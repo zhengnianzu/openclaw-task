@@ -1,0 +1,47 @@
+{
+  "system": {
+    "platform": ["windows", "linux"],
+    "python": "3.11",
+    "tools": []
+  },
+  "input_dir": {
+    "skill_dir": {
+      "research_skill": "./skills/research",
+      "writing_skill": "./skills/writing"
+    },
+    "user_dir": "./user_configs"
+  },
+  "agents": [
+    {
+      "name": "main",
+      "config": ["USER.md", "SOUL.md"],
+      "skills": ["research_skill"],
+      "system_prompt": "You are a research assistant specialized in gathering and analyzing information.",
+      "model": "claude-3-5-sonnet"
+    },
+    {
+      "name": "writer",
+      "config": ["USER.md", "SOUL.md"],
+      "skills": ["writing_skill"],
+      "system_prompt": "You are a professional writer who creates engaging articles.",
+      "model": "claude-3-5-sonnet"
+    }
+  ],
+  "queries": [
+    {
+      "agent_name": "main",
+      "text": "Research the latest developments in artificial intelligence for 2026",
+      "session_name": "main",
+      "timeout": 300
+    },
+    {
+      "agent_name": "writer",
+      "text": "Based on this research: {result_main}, write a comprehensive article about AI trends in 2026. The article should be engaging and accessible to general readers.",
+      "session_name": "main",
+      "timeout": 300
+    }
+  ],
+  "gateway_ws_url": "ws://127.0.0.1:18789/gateway",
+  "api_key": null,
+  "workspace_base": "./workspaces"
+}

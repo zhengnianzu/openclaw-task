@@ -1,0 +1,35 @@
+{
+  "system": {
+    "platform": ["windows"],
+    "python": "3.11",
+    "tools": []
+  },
+  "input_dir": {
+    "skill_dir": {},
+    "user_dir": null
+  },
+  "agents": [
+    {
+      "name": "simple_assistant",
+      "config": [],
+      "skills": [],
+      "system_prompt": "You are a helpful AI assistant. Answer questions clearly and concisely."
+    }
+  ],
+  "queries": [
+    {
+      "agent_name": "simple_assistant",
+      "text": "What is the capital of France?",
+      "session_name": "main",
+      "timeout": 60
+    },
+    {
+      "agent_name": "simple_assistant",
+      "text": "What is the population of that city?",
+      "session_name": "main",
+      "timeout": 60
+    }
+  ],
+  "gateway_ws_url": "ws://127.0.0.1:18789/gateway",
+  "workspace_base": "./workspaces"
+}

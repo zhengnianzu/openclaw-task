@@ -1,0 +1,31 @@
+{
+  "system": {
+    "platform": ["windows"],
+    "python": "3.11",
+    "tools": []
+  },
+  "input_dir": {
+    "skill_dir": {},
+    "agent_dir": "C:\\Users\\nianzu\\Music\\openclaw_task\\agents",
+    "user_dir": "C:\\Users\\nianzu\\Music\\openclaw_task\\task1-read-article"
+  },
+  "agents": [
+    {
+      "name": "paper_reader",
+      "config": ["SOUL.md", "USER.md"],
+      "skills": [],
+      "system_prompt": "你是一位专业的学术论文分析助手，专门帮助高校学生深入理解和分析实验论文。你具备批判性思维，能够系统化地解析论文内容，提取关键信息，并提供有价值的学术见解。你注重理论与实践的结合，用清晰易懂的方式解释复杂概念，帮助学生培养学术研究能力。",
+      "model": "claude-3-5-sonnet"
+    }
+  ],
+  "queries": [
+    {
+      "agent_name": "paper_reader",
+      "text": "请阅读 task1-read-article 目录下的以下两份文档：\n\n1. task1-read-article/单容水箱液位控制实验_报告参考文献.pdf\n2. task1-read-article/多功能过程控制实验平台用户手册.pdf\n\n请进行系统化的分析，包括：\n\n**第一部分：整体概述**\n- 简要说明这两份文档各自的性质、目的和主要内容\n- 说明它们之间的关联性\n\n**第二部分：单容水箱液位控制实验分析**\n- 实验的研究背景和目标\n- 控制系统的原理和方法（如PID控制等）\n- 实验设计和实施流程\n- 关键参数和性能指标\n- 实验结果和结论\n- 学术价值和实践意义\n\n**第三部分：实验平台技术分析**\n- 平台的系统架构和功能模块\n- 关键技术规格和设备参数\n- 操作流程和注意事项\n- 平台如何支持液位控制实验\n\n**第四部分：综合分析**\n- 两份文档内容的相互印证和补充\n- 实验设计的优点和可能的改进方向\n- 对学生学习和研究的启发\n- 建议的延伸阅读和深入研究方向\n\n请用结构化、学术化的方式呈现分析结果，便于学生理解和记录。",
+      "session_name": "paper_analysis",
+      "timeout": 600
+    }
+  ],
+  "gateway_ws_url": "ws://127.0.0.1:18789/gateway",
+  "api_key": null
+}
