@@ -9,7 +9,8 @@
     "agent_dir": "/home/nianzuzheng/project/openclaw-task/agents",
     "user_dir": {
       "path": "/home/nianzuzheng/project/openclaw-task/周子敬_资深财务会计师 _ 审计主管",
-      "map_file": "MAP_Linux"
+      "map_file": "MAP_Linux",
+      "profile_file": "profile_analyzed.json"
     }
   },
   "agents": [
@@ -31,5 +32,6 @@
   ],
   "gateway_ws_url": "ws://127.0.0.1:18789/gateway",
   "api_key": null,
-  "workspace_base": "/home/nianzuzheng/.openclaw/workspace"
+  "workspace_base": "/home/nianzuzheng/.openclaw/workspace",
+  "simulator_config": "/home/nianzuzheng/project/openclaw-task/周子敬_资深财务会计师 _ 审计主管/user_proxy_model.json"
 }

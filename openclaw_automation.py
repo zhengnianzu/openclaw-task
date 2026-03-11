@@ -35,6 +35,7 @@ class UserDirConfig(BaseModel):
     """用户目录配置"""
     path: str = Field(..., description="用户数据目录路径")
     map_file: Optional[str] = Field(None, description="映射文件名（相对于 path），如 'MAP_Linux'，自动补 .json 后缀")
+    profile_file: Optional[str] = Field(None, description="用户画像 JSON 文件名（相对于 path），如 'profile_analyzed.json'")
 
 
 class InputDirConfig(BaseModel):
@@ -81,11 +82,8 @@ class AutomationConfig(BaseModel):
     workspace_base: str = Field(r"C:\Users\nianzu\.openclaw\workspace", description="工作空间基础目录")
 
     # User Simulator 配置
-    user_profile: str = Field("", description="用户画像，描述用户身份、偏好等特征")
-    simulator_model: str = Field("gpt-4o", description="User Simulator 使用的模型")
-    simulator_api_key: Optional[str] = Field(None, description="User Simulator 的 OpenAI API Key")
-    simulator_base_url: Optional[str] = Field(None, description="User Simulator 的 API Base URL")
-    simulator_proxy: Optional[str] = Field(None, description="User Simulator 的 HTTP 代理地址")
+    user_profile: str = Field("", description="用户画像兜底文本，profile_file 不存在时使用")
+    simulator_config: Optional[str] = Field(None, description="Simulator 配置 JSON 绝对路径，含 model/api_key/base_url/proxy；不配置则从环境变量读取")
 
 
 # ============================================================================
@@ -309,9 +307,9 @@ class QueryOrchestrator:
         user_dir = self.config.input_dir.user_dir
         if not user_dir:
             return ""
-        root = Path(user_dir)
+        root = Path(user_dir.path)
         if not root.exists():
-            return str(user_dir)
+            return str(user_dir.path)
         lines = [f"{root.name}/"]
         for p in sorted(root.rglob("*")):
             depth = len(p.relative_to(root).parts)
@@ -320,14 +318,44 @@ class QueryOrchestrator:
         return "\n".join(lines)
 
     def _create_simulator(self, origin_query: str) -> User_simulator:
+        import os
+
+        # 1. 解析 user_profile
+        user_profile = self.config.user_profile
+        user_dir_cfg = self.config.input_dir.user_dir
+        if user_dir_cfg and user_dir_cfg.profile_file:
+            profile_path = Path(user_dir_cfg.path) / user_dir_cfg.profile_file
+            if profile_path.exists():
+                profile_data = json.loads(profile_path.read_text(encoding="utf-8"))
+                user_profile = json.dumps(profile_data, ensure_ascii=False, indent=2)
+            else:
+                print(f"  ⚠ profile_file 不存在: {profile_path}，回退到 config.user_profile")
+
+        # 2. 解析 simulator 连接配置：simulator_config 绝对路径优先，否则读环境变量
+        if self.config.simulator_config:
+            proxy_cfg_path = Path(self.config.simulator_config)
+            if proxy_cfg_path.exists():
+                proxy_cfg = json.loads(proxy_cfg_path.read_text(encoding="utf-8"))
+                print(f"  📄 Simulator 配置来自: {proxy_cfg_path}")
+            else:
+                print(f"  ⚠ simulator_config 文件不存在: {proxy_cfg_path}，回退到环境变量")
+                proxy_cfg = {}
+        else:
+            proxy_cfg = {}
+
+        model    = proxy_cfg.get("model")    or os.environ.get("SIMULATOR_MODEL", "gpt-4o")
+        api_key  = proxy_cfg.get("api_key")  or os.environ.get("SIMULATOR_OPENAI_API_KEY")
+        base_url = proxy_cfg.get("base_url") or os.environ.get("SIMULATOR_OPENAI_BASE_URL")
+        proxy    = proxy_cfg.get("proxy")    or os.environ.get("SIMULATOR_PROXY")
+
         return User_simulator(
             origin_query=origin_query,
-            user_profile=self.config.user_profile,
+            user_profile=user_profile,
             user_directory=self._build_user_directory(),
-            model=self.config.simulator_model,
-            api_key=self.config.simulator_api_key,
-            base_url=self.config.simulator_base_url,
-            proxy=self.config.simulator_proxy,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            proxy=proxy,
         )
 
     async def execute_queries(self, queries: List[QueryItem]) -> Dict[str, ExecutionResult]:

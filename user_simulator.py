@@ -41,15 +41,16 @@ class User_simulator:
         self._template = Path(prompt_file).read_text(encoding="utf-8")
 
         # 尝试从 user_directory 对应的目录下读取 user_profile.json
+        # user_directory 可能是真实路径，也可能是文件树文本，用 try/except 兼容
+        self._user_profile = user_profile
         if user_directory:
-            profile_path = Path(user_directory) / "user_profile.json"
-            if profile_path.exists():
-                profile_data = json.loads(profile_path.read_text(encoding="utf-8"))
-                self._user_profile = json.dumps(profile_data, ensure_ascii=False, indent=2)
-            else:
-                self._user_profile = user_profile
-        else:
-            self._user_profile = user_profile
+            try:
+                profile_path = Path(user_directory) / "user_profile.json"
+                if profile_path.exists():
+                    profile_data = json.loads(profile_path.read_text(encoding="utf-8"))
+                    self._user_profile = json.dumps(profile_data, ensure_ascii=False, indent=2)
+            except OSError:
+                pass  # user_directory 是文本描述而非真实路径，忽略
         self._user_directory = user_directory
         self._current_origin_query = origin_query
         self.model = model
@@ -105,7 +106,7 @@ class User_simulator:
             model=self.model,
             messages=full_messages,
         )
-
+        print(response)
         reply = response.choices[0].message.content
 
         # 记录本轮对话到历史（user=agent说的，assistant=simulator回复）
