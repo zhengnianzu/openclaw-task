@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 
+from user_simulator import User_simulator
+
 from pydantic import BaseModel, Field, validator
 from openclaw_sdk import OpenClawClient, AgentConfig, ExecutionOptions
 from openclaw_sdk.core.types import ExecutionResult
@@ -25,7 +27,7 @@ from openclaw_sdk.core.types import ExecutionResult
 class SystemConfig(BaseModel):
     """系统配置"""
     platform: List[str] = Field(default=["windows", "linux"])
-    python: str = Field(default="3.11")
+    python: str = Field(default="3.12")
     tools: List[str] = Field(default_factory=list)
 
 
@@ -64,6 +66,13 @@ class AutomationConfig(BaseModel):
     gateway_ws_url: Optional[str] = Field(None, description="WebSocket 网关 URL")
     api_key: Optional[str] = Field(None, description="API Key")
     workspace_base: str = Field(r"C:\Users\nianzu\.openclaw\workspace", description="工作空间基础目录")
+
+    # User Simulator 配置
+    user_profile: str = Field("", description="用户画像，描述用户身份、偏好等特征")
+    simulator_model: str = Field("gpt-4o", description="User Simulator 使用的模型")
+    simulator_api_key: Optional[str] = Field(None, description="User Simulator 的 OpenAI API Key")
+    simulator_base_url: Optional[str] = Field(None, description="User Simulator 的 API Base URL")
+    simulator_proxy: Optional[str] = Field(None, description="User Simulator 的 HTTP 代理地址")
 
 
 # ============================================================================
@@ -238,61 +247,117 @@ class AgentManager:
 class QueryOrchestrator:
     """编排和执行查询任务"""
 
-    def __init__(self, agent_manager: AgentManager):
+    def __init__(self, agent_manager: AgentManager, config: "AutomationConfig"):
         self.agent_manager = agent_manager
+        self.config = config
         self.results: Dict[str, ExecutionResult] = {}
 
+    def _build_user_directory(self) -> str:
+        """将 user_dir 的文件树转成字符串供 simulator 使用"""
+        user_dir = self.config.input_dir.user_dir
+        if not user_dir:
+            return ""
+        root = Path(user_dir)
+        if not root.exists():
+            return str(user_dir)
+        lines = [f"{root.name}/"]
+        for p in sorted(root.rglob("*")):
+            depth = len(p.relative_to(root).parts)
+            indent = "    " * depth
+            lines.append(f"{indent}{'└── ' if p.is_file() else ''}{p.name}{'/' if p.is_dir() else ''}")
+        return "\n".join(lines)
+
+    def _create_simulator(self, origin_query: str) -> User_simulator:
+        return User_simulator(
+            origin_query=origin_query,
+            user_profile=self.config.user_profile,
+            user_directory=self._build_user_directory(),
+            model=self.config.simulator_model,
+            api_key=self.config.simulator_api_key,
+            base_url=self.config.simulator_base_url,
+            proxy=self.config.simulator_proxy,
+        )
+
     async def execute_queries(self, queries: List[QueryItem]) -> Dict[str, ExecutionResult]:
-        """按顺序执行查询任务
+        """在同一 agent 内按顺序执行查询任务，前一个成功后才执行下一个，失败则终止
 
         Args:
             queries: 查询任务列表
 
         Returns:
-            执行结果字典 {agent_name: ExecutionResult}
+            执行结果字典 {result_agent_name: ExecutionResult}
         """
         print("\n" + "="*60)
         print("🚀 开始执行查询任务")
         print("="*60)
 
+        simulator: Optional[User_simulator] = None
+
         for idx, query in enumerate(queries, 1):
             print(f"\n📝 任务 {idx}/{len(queries)}: {query.agent_name}")
-            print(f"   查询: {query.text[:100]}...")
+            print(f"   Origin Query: {query.text[:100]}...")
 
-            # 替换变量
             query_text = self._replace_variables(query.text)
 
-            # 获取 Agent
             agent = self.agent_manager.get_agent(query.agent_name)
             if not agent:
-                print(f"   ✗ Agent 不存在: {query.agent_name}")
-                continue
+                print(f"   ✗ Agent 不存在: {query.agent_name}，终止后续任务")
+                break
 
-            # 执行查询
-            try:
-                # 创建执行选项（注意：字段名是 timeout_seconds）
-                options = ExecutionOptions(timeout_seconds=query.timeout) if query.timeout else None
+            options = ExecutionOptions(timeout_seconds=query.timeout) if query.timeout else None
 
-                result = await agent.execute(
-                    query_text,
-                    options=options
-                )
+            # 首个 query 创建 simulator；后续 query 复用同一实例，仅更新 origin_query
+            if simulator is None:
+                simulator = self._create_simulator(query_text)
+            else:
+                simulator.update_origin_query(query_text)
 
-                # 保存结果
-                result_key = f"result_{query.agent_name}"
-                self.results[result_key] = result
+            result, success = await self._run_conversation(agent, query_text, options, simulator)
 
-                # 输出结果摘要
-                print(f"   ✓ 执行成功")
-                print(f"   耗时: {result.latency_ms}ms")
-                print(f"   内容: {result.content[:200]}...")
+            result_key = f"result_{query.agent_name}"
+            self.results[result_key] = result
 
-            except Exception as e:
-                print(f"   ✗ 执行失败: {e}")
-                # 保存错误结果（用于后续查询的变量替换）
-                self.results[f"result_{query.agent_name}"] = None
+            if not success:
+                print(f"   任务 {idx} 失败，终止后续 {len(queries) - idx} 个任务")
+                break
 
         return self.results
+
+    async def _run_conversation(self, agent, initial_query: str, options, simulator: User_simulator):
+        """与 agent 进行多轮对话，由 simulator 模拟用户回复，直到任务结束
+
+        Returns:
+            (result, success): result 为最后一次 ExecutionResult，success 为是否 Task_Done
+        """
+        current_query = initial_query
+        last_result = None
+        turn = 0
+
+        while True:
+            turn += 1
+            print(f"\n   [Turn {turn}] 用户 → Agent: {current_query[:100]}...")
+
+            try:
+                result = await agent.execute(current_query, options=options)
+                last_result = result
+                agent_reply = result.content
+                print(f"   [Turn {turn}] Agent 回复: {agent_reply[:200]}...")
+            except Exception as e:
+                print(f"   ✗ Agent 执行失败: {e}")
+                return None, False
+
+            # 将 agent 回复交给 simulator，获取模拟用户的下一条消息
+            user_reply = simulator.chat(agent_reply)
+            print(f"   [Turn {turn}] Simulator 回复: {user_reply[:200]}...")
+
+            if "【Task_Done】" in user_reply:
+                print(f"   ✓ 任务完成（Turn {turn}）")
+                return last_result, True
+            elif "【Task_Failed】" in user_reply:
+                print(f"   ✗ 任务失败（Turn {turn}）：{user_reply[:200]}")
+                return last_result, False
+
+            current_query = user_reply
 
     def _replace_variables(self, text: str) -> str:
         """替换查询文本中的变量
@@ -415,7 +480,7 @@ class OpenClawAutomation:
 
     async def _execute_queries(self) -> Dict[str, ExecutionResult]:
         """执行查询"""
-        self.query_orchestrator = QueryOrchestrator(self.agent_manager)
+        self.query_orchestrator = QueryOrchestrator(self.agent_manager, self.config)
         return await self.query_orchestrator.execute_queries(self.config.queries)
 
 
