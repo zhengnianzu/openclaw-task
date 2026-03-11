@@ -29,11 +29,24 @@ class SystemConfig(BaseModel):
     tools: List[str] = Field(default_factory=list)
 
 
+class UserDirConfig(BaseModel):
+    """用户目录配置"""
+    path: str = Field(..., description="用户数据目录路径")
+    map_file: Optional[str] = Field(None, description="映射文件名（相对于 path），如 'MAP_Linux'，自动补 .json 后缀")
+
+
 class InputDirConfig(BaseModel):
     """输入目录配置"""
     skill_dir: Dict[str, str] = Field(default_factory=dict, description="技能目录映射")
-    user_dir: Optional[str] = Field(None, description="用户数据文件夹（如 PDF 等文件）")
+    user_dir: Optional[UserDirConfig] = Field(None, description="用户目录，支持字符串路径或 {path, map_file} 对象")
     agent_dir: Optional[str] = Field(None, description="Agent 源文件目录，包含各 agent 的子目录（如 agent_dir/paper_reader/SOUL.md）")
+
+    @validator('user_dir', pre=True)
+    def coerce_user_dir(cls, v):
+        """兼容旧格式：字符串自动转为 UserDirConfig"""
+        if isinstance(v, str):
+            return UserDirConfig(path=v)
+        return v
 
 
 class AgentConfigItem(BaseModel):
@@ -158,6 +171,45 @@ class WorkspaceManager:
                 print(f"  ✓ 复制用户目录: {user_dir_name}/ -> {dst}")
             else:
                 print(f"  ⚠ 用户目录不存在或不是目录: {user_path}")
+
+    def setup_from_map(self, map_file: str, base_dir: Optional[str] = None) -> None:
+        """根据 map.json 按映射逐条复制文件/目录
+
+        Args:
+            map_file: map.json 路径，格式 {"src_path": "dst_path"}
+            base_dir: 若提供，map 的 key（源路径）相对于此目录解析；
+                      否则 key 视为绝对路径（支持 ~ 展开）
+                      dst 路径始终支持 ~ 展开，不存在时自动创建父目录
+        """
+        map_path = Path(map_file)
+        if not map_path.exists():
+            print(f"  ⚠ map 文件不存在: {map_path}")
+            return
+
+        mapping: Dict[str, str] = json.loads(map_path.read_text(encoding="utf-8"))
+        base = Path(base_dir) if base_dir else None
+        print(f"  📄 读取 map 文件: {map_path}，共 {len(mapping)} 条映射")
+        if base:
+            print(f"  📂 源路径基准目录: {base}")
+
+        for src_str, dst_str in mapping.items():
+            src = (base / src_str) if base else Path(src_str).expanduser()
+            dst = Path(dst_str).expanduser()
+
+            if not src.exists():
+                print(f"  ⚠ 源路径不存在，跳过: {src}")
+                continue
+
+            dst.parent.mkdir(parents=True, exist_ok=True)
+
+            if src.is_dir():
+                if dst.exists():
+                    shutil.rmtree(dst)
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
+
+            print(f"  ✓ 映射复制: {src_str} -> {dst_str}")
 
 
 # ============================================================================
@@ -395,14 +447,35 @@ class OpenClawAutomation:
         """设置工作空间"""
         print("\n📁 设置工作空间...")
 
+        # 解析 user_dir：有 map_file 则按映射复制，否则整体复制（旧行为）
+        user_dir_config = self.config.input_dir.user_dir
+        user_dir_path: Optional[str] = None
+
+        if user_dir_config:
+            if user_dir_config.map_file:
+                map_path = self._resolve_map_file(user_dir_config.path, user_dir_config.map_file)
+                # 数据子目录 = user_dir.path / user_dir_name（同名子文件夹）
+                data_dir = str(Path(user_dir_config.path) / Path(user_dir_config.path).name)
+                self.workspace_manager.setup_from_map(map_path, base_dir=data_dir)
+            else:
+                user_dir_path = user_dir_config.path
+
         for agent_config in self.config.agents:
             self.workspace_manager.setup_agent_files(
                 agent_name=agent_config.name,
                 config_files=agent_config.config,
                 skill_dirs=self.config.input_dir.skill_dir,
                 agent_dir=self.config.input_dir.agent_dir,
-                user_dir=self.config.input_dir.user_dir
+                user_dir=user_dir_path
             )
+
+    @staticmethod
+    def _resolve_map_file(base_path: str, map_file: str) -> str:
+        """解析 map_file 路径：相对于 base_path，自动补 .json 后缀"""
+        p = Path(base_path) / map_file
+        if not p.suffix:
+            p = p.with_suffix('.json')
+        return str(p)
 
     async def _setup_agents(self) -> None:
         """设置 Agents"""
