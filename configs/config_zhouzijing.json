@@ -5,7 +5,7 @@
     "tools": []
   },
   "input_dir": {
-    "skill_dir": {},
+    "skill_dir": "/home/nianzuzheng/project/openclaw-task/skills",
     "agent_dir": "/home/nianzuzheng/project/openclaw-task/agents",
     "user_dir": {
       "path": "/home/nianzuzheng/project/openclaw-task/周子敬_资深财务会计师 _ 审计主管",
@@ -17,7 +17,7 @@
     {
       "name": "audit_assistant",
       "config": ["SOUL.md", "USER.md"],
-      "skills": [],
+      "skills": ["agent-browser"],
       "system_prompt": null,
       "model": "claude-3-5-sonnet"
     }
@@ -25,7 +25,7 @@
   "queries": [
     {
       "agent_name": "audit_assistant",
-      "text": "分析 ~/E/Personal/Financial_Planning/Balance_Sheets/20231027_PERSONAL_Household_Financial_Health_Assessment_V2.md 中的负债数据，结合 ~/E/Research/Tax_Policies/Mortgage_Interest_Rates/2023_Oct/20231024_INFO_LPR_Mortgage_Rates_Update.html 提到的最新利率，计算并对比两种还款方案的利息总额差异。",
+      "text": "当前有哪些技能，使用agent-brower，帮我看下https://shitjournal.org/，有哪些最新的文章",
       "session_name": "main",
       "timeout": 600
     }

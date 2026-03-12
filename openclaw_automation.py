@@ -40,9 +40,16 @@ class UserDirConfig(BaseModel):
 
 class InputDirConfig(BaseModel):
     """输入目录配置"""
-    skill_dir: Dict[str, str] = Field(default_factory=dict, description="技能目录映射")
+    skill_dir: Optional[str] = Field(None, description="技能根目录路径，下面每个子目录对应一个技能")
     user_dir: Optional[UserDirConfig] = Field(None, description="用户目录，支持字符串路径或 {path, map_file} 对象")
     agent_dir: Optional[str] = Field(None, description="Agent 源文件目录，包含各 agent 的子目录（如 agent_dir/paper_reader/SOUL.md）")
+
+    @validator('skill_dir', pre=True)
+    def coerce_skill_dir(cls, v):
+        """兼容旧格式：空 dict {} 转为 None"""
+        if isinstance(v, dict):
+            return None
+        return v
 
     @validator('user_dir', pre=True)
     def coerce_user_dir(cls, v):
@@ -119,7 +126,8 @@ class WorkspaceManager:
         self,
         agent_name: str,
         config_files: List[str],
-        skill_dirs: Dict[str, str],
+        skill_base_dir: Optional[str],
+        agent_skills: List[str],
         agent_dir: Optional[str] = None,
         user_dir: Optional[str] = None
     ) -> None:
@@ -128,7 +136,8 @@ class WorkspaceManager:
         Args:
             agent_name: Agent 名称
             config_files: 配置文件列表（如 SOUL.md, USER.md）
-            skill_dirs: 技能目录映射 {skill_name: source_path}
+            skill_base_dir: 技能根目录，下面每个子目录对应一个技能
+            agent_skills: 该 agent 需要的技能名称列表
             agent_dir: Agent 源文件根目录（包含各 agent 子目录）
             user_dir: 用户数据目录（整体复制到 workspace）
         """
@@ -149,17 +158,20 @@ class WorkspaceManager:
             else:
                 print(f"  ⚠ Agent 源目录不存在: {agent_source}")
 
-        # 2. 复制技能目录
-        for skill_name, skill_path in skill_dirs.items():
-            src = Path(skill_path)
-            if src.exists() and src.is_dir():
-                dst = workspace / skill_name
-                if dst.exists():
-                    shutil.rmtree(dst)
-                shutil.copytree(src, dst)
-                print(f"  ✓ 复制技能目录: {skill_name} -> {dst}")
-            else:
-                print(f"  ⚠ 技能目录不存在: {src}")
+        # 2. 复制技能目录：skill_base_dir/<skill_name>/ -> workspace/skills/<skill_name>/
+        if skill_base_dir and agent_skills:
+            skills_dst = workspace / "skills"
+            skills_dst.mkdir(exist_ok=True)
+            for skill_name in agent_skills:
+                src = Path(skill_base_dir) / skill_name
+                if src.exists() and src.is_dir():
+                    dst = skills_dst / skill_name
+                    if dst.exists():
+                        shutil.rmtree(dst)
+                    shutil.copytree(src, dst)
+                    print(f"  ✓ 复制技能: {skill_name} -> {dst}")
+                else:
+                    print(f"  ⚠ 技能目录不存在: {src}")
 
         # 3. 整体复制 user_dir 到 workspace
         if user_dir:
@@ -265,25 +277,6 @@ class AgentManager:
             print(f"  ✓ 创建新 Agent: {agent_name}")
 
         self.agents[agent_name] = agent
-
-        # 安装技能
-        if agent_config.skills:
-            await self._install_skills(agent_name, agent_config.skills)
-
-    async def _install_skills(self, agent_name: str, skills: List[str]) -> None:
-        """安装技能到 Agent"""
-        print(f"  📚 安装技能...")
-        for skill_name in skills:
-            try:
-                # 注意：实际的技能安装 API 可能需要根据 OpenClaw 的实际实现调整
-                # 这里假设有 skills manager
-                if hasattr(self.client, 'skills'):
-                    await self.client.skills.install(skill_name)
-                    print(f"    ✓ 技能安装成功: {skill_name}")
-                else:
-                    print(f"    ⚠ 技能安装 API 不可用，请手动安装: {skill_name}")
-            except Exception as e:
-                print(f"    ✗ 技能安装失败 {skill_name}: {e}")
 
     def get_agent(self, agent_name: str):
         """获取 Agent 实例"""
@@ -557,7 +550,8 @@ class OpenClawAutomation:
             self.workspace_manager.setup_agent_files(
                 agent_name=agent_config.name,
                 config_files=agent_config.config,
-                skill_dirs=self.config.input_dir.skill_dir,
+                skill_base_dir=self.config.input_dir.skill_dir,
+                agent_skills=agent_config.skills,
                 agent_dir=self.config.input_dir.agent_dir,
                 user_dir=user_dir_path
             )
