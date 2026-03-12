@@ -10,11 +10,14 @@
 
 import argparse
 import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from user_simulator import User_simulator
 
-DEFAULT_PROXY_CONFIG = "周子敬_资深财务会计师 _ 审计主管/user_proxy_model.json"
+DEFAULT_PROXY_CONFIG = "configs/user_proxy_model.json"
 DEFAULT_PROFILE      = "周子敬_资深财务会计师 _ 审计主管/profile_analyzed.json"
 DEFAULT_QUERY        = "帮我分析一下我的个人财务状况，重点看下负债情况。"
 
