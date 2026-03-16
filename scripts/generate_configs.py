@@ -10,7 +10,8 @@
     --simulator-config configs/user_proxy_model.json \
     --workspace /home/nianzuzheng/.openclaw/workspace \
     --model claude-3-5-sonnet \
-    --gateway-ws-url ws://127.0.0.1:18789/gateway
+    --gateway-ws-url ws://127.0.0.1:18789/gateway \
+    --timeout 3600
 """
 
 import argparse
@@ -40,6 +41,7 @@ def generate_single_config(
     model: str,
     gateway_ws_url: str,
     api_key: str | None,
+    timeout: int,
 ) -> dict:
     """为单条 query 生成一份完整配置"""
     agent_name = f"assistant{agent_index}"
@@ -72,7 +74,7 @@ def generate_single_config(
                 "agent_name": agent_name,
                 "text": query_text,
                 "session_name": f"query{query_index}",
-                "timeout": 600
+                "timeout": timeout
             }
         ],
         "gateway_ws_url": gateway_ws_url,
@@ -93,6 +95,7 @@ def main():
     parser.add_argument("--model",            required=True,  help="模型名称，如 claude-3-5-sonnet")
     parser.add_argument("--gateway-ws-url",   default="ws://127.0.0.1:18789/gateway", help="WebSocket 网关 URL")
     parser.add_argument("--api-key",          default=None,   help="API Key（可选）")
+    parser.add_argument("--timeout",          type=int, default=600, help="每条 query 超时时间（秒，默认 600）")
     args = parser.parse_args()
 
     input_dir  = Path(args.input)
@@ -112,34 +115,44 @@ def main():
 
     total = 0
     success = 0
+    global_agent_idx = 0
     for folder_idx, folder in enumerate(folders, start=1):
         try:
             queries_data = json.loads((folder / "user_queries.json").read_text(encoding="utf-8"))
-            skills: list = queries_data.get("skills", [])
-            queries_list: list = queries_data.get("queries", [])
             profile_file = find_profile_file(folder)
 
-            for q_idx, query_text in enumerate(queries_list, start=1):
-                total += 1
-                config = generate_single_config(
-                    folder=folder,
-                    agent_index=folder_idx,
-                    query_index=q_idx,
-                    query_text=query_text,
-                    skills=skills,
-                    profile_file=profile_file,
-                    skill_dir=args.skill_dir,
-                    agent_dir=args.agent_dir,
-                    simulator_config=args.simulator_config,
-                    workspace=args.workspace,
-                    model=args.model,
-                    gateway_ws_url=args.gateway_ws_url,
-                    api_key=args.api_key,
-                )
-                out_file = output_dir / f"{folder.name}_q{q_idx}.json"
-                out_file.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-                print(f"  ✓ {out_file.name}")
-                success += 1
+            # 新格式：user_queries.json 是数组，每个元素有 topic、queries、skills
+            for topic_item in queries_data:
+                topic = topic_item.get("topic", "unknown")
+                queries_list: list = topic_item.get("queries", [])
+                skills: list = topic_item.get("skills", [])
+
+                # topic 中特殊字符替换为下划线
+                safe_topic = topic.replace("/", "_").replace(" ", "_").replace("（", "_").replace("）", "_")
+
+                for q_idx, query_text in enumerate(queries_list, start=1):
+                    total += 1
+                    global_agent_idx += 1
+                    config = generate_single_config(
+                        folder=folder,
+                        agent_index=global_agent_idx,
+                        query_index=q_idx,
+                        query_text=query_text,
+                        skills=skills,
+                        profile_file=profile_file,
+                        skill_dir=args.skill_dir,
+                        agent_dir=args.agent_dir,
+                        simulator_config=args.simulator_config,
+                        workspace=args.workspace,
+                        model=args.model,
+                        gateway_ws_url=args.gateway_ws_url,
+                        api_key=args.api_key,
+                        timeout=args.timeout,
+                    )
+                    out_file = output_dir / f"{folder.name}_{safe_topic}_q{q_idx}.json"
+                    out_file.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+                    print(f"  ✓ {out_file.name}")
+                    success += 1
 
         except Exception as e:
             print(f"  ✗ [{folder_idx:03d}] {folder.name}: {e}")

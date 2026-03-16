@@ -416,7 +416,9 @@ class QueryOrchestrator:
                 agent_reply = result.content
                 print(f"   [Turn {turn}] Agent 回复: {agent_reply[:200]}...")
             except Exception as e:
+                import traceback
                 print(f"   ✗ Agent 执行失败: {e}")
+                traceback.print_exc()
                 return None, False
 
             # 将 agent 回复交给 simulator，获取模拟用户的下一条消息
