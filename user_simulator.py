@@ -102,10 +102,19 @@ class User_simulator:
             {"role": "user", "content": query},
         ]
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=full_messages,
-        )
+        last_exc = None
+        for attempt in range(3):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=full_messages,
+                )
+                break
+            except Exception as e:
+                last_exc = e
+                logging.warning(f"API call failed (attempt {attempt + 1}/3): {e}")
+        else:
+            raise last_exc
         print(response)
         reply = response.choices[0].message.content
 

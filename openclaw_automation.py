@@ -238,10 +238,67 @@ class WorkspaceManager:
 class AgentManager:
     """管理 Agent 的创建、配置和技能安装"""
 
-    def __init__(self, client: OpenClawClient, workspace_manager: WorkspaceManager):
+    def __init__(self, client: OpenClawClient, workspace_manager: WorkspaceManager, config: "AutomationConfig"):
+        import os
         self.client = client
         self.workspace_manager = workspace_manager
         self.agents: Dict[str, Any] = {}
+
+        # 解析 user_profile
+        user_profile = config.user_profile
+        user_dir_cfg = config.input_dir.user_dir
+        if user_dir_cfg:
+            # 优先使用显式配置的 profile_file，未配置则自动尝试 user_profile.json
+            profile_filename = user_dir_cfg.profile_file or "user_profile.json"
+            profile_path = Path(user_dir_cfg.path) / profile_filename
+            if profile_path.exists():
+                profile_data = json.loads(profile_path.read_text(encoding="utf-8"))
+                user_profile = json.dumps(profile_data, ensure_ascii=False, indent=2)
+            elif user_dir_cfg.profile_file:
+                # 只有显式配置了 profile_file 却不存在时才警告
+                print(f"  ⚠ profile_file 不存在: {profile_path}，回退到 config.user_profile")
+
+        # 解析 simulator 连接配置
+        if config.simulator_config:
+            proxy_cfg_path = Path(config.simulator_config)
+            if proxy_cfg_path.exists():
+                proxy_cfg = json.loads(proxy_cfg_path.read_text(encoding="utf-8"))
+                print(f"  📄 Simulator 配置来自: {proxy_cfg_path}")
+            else:
+                print(f"  ⚠ simulator_config 文件不存在: {proxy_cfg_path}，回退到环境变量")
+                proxy_cfg = {}
+        else:
+            proxy_cfg = {}
+
+        model    = proxy_cfg.get("model")    or os.environ.get("SIMULATOR_MODEL", "gpt-4o")
+        api_key  = proxy_cfg.get("api_key")  or os.environ.get("SIMULATOR_OPENAI_API_KEY")
+        base_url = proxy_cfg.get("base_url") or os.environ.get("SIMULATOR_OPENAI_BASE_URL")
+        proxy    = proxy_cfg.get("proxy")    or os.environ.get("SIMULATOR_PROXY")
+
+        # 构建 user_directory 文件树字符串
+        user_directory = ""
+        if user_dir_cfg:
+            root = Path(user_dir_cfg.path)
+            if root.exists():
+                lines = [f"{root.name}/"]
+                for p in sorted(root.rglob("*")):
+                    depth = len(p.relative_to(root).parts)
+                    indent = "    " * depth
+                    lines.append(f"{indent}{'└── ' if p.is_file() else ''}{p.name}{'/' if p.is_dir() else ''}")
+                user_directory = "\n".join(lines)
+            else:
+                user_directory = str(user_dir_cfg.path)
+
+        # origin_query 在首次执行前通过 update_origin_query 设置
+        self.simulator = User_simulator(
+            origin_query="",
+            user_profile=user_profile,
+            user_directory=user_directory,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            proxy=proxy,
+        )
 
     async def setup_agent(self, agent_config: AgentConfigItem) -> None:
         """设置单个 Agent
@@ -295,62 +352,6 @@ class QueryOrchestrator:
         self.config = config
         self.results: Dict[str, ExecutionResult] = {}
 
-    def _build_user_directory(self) -> str:
-        """将 user_dir 的文件树转成字符串供 simulator 使用"""
-        user_dir = self.config.input_dir.user_dir
-        if not user_dir:
-            return ""
-        root = Path(user_dir.path)
-        if not root.exists():
-            return str(user_dir.path)
-        lines = [f"{root.name}/"]
-        for p in sorted(root.rglob("*")):
-            depth = len(p.relative_to(root).parts)
-            indent = "    " * depth
-            lines.append(f"{indent}{'└── ' if p.is_file() else ''}{p.name}{'/' if p.is_dir() else ''}")
-        return "\n".join(lines)
-
-    def _create_simulator(self, origin_query: str) -> User_simulator:
-        import os
-
-        # 1. 解析 user_profile
-        user_profile = self.config.user_profile
-        user_dir_cfg = self.config.input_dir.user_dir
-        if user_dir_cfg and user_dir_cfg.profile_file:
-            profile_path = Path(user_dir_cfg.path) / user_dir_cfg.profile_file
-            if profile_path.exists():
-                profile_data = json.loads(profile_path.read_text(encoding="utf-8"))
-                user_profile = json.dumps(profile_data, ensure_ascii=False, indent=2)
-            else:
-                print(f"  ⚠ profile_file 不存在: {profile_path}，回退到 config.user_profile")
-
-        # 2. 解析 simulator 连接配置：simulator_config 绝对路径优先，否则读环境变量
-        if self.config.simulator_config:
-            proxy_cfg_path = Path(self.config.simulator_config)
-            if proxy_cfg_path.exists():
-                proxy_cfg = json.loads(proxy_cfg_path.read_text(encoding="utf-8"))
-                print(f"  📄 Simulator 配置来自: {proxy_cfg_path}")
-            else:
-                print(f"  ⚠ simulator_config 文件不存在: {proxy_cfg_path}，回退到环境变量")
-                proxy_cfg = {}
-        else:
-            proxy_cfg = {}
-
-        model    = proxy_cfg.get("model")    or os.environ.get("SIMULATOR_MODEL", "gpt-4o")
-        api_key  = proxy_cfg.get("api_key")  or os.environ.get("SIMULATOR_OPENAI_API_KEY")
-        base_url = proxy_cfg.get("base_url") or os.environ.get("SIMULATOR_OPENAI_BASE_URL")
-        proxy    = proxy_cfg.get("proxy")    or os.environ.get("SIMULATOR_PROXY")
-
-        return User_simulator(
-            origin_query=origin_query,
-            user_profile=user_profile,
-            user_directory=self._build_user_directory(),
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
-            proxy=proxy,
-        )
-
     async def execute_queries(self, queries: List[QueryItem]) -> Dict[str, ExecutionResult]:
         """在同一 agent 内按顺序执行查询任务，前一个成功后才执行下一个，失败则终止
 
@@ -364,7 +365,7 @@ class QueryOrchestrator:
         print("🚀 开始执行查询任务")
         print("="*60)
 
-        simulator: Optional[User_simulator] = None
+        simulator = self.agent_manager.simulator
 
         for idx, query in enumerate(queries, 1):
             print(f"\n📝 任务 {idx}/{len(queries)}: {query.agent_name}")
@@ -379,11 +380,7 @@ class QueryOrchestrator:
 
             options = ExecutionOptions(timeout_seconds=query.timeout) if query.timeout else None
 
-            # 首个 query 创建 simulator；后续 query 复用同一实例，仅更新 origin_query
-            if simulator is None:
-                simulator = self._create_simulator(query_text)
-            else:
-                simulator.update_origin_query(query_text)
+            simulator.update_origin_query(query_text)
 
             result, success = await self._run_conversation(agent, query_text, options, simulator)
 
@@ -405,6 +402,7 @@ class QueryOrchestrator:
         current_query = initial_query
         last_result = None
         turn = 0
+        retry = 0
 
         while True:
             turn += 1
@@ -420,9 +418,16 @@ class QueryOrchestrator:
                 print(f"   ✗ Agent 执行失败: {e}")
                 traceback.print_exc()
                 return None, False
-
-            # 将 agent 回复交给 simulator，获取模拟用户的下一条消息
-            user_reply = simulator.chat(agent_reply)
+            if not agent_reply:
+                user_reply = "没有看到你的回复，请重新执行。"
+                retry += 1
+                if retry >= 3:
+                    print(f"   ✗ 连续3次未收到回复，任务失败")
+                    return last_result, False
+            else:
+                # 将 agent 回复交给 simulator，获取模拟用户的下一条消息
+                retry = 0
+                user_reply = simulator.chat(agent_reply)
             print(f"   [Turn {turn}] Simulator 回复: {user_reply[:200]}...")
 
             if "【Task_Done】" in user_reply:
@@ -570,7 +575,7 @@ class OpenClawAutomation:
         """设置 Agents"""
         print("\n🤖 设置 Agents...")
 
-        self.agent_manager = AgentManager(self.client, self.workspace_manager)
+        self.agent_manager = AgentManager(self.client, self.workspace_manager, self.config)
 
         for agent_config in self.config.agents:
             await self.agent_manager.setup_agent(agent_config)
