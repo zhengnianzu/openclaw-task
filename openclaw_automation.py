@@ -402,6 +402,7 @@ class QueryOrchestrator:
         current_query = initial_query
         last_result = None
         turn = 0
+        retry = 0
 
         while True:
             turn += 1
@@ -418,10 +419,15 @@ class QueryOrchestrator:
                 traceback.print_exc()
                 return None, False
             if not agent_reply:
-                print(f"   ✗ Agent 回复为空，任务失败，终止对话")
-                return last_result, False
-            # 将 agent 回复交给 simulator，获取模拟用户的下一条消息
-            user_reply = simulator.chat(agent_reply)
+                user_reply = "没有看到你的回复，请重新执行。"
+                retry += 1
+                if retry >= 3:
+                    print(f"   ✗ 连续3次未收到回复，任务失败")
+                    return last_result, False
+            else:
+                # 将 agent 回复交给 simulator，获取模拟用户的下一条消息
+                retry = 0
+                user_reply = simulator.chat(agent_reply)
             print(f"   [Turn {turn}] Simulator 回复: {user_reply[:200]}...")
 
             if "【Task_Done】" in user_reply:
