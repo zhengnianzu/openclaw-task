@@ -158,18 +158,22 @@ class WorkspaceManager:
             else:
                 print(f"  ⚠ Agent 源目录不存在: {agent_source}")
 
-        # 2. 复制技能目录：skill_base_dir/<skill_name>/ -> workspace/skills/<skill_name>/
+        # 2. 复制技能目录：skill_base_dir/<skill_name>/ -> ~/.openclaw/skills/<skill_name>/
         if skill_base_dir and agent_skills:
-            skills_dst = workspace / "skills"
+            # workspace 形如 ~/.openclaw/workspace-agentN，上一级即 ~/.openclaw
+            openclaw_dir = workspace.parent
+            skills_dst = openclaw_dir / "skills"
             skills_dst.mkdir(exist_ok=True)
-            for skill_name in agent_skills:
-                src = Path(skill_base_dir) / skill_name
+            for skill_path in agent_skills:
+                # skill_path 形如 "category/author__skill-name"，取最后一段作为目标目录名
+                skill_name = Path(skill_path).name
+                src = Path(skill_base_dir) / skill_path
                 if src.exists() and src.is_dir():
                     dst = skills_dst / skill_name
                     if dst.exists():
                         shutil.rmtree(dst)
                     shutil.copytree(src, dst)
-                    print(f"  ✓ 复制技能: {skill_name} -> {dst}")
+                    print(f"  ✓ 复制技能: {skill_path} -> {dst}")
                 else:
                     print(f"  ⚠ 技能目录不存在: {src}")
 
