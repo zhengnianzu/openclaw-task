@@ -294,14 +294,12 @@ class AgentManager:
         if user_dir_cfg:
             root = Path(user_dir_cfg.path)
             if root.exists():
-                lines = [f"{root.name}/"]
+                lines = []
                 for p in sorted(root.rglob("*")):
-                    depth = len(p.relative_to(root).parts)
+                    depth = len(p.relative_to(root).parts) - 1
                     indent = "    " * depth
                     lines.append(f"{indent}{'└── ' if p.is_file() else ''}{p.name}{'/' if p.is_dir() else ''}")
                 user_directory = "\n".join(lines)
-            else:
-                user_directory = str(user_dir_cfg.path)
 
         # origin_query 在首次执行前通过 update_origin_query 设置
         self.simulator = User_simulator(
