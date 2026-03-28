@@ -38,6 +38,8 @@ class UserDirConfig(BaseModel):
     profile_file: Optional[str] = Field(None, description="用户画像 JSON 文件名（相对于 path），如 'profile_analyzed.json'")
 
 
+    copy_map_not_workspace: Optional[bool] = Field(None, description="True for map copy, False for workspace copy")
+
 class InputDirConfig(BaseModel):
     """输入目录配置"""
     skill_dir: Optional[str] = Field(None, description="技能根目录路径，下面每个子目录对应一个技能")
@@ -177,18 +179,29 @@ class WorkspaceManager:
 
         # 3. 整体复制 user_dir 到 workspace
         if user_dir:
-            user_path = Path(user_dir)
+            user_path = Path(user_dir).expanduser()
             if user_path.exists() and user_path.is_dir():
                 # 获取 user_dir 的目录名
                 user_dir_name = user_path.name
+                content_root = user_path / user_path.name
                 dst = workspace / user_dir_name
+
+                if not content_root.exists() or not content_root.is_dir():
+                    print(f"  Warning: user_dir content root does not exist or is not a directory: {content_root}")
+                    return
 
                 # 如果目标已存在，先删除
                 if dst.exists():
                     shutil.rmtree(dst)
 
                 # 复制整个目录
-                shutil.copytree(user_path, dst)
+                dst.mkdir(parents=True, exist_ok=True)
+                for item in content_root.iterdir():
+                    item_dst = dst / item.name
+                    if item.is_dir():
+                        shutil.copytree(item, item_dst)
+                    else:
+                        shutil.copy2(item, item_dst)
                 print(f"  ✓ 复制用户目录: {user_dir_name}/ -> {dst}")
             else:
                 print(f"  ⚠ 用户目录不存在或不是目录: {user_path}")
@@ -547,13 +560,33 @@ class OpenClawAutomation:
         user_dir_path: Optional[str] = None
 
         if user_dir_config:
-            if user_dir_config.map_file:
+            user_path = Path(user_dir_config.path).expanduser()
+            content_root = user_path / user_path.name
+
+            if not content_root.exists() or not content_root.is_dir():
+                # env文件夹不存在时，copy_map_not_workspace必须不存在
+                assert user_dir_config.copy_map_not_workspace is None, (
+                    "input_dir.user_dir.copy_map_not_workspace must be omitted when "
+                    "user_path / user_path.name does not exist"
+                )
+            elif user_dir_config.copy_map_not_workspace:
+                # env文件夹存在，copy_map_not_workspace是True时，map_file必须存在。
+                assert user_dir_config.map_file, "input_dir.user_dir.map_file must exist when copy_map_not_workspace is True"
                 map_path = self._resolve_map_file(user_dir_config.path, user_dir_config.map_file)
                 # 数据子目录 = user_dir.path / user_dir_name（同名子文件夹）
-                data_dir = str(Path(user_dir_config.path) / Path(user_dir_config.path).name)
+                data_dir = str(content_root)
                 self.workspace_manager.setup_from_map(map_path, base_dir=data_dir)
             else:
+                # env文件夹存在时，copy_map_not_workspace必须显式设置成True或False
+                assert user_dir_config.copy_map_not_workspace is False, (
+                    "input_dir.user_dir.copy_map_not_workspace must be explicitly set "
+                    "when user_path / user_path.name exists"
+                )
                 user_dir_path = user_dir_config.path
+                if user_dir_config.map_file:
+                    # copy_map_not_workspace是False时，不会按照map_file的指导复制，此时如果存在map_file，需要给出wraning
+                    map_path = self._resolve_map_file(user_dir_config.path, user_dir_config.map_file)
+                    print(f"  Warning: map_file '{map_path}' is ignored because copy_map_not_workspace is False; copying user_dir into workspace instead")
 
         for agent_config in self.config.agents:
             self.workspace_manager.setup_agent_files(
