@@ -29,6 +29,7 @@ class SystemConfig(BaseModel):
     platform: List[str] = Field(default=["windows", "linux"])
     python: str = Field(default="3.12")
     tools: List[str] = Field(default_factory=list)
+    hw_net_range: str = Field(default="green", description="网络环境: green 或 blue")
 
 
 class UserDirConfig(BaseModel):
@@ -130,7 +131,8 @@ class WorkspaceManager:
         skill_base_dir: Optional[str],
         agent_skills: List[str],
         agent_dir: Optional[str] = None,
-        user_dir: Optional[str] = None
+        user_dir: Optional[str] = None,
+        hw_net_range: str = "green"
     ) -> None:
         """设置 Agent 工作空间文件
 
@@ -180,30 +182,53 @@ class WorkspaceManager:
         if user_dir:
             user_path = Path(user_dir).expanduser()
             if user_path.exists() and user_path.is_dir():
-                # 获取 user_dir 的目录名
-                user_dir_name = user_path.name
                 content_root = user_path / user_path.name
-                dst = workspace / user_dir_name
 
                 if not content_root.exists() or not content_root.is_dir():
                     print(f"  Warning: user_dir content root does not exist or is not a directory: {content_root}")
                     return
 
-                # 如果目标已存在，先删除
-                if dst.exists():
-                    shutil.rmtree(dst)
-
-                # 复制整个目录
-                dst.mkdir(parents=True, exist_ok=True)
+                # 复制到 workspace 根目录
                 for item in content_root.iterdir():
-                    item_dst = dst / item.name
+                    item_dst = workspace / item.name
+                    if item_dst.exists():
+                        if item_dst.is_dir():
+                            shutil.rmtree(item_dst)
+                        else:
+                            item_dst.unlink()
                     if item.is_dir():
                         shutil.copytree(item, item_dst)
                     else:
                         shutil.copy2(item, item_dst)
-                print(f"  ✓ 复制用户目录: {user_dir_name}/ -> {dst}")
+                print(f"  ✓ 复制用户目录: {content_root} -> {workspace}")
             else:
                 print(f"  ⚠ 用户目录不存在或不是目录: {user_path}")
+
+        # 4. blue 网络环境：写入 TOOLS.md，指导模型优先使用serper搜索，而不是web_fetch和web_search(禁用)。
+        if hw_net_range == "blue":
+            tools_src = Path(__file__).parent / "tools_instruction_blue.md"
+            if tools_src.exists():
+                shutil.copy2(tools_src, workspace / "TOOLS.md")
+                print(f"  ✓ 写入 TOOLS.md (blue)")
+            else:
+                print(f"  ⚠ tools_instruction_blue.md 不存在: {tools_src}")
+
+            # 修改 workspace 上一层的 openclaw.json，在 tools 下新增 deny
+            openclaw_json_path = workspace.parent / "openclaw.json"
+            if not openclaw_json_path.exists():
+                raise FileNotFoundError(f"openclaw.json 不存在: {openclaw_json_path}")
+            openclaw_cfg = json.loads(openclaw_json_path.read_text(encoding="utf-8"))
+            if "tools" not in openclaw_cfg:
+                openclaw_cfg["tools"] = {}
+            deny_list = openclaw_cfg["tools"].get("deny", [])
+            if "web_search" not in deny_list:
+                deny_list.append("web_search")
+            openclaw_cfg["tools"]["deny"] = deny_list
+            openclaw_json_path.write_text(
+                json.dumps(openclaw_cfg, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+            print(f"  ✓ 更新 openclaw.json: tools.deny = [\"web_search\"]")
 
     def setup_from_map(self, map_file: str, base_dir: Optional[str] = None) -> None:
         """根据 map.json 按映射逐条复制文件/目录
@@ -584,7 +609,8 @@ class OpenClawAutomation:
                 skill_base_dir=self.config.input_dir.skill_dir,
                 agent_skills=agent_config.skills,
                 agent_dir=self.config.input_dir.agent_dir,
-                user_dir=user_dir_path
+                user_dir=user_dir_path,
+                hw_net_range=self.config.system.hw_net_range
             )
 
     @staticmethod
