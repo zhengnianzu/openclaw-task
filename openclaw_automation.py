@@ -29,7 +29,6 @@ class SystemConfig(BaseModel):
     platform: List[str] = Field(default=["windows", "linux"])
     python: str = Field(default="3.12")
     tools: List[str] = Field(default_factory=list)
-    hw_net_range: str = Field(default="green", description="网络环境: green 或 blue")
 
 
 class UserDirConfig(BaseModel):
@@ -131,8 +130,7 @@ class WorkspaceManager:
         skill_base_dir: Optional[str],
         agent_skills: List[str],
         agent_dir: Optional[str] = None,
-        user_dir: Optional[str] = None,
-        hw_net_range: str = "green"
+        user_dir: Optional[str] = None
     ) -> None:
         """设置 Agent 工作空间文件
 
@@ -141,7 +139,7 @@ class WorkspaceManager:
             config_files: 配置文件列表（如 SOUL.md, USER.md）
             skill_base_dir: 技能根目录，下面每个子目录对应一个技能
             agent_skills: 该 agent 需要的技能名称列表
-            agent_dir: Agent 源文件根目录（包含各 agent 子目录）
+            agent_dir: Agent 源文件目录，包含配置文件（如 SOUL.md, USER.md）
             user_dir: 用户数据目录（整体复制到 workspace）
         """
         workspace = self.get_agent_workspace(agent_name)
@@ -152,19 +150,21 @@ class WorkspaceManager:
             print(f"  📂 skills_dst: {workspace / 'skills'}")
         if user_dir:
             print(f"  📂 user_dir -> workspace: {Path(user_dir).expanduser()} -> {workspace}")
-        if hw_net_range == "blue":
-            print(f"  📂 TOOLS.md targets: {workspace / 'TOOLS.md'}, {self.base_dir / 'TOOLS.md'}")
 
-        # 1. 从 agent_dir/<agent_name>/ 复制配置文件（SOUL.md, USER.md 等）
+        # 1. 从 agent_dir/ 复制配置文件（SOUL.md, USER.md, TOOLS.md 等）
         if agent_dir and config_files:
-            agent_source = Path(agent_dir) / agent_name
+            agent_source = Path(agent_dir).expanduser()
             if agent_source.exists():
                 for config_file in config_files:
                     src = agent_source / config_file
                     if src.exists():
                         dst = workspace / config_file
                         shutil.copy2(src, dst)
-                        print(f"  ✓ 复制 Agent 配置: {config_file}")
+                        print(f"  ✓ 复制 Agent 配置: {config_file} -> {dst}")
+                        # 同时复制到 workspace 主目录
+                        dst_main = self.base_dir / config_file
+                        shutil.copy2(src, dst_main)
+                        print(f"  ✓ 复制 Agent 配置: {config_file} -> {dst_main}")
                     else:
                         print(f"  ⚠ Agent 配置文件不存在: {src}")
             else:
@@ -213,17 +213,6 @@ class WorkspaceManager:
                 print(f"  ✓ 复制用户目录: {content_root} -> {workspace}")
             else:
                 print(f"  ⚠ 用户目录不存在或不是目录: {user_path}")
-
-        # 4. blue 网络环境：写入 TOOLS.md，指导模型优先使用serper搜索，而不是web_fetch和web_search(禁用)。
-        if hw_net_range == "blue":
-            tools_src = Path(__file__).parent / "tools_instruction_blue.md"
-            if tools_src.exists():
-                shutil.copy2(tools_src, workspace / "TOOLS.md")
-                workspace_main = self.base_dir
-                shutil.copy2(tools_src, workspace_main / "TOOLS.md")
-                print(f"  ✓ 写入 TOOLS.md (blue)")
-            else:
-                print(f"  ⚠ tools_instruction_blue.md 不存在: {tools_src}")
 
     def setup_from_map(self, map_file: str, base_dir: Optional[str] = None) -> None:
         """根据 map.json 按映射逐条复制文件/目录
@@ -604,8 +593,7 @@ class OpenClawAutomation:
                 skill_base_dir=self.config.input_dir.skill_dir,
                 agent_skills=agent_config.skills,
                 agent_dir=self.config.input_dir.agent_dir,
-                user_dir=user_dir_path,
-                hw_net_range=self.config.system.hw_net_range
+                user_dir=user_dir_path
             )
 
     @staticmethod
