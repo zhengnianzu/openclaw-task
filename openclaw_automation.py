@@ -102,7 +102,7 @@ class WorkspaceManager:
     """管理 Agent 工作空间和文件"""
 
     def __init__(self, base_dir: str):
-        self.base_dir = Path(base_dir)
+        self.base_dir = Path(base_dir).expanduser()
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     def get_agent_workspace(self, agent_name: str) -> Path:
@@ -139,21 +139,32 @@ class WorkspaceManager:
             config_files: 配置文件列表（如 SOUL.md, USER.md）
             skill_base_dir: 技能根目录，下面每个子目录对应一个技能
             agent_skills: 该 agent 需要的技能名称列表
-            agent_dir: Agent 源文件根目录（包含各 agent 子目录）
+            agent_dir: Agent 源文件目录，包含配置文件（如 SOUL.md, USER.md）
             user_dir: 用户数据目录（整体复制到 workspace）
         """
         workspace = self.get_agent_workspace(agent_name)
 
-        # 1. 从 agent_dir/<agent_name>/ 复制配置文件（SOUL.md, USER.md 等）
+        # 打印目标路径预览
+        print(f"  📂 workspace: {workspace}")
+        if skill_base_dir and agent_skills:
+            print(f"  📂 skills_dst: {workspace / 'skills'}")
+        if user_dir:
+            print(f"  📂 user_dir -> workspace: {Path(user_dir).expanduser()} -> {workspace}")
+
+        # 1. 从 agent_dir/ 复制配置文件（SOUL.md, USER.md, TOOLS.md 等）
         if agent_dir and config_files:
-            agent_source = Path(agent_dir) / agent_name
+            agent_source = Path(agent_dir).expanduser()
             if agent_source.exists():
                 for config_file in config_files:
                     src = agent_source / config_file
                     if src.exists():
                         dst = workspace / config_file
                         shutil.copy2(src, dst)
-                        print(f"  ✓ 复制 Agent 配置: {config_file}")
+                        print(f"  ✓ 复制 Agent 配置: {config_file} -> {dst}")
+                        # 同时复制到 workspace 主目录
+                        dst_main = self.base_dir / config_file
+                        shutil.copy2(src, dst_main)
+                        print(f"  ✓ 复制 Agent 配置: {config_file} -> {dst_main}")
                     else:
                         print(f"  ⚠ Agent 配置文件不存在: {src}")
             else:
@@ -179,29 +190,27 @@ class WorkspaceManager:
         # 3. 整体复制 user_dir 到 workspace
         if user_dir:
             user_path = Path(user_dir).expanduser()
+            print(f'check user_path {user_path=}')
             if user_path.exists() and user_path.is_dir():
-                # 获取 user_dir 的目录名
-                user_dir_name = user_path.name
                 content_root = user_path / user_path.name
-                dst = workspace / user_dir_name
 
                 if not content_root.exists() or not content_root.is_dir():
                     print(f"  Warning: user_dir content root does not exist or is not a directory: {content_root}")
                     return
 
-                # 如果目标已存在，先删除
-                if dst.exists():
-                    shutil.rmtree(dst)
-
-                # 复制整个目录
-                dst.mkdir(parents=True, exist_ok=True)
+                # 复制到 workspace 根目录
                 for item in content_root.iterdir():
-                    item_dst = dst / item.name
+                    item_dst = workspace / item.name
+                    if item_dst.exists():
+                        if item_dst.is_dir():
+                            shutil.rmtree(item_dst)
+                        else:
+                            item_dst.unlink()
                     if item.is_dir():
                         shutil.copytree(item, item_dst)
                     else:
                         shutil.copy2(item, item_dst)
-                print(f"  ✓ 复制用户目录: {user_dir_name}/ -> {dst}")
+                print(f"  ✓ 复制用户目录: {content_root} -> {workspace}")
             else:
                 print(f"  ⚠ 用户目录不存在或不是目录: {user_path}")
 
