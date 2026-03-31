@@ -103,7 +103,7 @@ class WorkspaceManager:
     """管理 Agent 工作空间和文件"""
 
     def __init__(self, base_dir: str):
-        self.base_dir = Path(base_dir)
+        self.base_dir = Path(base_dir).expanduser()
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     def get_agent_workspace(self, agent_name: str) -> Path:
@@ -146,6 +146,15 @@ class WorkspaceManager:
         """
         workspace = self.get_agent_workspace(agent_name)
 
+        # 打印目标路径预览
+        print(f"  📂 workspace: {workspace}")
+        if skill_base_dir and agent_skills:
+            print(f"  📂 skills_dst: {workspace / 'skills'}")
+        if user_dir:
+            print(f"  📂 user_dir -> workspace: {Path(user_dir).expanduser()} -> {workspace}")
+        if hw_net_range == "blue":
+            print(f"  📂 TOOLS.md targets: {workspace / 'TOOLS.md'}, {self.base_dir / 'TOOLS.md'}")
+
         # 1. 从 agent_dir/<agent_name>/ 复制配置文件（SOUL.md, USER.md 等）
         if agent_dir and config_files:
             agent_source = Path(agent_dir) / agent_name
@@ -181,6 +190,7 @@ class WorkspaceManager:
         # 3. 整体复制 user_dir 到 workspace
         if user_dir:
             user_path = Path(user_dir).expanduser()
+            print(f'check user_path {user_path=}')
             if user_path.exists() and user_path.is_dir():
                 content_root = user_path / user_path.name
 
@@ -209,26 +219,11 @@ class WorkspaceManager:
             tools_src = Path(__file__).parent / "tools_instruction_blue.md"
             if tools_src.exists():
                 shutil.copy2(tools_src, workspace / "TOOLS.md")
+                workspace_main = self.base_dir
+                shutil.copy2(tools_src, workspace_main / "TOOLS.md")
                 print(f"  ✓ 写入 TOOLS.md (blue)")
             else:
                 print(f"  ⚠ tools_instruction_blue.md 不存在: {tools_src}")
-
-            # 修改 workspace 上一层的 openclaw.json，在 tools 下新增 deny
-            openclaw_json_path = workspace.parent / "openclaw.json"
-            if not openclaw_json_path.exists():
-                raise FileNotFoundError(f"openclaw.json 不存在: {openclaw_json_path}")
-            openclaw_cfg = json.loads(openclaw_json_path.read_text(encoding="utf-8"))
-            if "tools" not in openclaw_cfg:
-                openclaw_cfg["tools"] = {}
-            deny_list = openclaw_cfg["tools"].get("deny", [])
-            if "web_search" not in deny_list:
-                deny_list.append("web_search")
-            openclaw_cfg["tools"]["deny"] = deny_list
-            openclaw_json_path.write_text(
-                json.dumps(openclaw_cfg, ensure_ascii=False, indent=2),
-                encoding="utf-8"
-            )
-            print(f"  ✓ 更新 openclaw.json: tools.deny = [\"web_search\"]")
 
     def setup_from_map(self, map_file: str, base_dir: Optional[str] = None) -> None:
         """根据 map.json 按映射逐条复制文件/目录
