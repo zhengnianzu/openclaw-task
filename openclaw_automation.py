@@ -12,10 +12,11 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
-
+import os
+import tempfile
 from user_simulator import User_simulator
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, field_validator
 from openclaw_sdk import OpenClawClient, AgentConfig, ExecutionOptions
 from openclaw_sdk.core.types import ExecutionResult
 
@@ -38,25 +39,39 @@ class UserDirConfig(BaseModel):
     profile_file: Optional[str] = Field(None, description="用户画像 JSON 文件名（相对于 path），如 'profile_analyzed.json'")
 
 
-
 class InputDirConfig(BaseModel):
     """输入目录配置"""
     skill_dir: Optional[str] = Field(None, description="技能根目录路径，下面每个子目录对应一个技能")
     user_dir: Optional[UserDirConfig] = Field(None, description="用户目录，支持字符串路径或 {path, map_file} 对象")
     agent_dir: Optional[str] = Field(None, description="Agent 源文件目录，包含各 agent 的子目录（如 agent_dir/paper_reader/SOUL.md）")
 
-    @validator('skill_dir', pre=True)
+    @field_validator('skill_dir', mode='before')
+    @classmethod
     def coerce_skill_dir(cls, v):
         """兼容旧格式：空 dict {} 转为 None"""
         if isinstance(v, dict):
             return None
         return v
 
-    @validator('user_dir', pre=True)
+    @field_validator('user_dir', mode='before')
+    @classmethod
     def coerce_user_dir(cls, v):
-        """兼容旧格式：字符串自动转为 UserDirConfig"""
+        """兼容旧格式，同时拦截 path 为 null 的情况"""
+        # 1. 如果传进来的是普通字符串，转为对象
         if isinstance(v, str):
             return UserDirConfig(path=v)
+
+        # 2. 核心修改：如果传进来的是字典，且 path 为 null (None)
+        if isinstance(v, dict) and v.get('path') is None:
+            # 分配一个系统的临时空目录作为“虚空地址”
+            dummy_path = os.path.join(tempfile.gettempdir(), "openclaw_void_dir")
+            
+            # 如果这个虚空目录不存在，顺手建一个，防止后续文件系统操作报错
+            if not os.path.exists(dummy_path):
+                os.makedirs(dummy_path, exist_ok=True)
+            
+            v['path'] = dummy_path
+            print(f" ⚠ 检测到 user_dir.path 为空，已自动重定向至虚空地址: {dummy_path}")
         return v
 
 
@@ -703,7 +718,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="OpenClaw 自动化任务执行系统")
     parser.add_argument(
-        "config",
+        "--config",
         help="配置文件路径 (JSON/YAML)"
     )
     parser.add_argument(
