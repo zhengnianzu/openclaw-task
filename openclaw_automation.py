@@ -297,15 +297,18 @@ class AgentManager:
                 print(f"  ⚠ profile_file 不存在: {profile_path}，回退到 config.user_profile")
 
         # 解析 simulator 连接配置
-        if config.simulator_config:
-            proxy_cfg_path = Path(config.simulator_config)
-            if proxy_cfg_path.exists():
-                proxy_cfg = json.loads(proxy_cfg_path.read_text(encoding="utf-8"))
-                print(f"  📄 Simulator 配置来自: {proxy_cfg_path}")
-            else:
-                print(f"  ⚠ simulator_config 文件不存在: {proxy_cfg_path}，回退到环境变量")
-                proxy_cfg = {}
+        # 当 simulator_config 为空时，不创建 simulator，默认不进行多轮对话
+        if not config.simulator_config:
+            print("  ℹ simulator_config 未配置，将跳过多轮对话（仅执行单轮）")
+            self.simulator = None
+            return
+
+        proxy_cfg_path = Path(config.simulator_config)
+        if proxy_cfg_path.exists():
+            proxy_cfg = json.loads(proxy_cfg_path.read_text(encoding="utf-8"))
+            print(f"  📄 Simulator 配置来自: {proxy_cfg_path}")
         else:
+            print(f"  ⚠ simulator_config 文件不存在: {proxy_cfg_path}，回退到环境变量")
             proxy_cfg = {}
 
         model    = proxy_cfg.get("model")    or os.environ.get("SIMULATOR_MODEL", "gpt-4o")
@@ -405,7 +408,7 @@ class QueryOrchestrator:
 
         for idx, query in enumerate(queries, 1):
             print(f"\n📝 任务 {idx}/{len(queries)}: {query.agent_name}")
-            print(f"   Origin Query: {query.text[:100]}...")
+            print(f"   Origin Query: {query.text}")
 
             query_text = self._replace_variables(query.text)
 
@@ -416,9 +419,12 @@ class QueryOrchestrator:
 
             options = ExecutionOptions(timeout_seconds=query.timeout) if query.timeout else None
 
-            simulator.update_origin_query(query_text)
-
-            result, success = await self._run_conversation(agent, query_text, options, simulator)
+            if simulator is None:
+                # simulator_config 为空，仅执行单轮对话
+                result, success = await self._run_single(agent, query_text, options)
+            else:
+                simulator.update_origin_query(query_text)
+                result, success = await self._run_conversation(agent, query_text, options, simulator)
 
             result_key = f"result_{query.agent_name}"
             self.results[result_key] = result
@@ -428,6 +434,24 @@ class QueryOrchestrator:
                 break
 
         return self.results
+
+    async def _run_single(self, agent, query: str, options):
+        """单轮执行：不使用 simulator，仅发送一次查询并返回结果
+
+        Returns:
+            (result, success): result 为 ExecutionResult，success 基于 result 是否有内容
+        """
+        print(f"\n   [Single] 用户 → Agent: {query}")
+        try:
+            result = await agent.execute(query, options=options)
+            agent_reply = result.content
+            print(f"   [Single] Agent 回复: {agent_reply}")
+            return result, bool(agent_reply)
+        except Exception as e:
+            import traceback
+            print(f"   ✗ Agent 执行失败: {e}")
+            traceback.print_exc()
+            return None, False
 
     async def _run_conversation(self, agent, initial_query: str, options, simulator: User_simulator):
         """与 agent 进行多轮对话，由 simulator 模拟用户回复，直到任务结束
@@ -442,13 +466,13 @@ class QueryOrchestrator:
 
         while True:
             turn += 1
-            print(f"\n   [Turn {turn}] 用户 → Agent: {current_query[:100]}...")
+            print(f"\n   [Turn {turn}] 用户 → Agent: {current_query}...")
 
             try:
                 result = await agent.execute(current_query, options=options)
                 last_result = result
                 agent_reply = result.content
-                print(f"   [Turn {turn}] Agent 回复: {agent_reply[:200]}...")
+                print(f"   [Turn {turn}] Agent 回复: {agent_reply}")
             except Exception as e:
                 import traceback
                 print(f"   ✗ Agent 执行失败: {e}")
@@ -464,13 +488,25 @@ class QueryOrchestrator:
                 # 将 agent 回复交给 simulator，获取模拟用户的下一条消息
                 retry = 0
                 user_reply = simulator.chat(agent_reply)
-            print(f"   [Turn {turn}] Simulator 回复: {user_reply[:200]}...")
+            print(f"   [Turn {turn}] Simulator 回复: {user_reply}")
 
             if "【Task_Done】" in user_reply:
                 print(f"   ✓ 任务完成（Turn {turn}）")
+                closing = "真棒"
+                print(f"\n   [Turn {turn}+1] 用户 → Agent（收尾）: {closing}")
+                try:
+                    await agent.execute(closing, options=options)
+                except Exception:
+                    pass
                 return last_result, True
             elif "【Task_Failed】" in user_reply:
-                print(f"   ✗ 任务失败（Turn {turn}）：{user_reply[:200]}")
+                print(f"   ✗ 任务失败（Turn {turn}）：{user_reply}")
+                closing = "好吧"
+                print(f"\n   [Turn {turn}+1] 用户 → Agent（收尾）: {closing}")
+                try:
+                    await agent.execute(closing, options=options)
+                except Exception:
+                    pass
                 return last_result, False
 
             current_query = user_reply

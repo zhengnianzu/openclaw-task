@@ -115,7 +115,7 @@ class User_simulator:
                 logging.warning(f"API call failed (attempt {attempt + 1}/3): {e}")
         else:
             raise last_exc
-        print(response)
+        
         reply = response.choices[0].message.content
 
         # 记录本轮对话到历史（user=agent说的，assistant=simulator回复）
