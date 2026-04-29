@@ -1,0 +1,6 @@
+{
+  "model": "claude-haiku-4-5-20251001",
+  "api_key": "sk-1234",
+  "base_url": "http://127.0.0.1:4000",
+  "proxy": null
+}
