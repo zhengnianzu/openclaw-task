@@ -304,74 +304,73 @@ class WorkspaceManager:
 
 
 # ============================================================================
+# Simulator 工厂函数
+# ============================================================================
+
+def create_simulator(config: "AutomationConfig") -> Optional[User_simulator]:
+    """根据配置创建 User_simulator 实例，无配置则返回 None"""
+    import os
+
+    user_profile = config.user_profile
+    user_dir_cfg = config.input_dir.user_dir
+    if user_dir_cfg:
+        profile_filename = user_dir_cfg.profile_file or "user_profile.json"
+        profile_path = Path(user_dir_cfg.path) / profile_filename
+        if profile_path.exists():
+            profile_data = json.loads(profile_path.read_text(encoding="utf-8"))
+            user_profile = json.dumps(profile_data, ensure_ascii=False, indent=2)
+        elif user_dir_cfg.profile_file:
+            logger.warning("profile_file 不存在: %s，回退到 config.user_profile", profile_path)
+
+    if not config.simulator_config:
+        logger.info("simulator_config 未配置，将跳过多轮对话（仅执行单轮）")
+        return None
+
+    proxy_cfg_path = Path(config.simulator_config)
+    if proxy_cfg_path.exists():
+        proxy_cfg = json.loads(proxy_cfg_path.read_text(encoding="utf-8"))
+        logger.info("Simulator 配置来自: %s", proxy_cfg_path)
+    else:
+        logger.warning("simulator_config 文件不存在: %s，回退到环境变量", proxy_cfg_path)
+        proxy_cfg = {}
+
+    model    = proxy_cfg.get("model")    or os.environ.get("SIMULATOR_MODEL", "gpt-4o")
+    api_key  = proxy_cfg.get("api_key")  or os.environ.get("SIMULATOR_OPENAI_API_KEY")
+    base_url = proxy_cfg.get("base_url") or os.environ.get("SIMULATOR_OPENAI_BASE_URL")
+    proxy    = proxy_cfg.get("proxy")    or os.environ.get("SIMULATOR_PROXY")
+
+    user_directory = ""
+    if user_dir_cfg:
+        root = Path(user_dir_cfg.path)
+        if root.exists():
+            lines = []
+            for p in sorted(root.rglob("*")):
+                depth = len(p.relative_to(root).parts) - 1
+                indent = "    " * depth
+                lines.append(f"{indent}{'└── ' if p.is_file() else ''}{p.name}{'/' if p.is_dir() else ''}")
+            user_directory = "\n".join(lines)
+
+    return User_simulator(
+        origin_query="",
+        user_profile=user_profile,
+        user_directory=user_directory,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        proxy=proxy,
+    )
+
+
+# ============================================================================
 # Agent 管理器
 # ============================================================================
 
 class AgentManager:
-    """管理 Agent 的创建、配置和技能安装"""
+    """管理 Agent 的创建和注册"""
 
-    def __init__(self, client: OpenClawClient, workspace_manager: WorkspaceManager, config: "AutomationConfig"):
-        import os
+    def __init__(self, client: OpenClawClient, workspace_manager: WorkspaceManager):
         self.client = client
         self.workspace_manager = workspace_manager
-        self.agents: Dict[str, Any] = {}
-
-        # 解析 user_profile
-        user_profile = config.user_profile
-        user_dir_cfg = config.input_dir.user_dir
-        if user_dir_cfg:
-            # 优先使用显式配置的 profile_file，未配置则自动尝试 user_profile.json
-            profile_filename = user_dir_cfg.profile_file or "user_profile.json"
-            profile_path = Path(user_dir_cfg.path) / profile_filename
-            if profile_path.exists():
-                profile_data = json.loads(profile_path.read_text(encoding="utf-8"))
-                user_profile = json.dumps(profile_data, ensure_ascii=False, indent=2)
-            elif user_dir_cfg.profile_file:
-                # 只有显式配置了 profile_file 却不存在时才警告
-                logger.warning("profile_file 不存在: %s，回退到 config.user_profile", profile_path)
-
-        # 解析 simulator 连接配置
-        # 当 simulator_config 为空时，不创建 simulator，默认不进行多轮对话
-        if not config.simulator_config:
-            logger.info("simulator_config 未配置，将跳过多轮对话（仅执行单轮）")
-            self.simulator = None
-            return
-
-        proxy_cfg_path = Path(config.simulator_config)
-        if proxy_cfg_path.exists():
-            proxy_cfg = json.loads(proxy_cfg_path.read_text(encoding="utf-8"))
-            logger.info("Simulator 配置来自: %s", proxy_cfg_path)
-        else:
-            logger.warning("simulator_config 文件不存在: %s，回退到环境变量", proxy_cfg_path)
-            proxy_cfg = {}
-
-        model    = proxy_cfg.get("model")    or os.environ.get("SIMULATOR_MODEL", "gpt-4o")
-        api_key  = proxy_cfg.get("api_key")  or os.environ.get("SIMULATOR_OPENAI_API_KEY")
-        base_url = proxy_cfg.get("base_url") or os.environ.get("SIMULATOR_OPENAI_BASE_URL")
-        proxy    = proxy_cfg.get("proxy")    or os.environ.get("SIMULATOR_PROXY")
-
-        # 构建 user_directory 文件树字符串
-        user_directory = ""
-        if user_dir_cfg:
-            root = Path(user_dir_cfg.path)
-            if root.exists():
-                lines = []
-                for p in sorted(root.rglob("*")):
-                    depth = len(p.relative_to(root).parts) - 1
-                    indent = "    " * depth
-                    lines.append(f"{indent}{'└── ' if p.is_file() else ''}{p.name}{'/' if p.is_dir() else ''}")
-                user_directory = "\n".join(lines)
-
-        # origin_query 在首次执行前通过 update_origin_query 设置
-        self.simulator = User_simulator(
-            origin_query="",
-            user_profile=user_profile,
-            user_directory=user_directory,
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
-            proxy=proxy,
-        )
 
     async def setup_agent(self, agent_config: AgentConfigItem) -> None:
         """设置单个 Agent
@@ -382,36 +381,17 @@ class AgentManager:
         agent_name = agent_config.name
         logger.info("设置 Agent: %s", agent_name)
 
-        # 检查 agent 是否已在 gateway 注册
         existing_ids = {a.agent_id for a in await self.client.list_agents()}
 
-        if agent_name in existing_ids:
-            agent = self.client.get_agent(agent_name)
-            logger.info("已存在 Agent: %s", agent_name)
-        else:
+        if agent_name not in existing_ids:
             workspace = self.workspace_manager.get_agent_workspace(agent_name)
-            agent = await self.client.create_agent(
+            await self.client.create_agent(
                 AgentConfig(
                     agent_id=agent_name,
                     workspace=str(workspace),
                 )
             )
             logger.info("创建新 Agent: %s", agent_name)
-
-        self.agents[agent_name] = agent
-
-    def get_agent(self, agent_name: str, session_name: str = "main"):
-        """获取 Agent 实例
-
-        Args:
-            agent_name: Agent 名称
-            session_name: 会话名称，不同 session_name 对应独立的对话历史
-        """
-        if agent_name not in self.agents:
-            return None
-        if session_name == "main":
-            return self.agents[agent_name]
-        return self.client.get_agent(agent_name, session_name)
 
 
 # ============================================================================
@@ -421,8 +401,9 @@ class AgentManager:
 class QueryOrchestrator:
     """编排和执行查询任务"""
 
-    def __init__(self, agent_manager: AgentManager, config: "AutomationConfig"):
-        self.agent_manager = agent_manager
+    def __init__(self, client: OpenClawClient, simulator: Optional[User_simulator], config: "AutomationConfig"):
+        self.client = client
+        self.simulator = simulator
         self.config = config
         self.results: Dict[str, ExecutionResult] = {}
 
@@ -439,7 +420,7 @@ class QueryOrchestrator:
         logger.info("开始执行查询任务")
         logger.info("=" * 60)
 
-        simulator = self.agent_manager.simulator
+        simulator = self.simulator
 
         for idx, query in enumerate(queries, 1):
             logger.info("任务 %d/%d: %s", idx, len(queries), query.agent_name)
@@ -447,7 +428,7 @@ class QueryOrchestrator:
 
             query_text = self._replace_variables(query.text)
 
-            agent = self.agent_manager.get_agent(query.agent_name, query.session_name or "main")
+            agent = self.client.get_agent(query.agent_name, query.session_name or "main")
             logger.debug("agent: %s", agent)
             if not agent:
                 logger.error("Agent 不存在: %s，终止后续任务", query.agent_name)
@@ -462,7 +443,7 @@ class QueryOrchestrator:
             else:
                 simulator.update_origin_query(query_text)
                 result, success = await self._run_conversation(agent, query_text, options, simulator)
-
+     
             result_key = f"result_{query.agent_name}"
             self.results[result_key] = result
 
@@ -478,13 +459,12 @@ class QueryOrchestrator:
         Returns:
             (result, success): result 为 ExecutionResult，success 基于 result 是否有内容
         """
-        logger.debug("[Single] 用户 → Agent: %s", query)
         try:
             result = await agent.execute(query, options=options)
             agent_reply = result.content
             logger.debug("result: %s", result)
             logger.debug("agent: %s", agent)
-            logger.info("[A]: %s", agent_reply)
+            logger.info("[A] %s", agent_reply)
             return result, bool(agent_reply)
         except Exception as e:
             import traceback
@@ -610,7 +590,6 @@ class OpenClawAutomation:
         self.config = config
         self.workspace_manager = WorkspaceManager(config.workspace_base)
         self.client: Optional[OpenClawClient] = None
-        self.agent_manager: Optional[AgentManager] = None
         self.query_orchestrator: Optional[QueryOrchestrator] = None
 
     async def run(self) -> Dict[str, ExecutionResult]:
@@ -629,7 +608,7 @@ class OpenClawAutomation:
         # 注意：OpenClawClient.connect() 返回协程，需要先 await
         # 然后返回的 OpenClawClient 实例才支持 async with
         logger.debug("connect_kwargs: %s", connect_kwargs)
-        client = await OpenClawClient.connect() # **connect_kwargs
+        client = await OpenClawClient.connect(**connect_kwargs)
 
         async with client:
             self.client = client
@@ -637,7 +616,7 @@ class OpenClawAutomation:
             # 1. 设置工作空间
             await self._setup_workspaces()
 
-            # 2. 设置 Agents
+            # 2. 注册 Agents
             await self._setup_agents()
 
             # 3. 执行查询
@@ -696,17 +675,18 @@ class OpenClawAutomation:
         return str(p)
 
     async def _setup_agents(self) -> None:
-        """设置 Agents"""
+        """注册 Agents 到 gateway"""
         logger.info("设置 Agents...")
 
-        self.agent_manager = AgentManager(self.client, self.workspace_manager, self.config)
+        agent_manager = AgentManager(self.client, self.workspace_manager)
 
         for agent_config in self.config.agents:
-            await self.agent_manager.setup_agent(agent_config)
+            await agent_manager.setup_agent(agent_config)
 
     async def _execute_queries(self) -> Dict[str, ExecutionResult]:
         """执行查询"""
-        self.query_orchestrator = QueryOrchestrator(self.agent_manager, self.config)
+        simulator = create_simulator(self.config)
+        self.query_orchestrator = QueryOrchestrator(self.client, simulator, self.config)
         return await self.query_orchestrator.execute_queries(self.config.queries)
 
 
