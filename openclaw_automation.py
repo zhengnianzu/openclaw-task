@@ -142,6 +142,7 @@ class AutomationConfig(BaseModel):
     # User Simulator 配置
     user_profile: str = Field("", description="用户画像兜底文本，profile_file 不存在时使用")
     simulator_config: Optional[str] = Field(None, description="Simulator 配置 JSON 绝对路径，含 model/api_key/base_url/proxy；不配置则从环境变量读取")
+    user_max_turn: int = Field(5, description="多轮对话最大轮次")
 
 
 # ============================================================================
@@ -395,188 +396,127 @@ class AgentManager:
 
 
 # ============================================================================
-# 查询编排器
+# 查询执行
 # ============================================================================
 
-class QueryOrchestrator:
-    """编排和执行查询任务"""
+def _replace_variables(text: str, results: Dict[str, ExecutionResult]) -> str:
+    """替换查询文本中的变量，支持 {result_agent_name}"""
+    pattern = r'\{result_(\w+)\}'
 
-    def __init__(self, client: OpenClawClient, simulator: Optional[User_simulator], config: "AutomationConfig"):
-        self.client = client
-        self.simulator = simulator
-        self.config = config
-        self.results: Dict[str, ExecutionResult] = {}
+    def replacer(match):
+        result_key = match.group(0)[1:-1]
+        result = results.get(result_key)
+        if result is None:
+            return f"[Error: {result_key} not found]"
+        elif hasattr(result, 'content'):
+            return result.content
+        return str(result)
 
-    async def execute_queries(self, queries: List[QueryItem]) -> Dict[str, ExecutionResult]:
-        """在同一 agent 内按顺序执行查询任务，前一个成功后才执行下一个，失败则终止
+    return re.sub(pattern, replacer, text)
 
-        Args:
-            queries: 查询任务列表
 
-        Returns:
-            执行结果字典 {result_agent_name: ExecutionResult}
-        """
-        logger.info("=" * 60)
-        logger.info("开始执行查询任务")
-        logger.info("=" * 60)
+async def execute_queries(
+    client: OpenClawClient,
+    queries: List[QueryItem],
+    simulator: Optional[User_simulator] = None,
+    max_turn: int = 5,
+) -> Dict[str, ExecutionResult]:
+    """执行查询任务列表
 
-        simulator = self.simulator
+    外循环遍历每个 query；当 simulator 存在时，内循环进行多轮对话，
+    受 max_turn 控制。
 
-        for idx, query in enumerate(queries, 1):
-            logger.info("任务 %d/%d: %s", idx, len(queries), query.agent_name)
-            logger.info("[Q] %s", query.text)
+    Args:
+        client: OpenClaw 客户端
+        queries: 查询任务列表
+        simulator: 用户模拟器，None 则仅单轮
+        max_turn: 多轮对话最大轮次
 
-            query_text = self._replace_variables(query.text)
+    Returns:
+        {result_agent_name: ExecutionResult}
+    """
+    logger.info("=" * 60)
+    logger.info("开始执行查询任务")
+    logger.info("=" * 60)
 
-            agent = self.client.get_agent(query.agent_name, query.session_name or "main")
-            logger.debug("agent: %s", agent)
-            if not agent:
-                logger.error("Agent 不存在: %s，终止后续任务", query.agent_name)
-                break
+    results: Dict[str, ExecutionResult] = {}
 
-            options = ExecutionOptions(timeout_seconds=query.timeout) if query.timeout else None
-            logger.debug("options: %s", options)
+    for idx, query in enumerate(queries, 1):
+        logger.info("任务 %d/%d: [%s|%s]", idx, len(queries), query.agent_name, query.session_name)
+        logger.info("[Q] %s", query.text)
 
-            if simulator is None:
-                # simulator_config 为空，仅执行单轮对话
-                result, success = await self._run_single(agent, query_text, options)
-            else:
-                simulator.update_origin_query(query_text)
-                result, success = await self._run_conversation(agent, query_text, options, simulator)
-     
-            result_key = f"result_{query.agent_name}"
-            self.results[result_key] = result
+        query_text = _replace_variables(query.text, results)        
+        options = ExecutionOptions(timeout_seconds=query.timeout) if query.timeout else None
 
-            if not success:
-                logger.error("任务 %d 失败，终止后续 %d 个任务", idx, len(queries) - idx)
-                break
+        if simulator is not None:
+            simulator.update_origin_query(query_text)
 
-        return self.results
-
-    async def _run_single(self, agent, query: str, options):
-        """单轮执行：不使用 simulator，仅发送一次查询并返回结果
-
-        Returns:
-            (result, success): result 为 ExecutionResult，success 基于 result 是否有内容
-        """
-        try:
-            result = await agent.execute(query, options=options)
-            agent_reply = result.content
-            logger.debug("result: %s", result)
-            logger.debug("agent: %s", agent)
-            logger.info("[A] %s", agent_reply)
-            return result, bool(agent_reply)
-        except Exception as e:
-            import traceback
-            logger.error("Agent 执行失败: %s", e)
-            logger.debug(traceback.format_exc())
-            return None, False
-
-    async def _run_conversation(self, agent, initial_query: str, options, simulator: User_simulator):
-        """与 agent 进行多轮对话，由 simulator 模拟用户回复，直到任务结束
-
-        Returns:
-            (result, success): result 为最后一次 ExecutionResult，success 为是否 Task_Done
-        """
-        current_query = initial_query
+        current_query = query_text
         last_result = None
-        turn = 0
+        success = False
         retry = 0
 
-        while True:
-            turn += 1
-            logger.debug("[Q%d] 用户 → Agent: %s", turn, current_query)
+        for turn in range(1, max_turn + 1 if simulator else 2):
+            logger.debug("[Q%d] %s", turn, current_query)
+            agent = client.get_agent(query.agent_name, query.session_name or "main")
 
             try:
                 result = await agent.execute(current_query, options=options)
                 last_result = result
                 agent_reply = result.content
-                logger.info("[Q%d] Agent 回复: %s", turn, agent_reply)
+                logger.info("[A%d] %s", turn, agent_reply)
             except Exception as e:
                 import traceback
                 logger.error("Agent 执行失败: %s", e)
                 logger.debug(traceback.format_exc())
-                return None, False
+                break
+
             if not agent_reply:
-                user_reply = "没有看到你的回复，请重新执行。"
                 retry += 1
                 if retry >= 3:
                     logger.error("连续3次未收到回复，任务失败")
-                    return last_result, False
-            else:
-                # 将 agent 回复交给 simulator，获取模拟用户的下一条消息
-                retry = 0
-                user_reply = simulator.chat(agent_reply)
-            logger.debug("[Q%d] Simulator 回复: %s", turn, user_reply)
+                    break
+                current_query = "没有看到你的回复，请重新执行。"
+                continue
+
+            retry = 0
+
+            if simulator is None:
+                success = True
+                break
+
+            user_reply = simulator.chat(agent_reply)
+            logger.debug("[S%d] %s", turn, user_reply)
 
             if "【Task_Done】" in user_reply:
-                logger.info("任务完成（END）", turn)
-                closing = "真棒"
-                logger.debug("[END]: %s", turn, closing)
+                logger.info("任务完成（Turn %d）", turn)
                 try:
-                    await agent.execute(closing, options=options)
+                    await agent.execute("真棒", options=options)
                 except Exception:
                     pass
-                return last_result, True
+                success = True
+                break
             elif "【Task_Failed】" in user_reply:
-                logger.error("任务失败（END）：%s", turn, user_reply)
-                closing = "好吧"
-                logger.debug("[END]: %s", turn, closing)
+                logger.error("任务失败（Turn %d）：%s", turn, user_reply)
                 try:
-                    await agent.execute(closing, options=options)
+                    await agent.execute("好吧", options=options)
                 except Exception:
                     pass
-                return last_result, False
+                break
 
             current_query = user_reply
+        else:
+            if simulator is not None:
+                logger.warning("达到最大轮次 %d，任务未完成", max_turn)
 
-    def _replace_variables(self, text: str) -> str:
-        """替换查询文本中的变量
+        results[f"result_{query.agent_name}"] = last_result
 
-        支持格式：{result_agent_name}
-        """
-        pattern = r'\{result_(\w+)\}'
+        if not success:
+            logger.error("任务 %d 失败，终止后续 %d 个任务", idx, len(queries) - idx)
+            break
 
-        def replacer(match):
-            result_key = match.group(0)[1:-1]  # 去掉 {}
-            result = self.results.get(result_key)
+    return results
 
-            if result is None:
-                return f"[Error: {result_key} not found]"
-            elif hasattr(result, 'content'):
-                return result.content
-            else:
-                return str(result)
-
-        return re.sub(pattern, replacer, text)
-
-    def generate_report(self, output_file: Optional[str] = None) -> str:
-        """生成执行报告"""
-        report_lines = [
-            "\n" + "="*60,
-            "📊 执行报告",
-            "="*60,
-            ""
-        ]
-
-        for idx, (key, result) in enumerate(self.results.items(), 1):
-            if result is None:
-                report_lines.append(f"{idx}. {key}: 执行失败")
-            else:
-                report_lines.append(f"{idx}. {key}:")
-                report_lines.append(f"   状态: {'成功' if result.success else '失败'}")
-                report_lines.append(f"   耗时: {result.latency_ms}ms")
-                report_lines.append(f"   内容预览: {result.content[:150]}...")
-                report_lines.append("")
-
-        report = "\n".join(report_lines)
-
-        # 输出到文件
-        if output_file:
-            Path(output_file).write_text(report, encoding="utf-8")
-            logger.info("报告已保存到: %s", output_file)
-
-        return report
 
 
 # ============================================================================
@@ -589,8 +529,6 @@ class OpenClawAutomation:
     def __init__(self, config: AutomationConfig):
         self.config = config
         self.workspace_manager = WorkspaceManager(config.workspace_base)
-        self.client: Optional[OpenClawClient] = None
-        self.query_orchestrator: Optional[QueryOrchestrator] = None
 
     async def run(self) -> Dict[str, ExecutionResult]:
         """运行自动化流程"""
@@ -620,10 +558,13 @@ class OpenClawAutomation:
             await self._setup_agents()
 
             # 3. 执行查询
-            results = await self._execute_queries()
-
-            # 4. 生成报告
-            self.query_orchestrator.generate_report("execution_report.txt")
+            simulator = create_simulator(self.config)
+            results = await execute_queries(
+                client,
+                self.config.queries,
+                simulator=simulator,
+                max_turn=self.config.user_max_turn,
+            )
 
             return results
 
@@ -683,11 +624,6 @@ class OpenClawAutomation:
         for agent_config in self.config.agents:
             await agent_manager.setup_agent(agent_config)
 
-    async def _execute_queries(self) -> Dict[str, ExecutionResult]:
-        """执行查询"""
-        simulator = create_simulator(self.config)
-        self.query_orchestrator = QueryOrchestrator(self.client, simulator, self.config)
-        return await self.query_orchestrator.execute_queries(self.config.queries)
 
 
 # ============================================================================
