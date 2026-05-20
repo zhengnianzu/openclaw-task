@@ -356,17 +356,9 @@ class AgentManager:
             # 创建新 Agent
             workspace = self.workspace_manager.get_agent_workspace(agent_name)
 
-            # 读取系统提示词（如果有 SOUL.md）
-            system_prompt = agent_config.system_prompt
-            if not system_prompt and "SOUL.md" in agent_config.config:
-                soul_file = workspace / "SOUL.md"
-                if soul_file.exists():
-                    system_prompt = soul_file.read_text(encoding="utf-8")
-
             agent = await self.client.create_agent(
                 AgentConfig(
                     agent_id=agent_name,
-                    system_prompt=system_prompt or f"You are {agent_name} assistant.",
                     workspace=str(workspace),
                 )
             )
