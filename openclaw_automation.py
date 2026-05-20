@@ -465,6 +465,9 @@ async def execute_queries(
                 last_result = result
                 agent_reply = result.content
                 logger.info("[A%d] %s", turn, agent_reply)
+                if not agent_reply:
+                    logger.debug(result)
+
             except Exception as e:
                 import traceback
                 logger.error("Agent 执行失败: %s", e)
@@ -546,9 +549,9 @@ class OpenClawAutomation:
         # 注意：OpenClawClient.connect() 返回协程，需要先 await
         # 然后返回的 OpenClawClient 实例才支持 async with
         logger.debug("connect_kwargs: %s", connect_kwargs)
-        client = await OpenClawClient.connect(**connect_kwargs)
+        # client = await OpenClawClient.connect(**connect_kwargs)
 
-        async with client:
+        async with await OpenClawClient.connect() as client:
             self.client = client
 
             # 1. 设置工作空间
