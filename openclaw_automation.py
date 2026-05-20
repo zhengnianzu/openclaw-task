@@ -7,6 +7,7 @@ OpenClaw 自动化任务执行系统
 
 import asyncio
 import json
+import logging
 import re
 import shutil
 from pathlib import Path
@@ -19,6 +20,39 @@ from user_simulator import User_simulator
 from pydantic import BaseModel, Field, validator, field_validator
 from openclaw_sdk import OpenClawClient, AgentConfig, ExecutionOptions
 from openclaw_sdk.core.types import ExecutionResult
+
+
+def setup_logger(config_file: Optional[str] = None) -> logging.Logger:
+    logger = logging.getLogger("openclaw_automation")
+    logger.setLevel(logging.DEBUG)
+
+    if logger.handlers:
+        return logger
+
+    log_dir = Path(__file__).parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+
+    if config_file:
+        log_name = Path(config_file).stem + ".log"
+    else:
+        log_name = "openclaw_automation.log"
+
+    fh = logging.FileHandler(log_dir / log_name, encoding="utf-8", mode="w")
+    fh.setLevel(logging.DEBUG)
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    fh.setFormatter(fmt)
+    ch.setFormatter(fmt)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger
+
+
+logger = logging.getLogger("openclaw_automation")
 
 
 # ============================================================================
@@ -71,7 +105,8 @@ class InputDirConfig(BaseModel):
                 os.makedirs(dummy_path, exist_ok=True)
             
             v['path'] = dummy_path
-            print(f" ⚠ 检测到 user_dir.path 为空，已自动重定向至虚空地址: {dummy_path}")
+            logging.getLogger("openclaw_automation").warning(
+                "检测到 user_dir.path 为空，已自动重定向至虚空地址: %s", dummy_path)
         return v
 
 
@@ -159,12 +194,11 @@ class WorkspaceManager:
         """
         workspace = self.get_agent_workspace(agent_name)
 
-        # 打印目标路径预览
-        print(f"  📂 workspace: {workspace}")
+        logger.info("workspace: %s", workspace)
         if skill_base_dir and agent_skills:
-            print(f"  📂 skills_dst: {workspace / 'skills'}")
+            logger.info("skills_dst: %s", workspace / 'skills')
         if user_dir:
-            print(f"  📂 user_dir -> workspace: {Path(user_dir).expanduser()} -> {workspace}")
+            logger.info("user_dir -> workspace: %s -> %s", Path(user_dir).expanduser(), workspace)
 
         # 1. 从 agent_dir/ 复制配置文件（SOUL.md, USER.md, TOOLS.md 等）
         if agent_dir and config_files:
@@ -175,15 +209,15 @@ class WorkspaceManager:
                     if src.exists():
                         dst = workspace / config_file
                         shutil.copy2(src, dst)
-                        print(f"  ✓ 复制 Agent 配置: {config_file} -> {dst}")
+                        logger.info("复制 Agent 配置: %s -> %s", config_file, dst)
                         # 同时复制到 workspace 主目录
                         dst_main = self.base_dir / config_file
                         shutil.copy2(src, dst_main)
-                        print(f"  ✓ 复制 Agent 配置: {config_file} -> {dst_main}")
+                        logger.info("复制 Agent 配置: %s -> %s", config_file, dst_main)
                     else:
-                        print(f"  ⚠ Agent 配置文件不存在: {src}")
+                        logger.warning("Agent 配置文件不存在: %s", src)
             else:
-                print(f"  ⚠ Agent 源目录不存在: {agent_source}")
+                logger.warning("Agent 源目录不存在: %s", agent_source)
 
         # 2. 复制技能目录：skill_base_dir/<skill_path>/ -> workspace/skills/<skill_name>/
         if skill_base_dir and agent_skills:
@@ -198,19 +232,19 @@ class WorkspaceManager:
                     if dst.exists():
                         shutil.rmtree(dst)
                     shutil.copytree(src, dst)
-                    print(f"  ✓ 复制技能: {skill_path} -> {dst}")
+                    logger.info("复制技能: %s -> %s", skill_path, dst)
                 else:
-                    print(f"  ⚠ 技能目录不存在: {src}")
+                    logger.warning("技能目录不存在: %s", src)
 
         # 3. 整体复制 user_dir 到 workspace
         if user_dir:
             user_path = Path(user_dir).expanduser()
-            print(f'check user_path {user_path=}')
+            logger.debug("check user_path: %s", user_path)
             if user_path.exists() and user_path.is_dir():
                 content_root = user_path / user_path.name
 
                 if not content_root.exists() or not content_root.is_dir():
-                    print(f"  Warning: user_dir content root does not exist or is not a directory: {content_root}")
+                    logger.warning("user_dir content root does not exist or is not a directory: %s", content_root)
                     return
 
                 # 复制到 workspace 根目录
@@ -225,9 +259,9 @@ class WorkspaceManager:
                         shutil.copytree(item, item_dst)
                     else:
                         shutil.copy2(item, item_dst)
-                print(f"  ✓ 复制用户目录: {content_root} -> {workspace}")
+                logger.info("复制用户目录: %s -> %s", content_root, workspace)
             else:
-                print(f"  ⚠ 用户目录不存在或不是目录: {user_path}")
+                logger.warning("用户目录不存在或不是目录: %s", user_path)
 
     def setup_from_map(self, map_file: str, base_dir: Optional[str] = None) -> None:
         """根据 map.json 按映射逐条复制文件/目录
@@ -240,21 +274,21 @@ class WorkspaceManager:
         """
         map_path = Path(map_file)
         if not map_path.exists():
-            print(f"  ⚠ map 文件不存在: {map_path}")
+            logger.warning("map 文件不存在: %s", map_path)
             return
 
         mapping: Dict[str, str] = json.loads(map_path.read_text(encoding="utf-8"))
         base = Path(base_dir) if base_dir else None
-        print(f"  📄 读取 map 文件: {map_path}，共 {len(mapping)} 条映射")
+        logger.info("读取 map 文件: %s，共 %d 条映射", map_path, len(mapping))
         if base:
-            print(f"  📂 源路径基准目录: {base}")
+            logger.info("源路径基准目录: %s", base)
 
         for src_str, dst_str in mapping.items():
             src = (base / src_str) if base else Path(src_str).expanduser()
             dst = Path(dst_str).expanduser()
 
             if not src.exists():
-                print(f"  ⚠ 源路径不存在，跳过: {src}")
+                logger.warning("源路径不存在，跳过: %s", src)
                 continue
 
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -266,7 +300,7 @@ class WorkspaceManager:
             else:
                 shutil.copy2(src, dst)
 
-            print(f"  ✓ 映射复制: {src_str} -> {dst_str}")
+            logger.info("映射复制: %s -> %s", src_str, dst_str)
 
 
 # ============================================================================
@@ -294,21 +328,21 @@ class AgentManager:
                 user_profile = json.dumps(profile_data, ensure_ascii=False, indent=2)
             elif user_dir_cfg.profile_file:
                 # 只有显式配置了 profile_file 却不存在时才警告
-                print(f"  ⚠ profile_file 不存在: {profile_path}，回退到 config.user_profile")
+                logger.warning("profile_file 不存在: %s，回退到 config.user_profile", profile_path)
 
         # 解析 simulator 连接配置
         # 当 simulator_config 为空时，不创建 simulator，默认不进行多轮对话
         if not config.simulator_config:
-            print("  ℹ simulator_config 未配置，将跳过多轮对话（仅执行单轮）")
+            logger.info("simulator_config 未配置，将跳过多轮对话（仅执行单轮）")
             self.simulator = None
             return
 
         proxy_cfg_path = Path(config.simulator_config)
         if proxy_cfg_path.exists():
             proxy_cfg = json.loads(proxy_cfg_path.read_text(encoding="utf-8"))
-            print(f"  📄 Simulator 配置来自: {proxy_cfg_path}")
+            logger.info("Simulator 配置来自: %s", proxy_cfg_path)
         else:
-            print(f"  ⚠ simulator_config 文件不存在: {proxy_cfg_path}，回退到环境变量")
+            logger.warning("simulator_config 文件不存在: %s，回退到环境变量", proxy_cfg_path)
             proxy_cfg = {}
 
         model    = proxy_cfg.get("model")    or os.environ.get("SIMULATOR_MODEL", "gpt-4o")
@@ -346,29 +380,38 @@ class AgentManager:
             agent_config: Agent 配置
         """
         agent_name = agent_config.name
-        print(f"\n📦 设置 Agent: {agent_name}")
+        logger.info("设置 Agent: %s", agent_name)
 
-        # 获取或创建 Agent
-        try:
+        # 检查 agent 是否已在 gateway 注册
+        existing_ids = {a.agent_id for a in await self.client.list_agents()}
+
+        if agent_name in existing_ids:
             agent = self.client.get_agent(agent_name)
-            print(f"  ✓ 已存在 Agent: {agent_name}")
-        except Exception:
-            # 创建新 Agent
+            logger.info("已存在 Agent: %s", agent_name)
+        else:
             workspace = self.workspace_manager.get_agent_workspace(agent_name)
-
             agent = await self.client.create_agent(
                 AgentConfig(
                     agent_id=agent_name,
                     workspace=str(workspace),
                 )
             )
-            print(f"  ✓ 创建新 Agent: {agent_name}")
+            logger.info("创建新 Agent: %s", agent_name)
 
         self.agents[agent_name] = agent
 
-    def get_agent(self, agent_name: str):
-        """获取 Agent 实例"""
-        return self.agents.get(agent_name)
+    def get_agent(self, agent_name: str, session_name: str = "main"):
+        """获取 Agent 实例
+
+        Args:
+            agent_name: Agent 名称
+            session_name: 会话名称，不同 session_name 对应独立的对话历史
+        """
+        if agent_name not in self.agents:
+            return None
+        if session_name == "main":
+            return self.agents[agent_name]
+        return self.client.get_agent(agent_name, session_name)
 
 
 # ============================================================================
@@ -392,24 +435,26 @@ class QueryOrchestrator:
         Returns:
             执行结果字典 {result_agent_name: ExecutionResult}
         """
-        print("\n" + "="*60)
-        print("🚀 开始执行查询任务")
-        print("="*60)
+        logger.info("=" * 60)
+        logger.info("开始执行查询任务")
+        logger.info("=" * 60)
 
         simulator = self.agent_manager.simulator
 
         for idx, query in enumerate(queries, 1):
-            print(f"\n📝 任务 {idx}/{len(queries)}: {query.agent_name}")
-            print(f"   Origin Query: {query.text}")
+            logger.info("任务 %d/%d: %s", idx, len(queries), query.agent_name)
+            logger.info("[Q] %s", query.text)
 
             query_text = self._replace_variables(query.text)
 
-            agent = self.agent_manager.get_agent(query.agent_name)
+            agent = self.agent_manager.get_agent(query.agent_name, query.session_name or "main")
+            logger.debug("agent: %s", agent)
             if not agent:
-                print(f"   ✗ Agent 不存在: {query.agent_name}，终止后续任务")
+                logger.error("Agent 不存在: %s，终止后续任务", query.agent_name)
                 break
 
             options = ExecutionOptions(timeout_seconds=query.timeout) if query.timeout else None
+            logger.debug("options: %s", options)
 
             if simulator is None:
                 # simulator_config 为空，仅执行单轮对话
@@ -422,7 +467,7 @@ class QueryOrchestrator:
             self.results[result_key] = result
 
             if not success:
-                print(f"   任务 {idx} 失败，终止后续 {len(queries) - idx} 个任务")
+                logger.error("任务 %d 失败，终止后续 %d 个任务", idx, len(queries) - idx)
                 break
 
         return self.results
@@ -433,16 +478,18 @@ class QueryOrchestrator:
         Returns:
             (result, success): result 为 ExecutionResult，success 基于 result 是否有内容
         """
-        print(f"\n   [Single] 用户 → Agent: {query}")
+        logger.debug("[Single] 用户 → Agent: %s", query)
         try:
             result = await agent.execute(query, options=options)
             agent_reply = result.content
-            print(f"   [Single] Agent 回复: {agent_reply}")
+            logger.debug("result: %s", result)
+            logger.debug("agent: %s", agent)
+            logger.info("[A]: %s", agent_reply)
             return result, bool(agent_reply)
         except Exception as e:
             import traceback
-            print(f"   ✗ Agent 执行失败: {e}")
-            traceback.print_exc()
+            logger.error("Agent 执行失败: %s", e)
+            logger.debug(traceback.format_exc())
             return None, False
 
     async def _run_conversation(self, agent, initial_query: str, options, simulator: User_simulator):
@@ -458,43 +505,43 @@ class QueryOrchestrator:
 
         while True:
             turn += 1
-            print(f"\n   [Turn {turn}] 用户 → Agent: {current_query}...")
+            logger.debug("[Q%d] 用户 → Agent: %s", turn, current_query)
 
             try:
                 result = await agent.execute(current_query, options=options)
                 last_result = result
                 agent_reply = result.content
-                print(f"   [Turn {turn}] Agent 回复: {agent_reply}")
+                logger.info("[Q%d] Agent 回复: %s", turn, agent_reply)
             except Exception as e:
                 import traceback
-                print(f"   ✗ Agent 执行失败: {e}")
-                traceback.print_exc()
+                logger.error("Agent 执行失败: %s", e)
+                logger.debug(traceback.format_exc())
                 return None, False
             if not agent_reply:
                 user_reply = "没有看到你的回复，请重新执行。"
                 retry += 1
                 if retry >= 3:
-                    print(f"   ✗ 连续3次未收到回复，任务失败")
+                    logger.error("连续3次未收到回复，任务失败")
                     return last_result, False
             else:
                 # 将 agent 回复交给 simulator，获取模拟用户的下一条消息
                 retry = 0
                 user_reply = simulator.chat(agent_reply)
-            print(f"   [Turn {turn}] Simulator 回复: {user_reply}")
+            logger.debug("[Q%d] Simulator 回复: %s", turn, user_reply)
 
             if "【Task_Done】" in user_reply:
-                print(f"   ✓ 任务完成（Turn {turn}）")
+                logger.info("任务完成（END）", turn)
                 closing = "真棒"
-                print(f"\n   [Turn {turn}+1] 用户 → Agent（收尾）: {closing}")
+                logger.debug("[END]: %s", turn, closing)
                 try:
                     await agent.execute(closing, options=options)
                 except Exception:
                     pass
                 return last_result, True
             elif "【Task_Failed】" in user_reply:
-                print(f"   ✗ 任务失败（Turn {turn}）：{user_reply}")
+                logger.error("任务失败（END）：%s", turn, user_reply)
                 closing = "好吧"
-                print(f"\n   [Turn {turn}+1] 用户 → Agent（收尾）: {closing}")
+                logger.debug("[END]: %s", turn, closing)
                 try:
                     await agent.execute(closing, options=options)
                 except Exception:
@@ -547,7 +594,7 @@ class QueryOrchestrator:
         # 输出到文件
         if output_file:
             Path(output_file).write_text(report, encoding="utf-8")
-            print(f"\n💾 报告已保存到: {output_file}")
+            logger.info("报告已保存到: %s", output_file)
 
         return report
 
@@ -568,9 +615,9 @@ class OpenClawAutomation:
 
     async def run(self) -> Dict[str, ExecutionResult]:
         """运行自动化流程"""
-        print("="*60)
-        print("🤖 OpenClaw 自动化任务系统")
-        print("="*60)
+        logger.info("=" * 60)
+        logger.info("OpenClaw 自动化任务系统")
+        logger.info("=" * 60)
 
         # 构建连接参数
         connect_kwargs = {}
@@ -581,7 +628,8 @@ class OpenClawAutomation:
 
         # 注意：OpenClawClient.connect() 返回协程，需要先 await
         # 然后返回的 OpenClawClient 实例才支持 async with
-        client = await OpenClawClient.connect(**connect_kwargs)
+        logger.debug("connect_kwargs: %s", connect_kwargs)
+        client = await OpenClawClient.connect() # **connect_kwargs
 
         async with client:
             self.client = client
@@ -602,7 +650,7 @@ class OpenClawAutomation:
 
     async def _setup_workspaces(self) -> None:
         """设置工作空间"""
-        print("\n📁 设置工作空间...")
+        logger.info("设置工作空间...")
 
         # 解析 user_dir：有 map_file 则按映射复制，否则整体复制（旧行为）
         user_dir_config = self.config.input_dir.user_dir
@@ -649,7 +697,7 @@ class OpenClawAutomation:
 
     async def _setup_agents(self) -> None:
         """设置 Agents"""
-        print("\n🤖 设置 Agents...")
+        logger.info("设置 Agents...")
 
         self.agent_manager = AgentManager(self.client, self.workspace_manager, self.config)
 
@@ -721,6 +769,9 @@ async def main(config_file: Optional[str] = None, config_dict: Optional[Dict] = 
         # 从字典加载
         await main(config_dict={...})
     """
+    # 初始化 logger
+    setup_logger(config_file)
+
     # 加载配置
     if config_file:
         config = ConfigLoader.load_from_file(config_file)
@@ -733,7 +784,7 @@ async def main(config_file: Optional[str] = None, config_dict: Optional[Dict] = 
     automation = OpenClawAutomation(config)
     results = await automation.run()
 
-    print("\n✅ 所有任务执行完成！")
+    logger.info("所有任务执行完成！")
     return results
 
 
