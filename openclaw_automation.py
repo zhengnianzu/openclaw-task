@@ -19,7 +19,10 @@ from user_simulator import User_simulator
 
 from pydantic import BaseModel, Field, validator, field_validator
 from openclaw_sdk import OpenClawClient, AgentConfig, ExecutionOptions
+from openclaw_sdk.core.config import ClientConfig
 from openclaw_sdk.core.types import ExecutionResult
+from openclaw_sdk.core.exceptions import GatewayError
+from openclaw_sdk.gateway.protocol import ProtocolGateway
 
 
 def setup_logger(config_file: Optional[str] = None) -> logging.Logger:
@@ -53,6 +56,37 @@ def setup_logger(config_file: Optional[str] = None) -> logging.Logger:
 
 
 logger = logging.getLogger("openclaw_automation")
+
+
+async def build_openclaw_client(
+    gateway_ws_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    gateway_timeout: Optional[int] = None,
+) -> OpenClawClient:
+    """手动构造 client，确保 gateway_timeout 作用于 WS 建连超时。"""
+    config = ClientConfig(
+        mode="protocol" if gateway_ws_url else "auto",
+        gateway_ws_url=gateway_ws_url,
+        api_key=api_key,
+        timeout=gateway_timeout or 300,
+    )
+    connect_timeout = float(gateway_timeout or 10)
+    default_timeout = float(gateway_timeout or 300)
+
+    gateway = ProtocolGateway(
+        ws_url=gateway_ws_url or "ws://127.0.0.1:18789/gateway",
+        token=api_key,
+        connect_timeout=connect_timeout,
+        default_timeout=default_timeout,
+        retry_policy=config.retry_policy,
+    )
+    try:
+        # SDK 内部 connect() 可能在 backoff 循环里停留很久，这里再包一层总超时。
+        await asyncio.wait_for(gateway.connect(), timeout=connect_timeout + 5.0)
+    except Exception:
+        await gateway.close()
+        raise
+    return OpenClawClient(config=config, gateway=gateway)
 
 
 # ============================================================================
@@ -137,12 +171,29 @@ class AutomationConfig(BaseModel):
     # OpenClaw 连接配置
     gateway_ws_url: Optional[str] = Field(None, description="WebSocket 网关 URL")
     api_key: Optional[str] = Field(None, description="API Key")
+    gateway_timeout: Optional[int] = Field(None, description="Gateway 连接/调用超时（秒）")
     workspace_base: str = Field(r"C:\Users\nianzu\.openclaw\workspace", description="工作空间基础目录")
 
     # User Simulator 配置
     user_profile: str = Field("", description="用户画像兜底文本，profile_file 不存在时使用")
     simulator_config: Optional[str] = Field(None, description="Simulator 配置 JSON 绝对路径，含 model/api_key/base_url/proxy；不配置则从环境变量读取")
     user_max_turn: int = Field(5, description="多轮对话最大轮次")
+
+    @field_validator("gateway_ws_url", mode="before")
+    @classmethod
+    def normalize_gateway_ws_url(cls, v):
+        """兼容只填 host:port 的写法，自动补全 /gateway。"""
+        if not isinstance(v, str):
+            return v
+
+        url = v.strip()
+        if not url:
+            return None
+
+        if url.startswith(("ws://", "wss://")) and "/gateway" not in url:
+            return url.rstrip("/") + "/gateway"
+
+        return url
 
 
 # ============================================================================
@@ -441,12 +492,104 @@ async def execute_queries(
 
     results: Dict[str, ExecutionResult] = {}
 
+    async def wait_for_execution_ready(agent_name: str, session_name: str) -> None:
+        """执行前等待连接恢复，并测试当前 session 是否可访问。"""
+        max_attempts = 4
+        wait_seconds = 40
+
+        for attempt in range(1, max_attempts + 1):
+            gateway = client.gateway
+            if not getattr(gateway, "_connected", False):
+                logger.warning(
+                    "gateway 未连接，第 %d/%d 次等待 %d 秒后重连",
+                    attempt,
+                    max_attempts,
+                    wait_seconds,
+                )
+                await asyncio.sleep(wait_seconds)
+                await gateway.connect()
+
+            agent = client.get_agent(agent_name, session_name)
+            try:
+                preview = await agent.get_memory_status()
+                logger.info(
+                    "execution ready: agent=%s session=%s attempt=%d preview=%s",
+                    agent_name,
+                    session_name,
+                    attempt,
+                    preview,
+                )
+                return
+            except Exception as e:
+                logger.warning(
+                    "session preview 失败，第 %d/%d 次: agent=%s session=%s err=%s",
+                    attempt,
+                    max_attempts,
+                    agent_name,
+                    session_name,
+                    e,
+                )
+
+            if attempt < max_attempts:
+                logger.warning(
+                    "等待 %d 秒后继续重连并测试: agent=%s session=%s",
+                    wait_seconds,
+                    agent_name,
+                    session_name,
+                )
+                await asyncio.sleep(wait_seconds)
+
+        raise RuntimeError(
+            f"execution not ready after {max_attempts} attempts: "
+            f"agent={agent_name} session={session_name}"
+        )
+
+    async def execute_with_reconnect(agent, query_text: str, options: Optional[ExecutionOptions]):
+        """执行查询；遇到 GatewayError 时等待 10 秒后重连重试。"""
+        max_attempts = 3
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = await agent.execute(query_text, options=options)
+                if result is None or not getattr(result, "content", None):
+                    raise RuntimeError("Agent returned empty content")
+                return result
+            except GatewayError as e:
+                if attempt >= max_attempts:
+                    logger.error("gateway 连续失败 %d 次，放弃执行: %s", attempt, e)
+                    raise
+
+                logger.warning(
+                    "gateway 执行失败，第 %d/%d 次重试前等待 10 秒: %s",
+                    attempt,
+                    max_attempts,
+                    e,
+                )
+                await asyncio.sleep(30)
+                await wait_for_execution_ready(agent.agent_id, agent.session_name)
+            except RuntimeError as e:
+                if attempt >= max_attempts:
+                    logger.error("agent 连续返回空内容 %d 次，放弃执行: %s", attempt, e)
+                    raise
+
+                logger.warning(
+                    "agent 返回空内容，第 %d/%d 次重试前等待 30 秒: %s",
+                    attempt,
+                    max_attempts,
+                    e,
+                )
+                await asyncio.sleep(30)
+                await wait_for_execution_ready(agent.agent_id, agent.session_name)
+
     for idx, query in enumerate(queries, 1):
         logger.info("任务 %d/%d: [%s|%s]", idx, len(queries), query.agent_name, query.session_name)
         logger.info("[Q] %s", query.text)
 
         query_text = _replace_variables(query.text, results)        
         options = ExecutionOptions(timeout_seconds=query.timeout) if query.timeout else None
+        session_name = query.session_name or "main"
+
+        await wait_for_execution_ready(query.agent_name, session_name)
 
         if simulator is not None:
             simulator.update_origin_query(query_text)
@@ -458,10 +601,10 @@ async def execute_queries(
 
         for turn in range(1, max_turn + 1 if simulator else 2):
             logger.debug("[Q%d] %s", turn, current_query)
-            agent = client.get_agent(query.agent_name, query.session_name or "main")
+            agent = client.get_agent(query.agent_name, session_name)
 
             try:
-                result = await agent.execute(current_query, options=options)
+                result = await execute_with_reconnect(agent, current_query, options)
                 last_result = result
                 agent_reply = result.content
                 logger.info("[A%d] %s", turn, agent_reply)
@@ -494,7 +637,7 @@ async def execute_queries(
             if "【Task_Done】" in user_reply:
                 logger.info("任务完成（Turn %d）", turn)
                 try:
-                    await agent.execute("真棒", options=options)
+                    await execute_with_reconnect(agent, "真棒", options)
                 except Exception:
                     pass
                 success = True
@@ -502,7 +645,7 @@ async def execute_queries(
             elif "【Task_Failed】" in user_reply:
                 logger.error("任务失败（Turn %d）：%s", turn, user_reply)
                 try:
-                    await agent.execute("好吧", options=options)
+                    await execute_with_reconnect(agent, "好吧", options)
                 except Exception:
                     pass
                 break
@@ -539,19 +682,14 @@ class OpenClawAutomation:
         logger.info("OpenClaw 自动化任务系统")
         logger.info("=" * 60)
 
-        # 构建连接参数
-        connect_kwargs = {}
-        if self.config.gateway_ws_url:
-            connect_kwargs['gateway_ws_url'] = self.config.gateway_ws_url
-        if self.config.api_key:
-            connect_kwargs['api_key'] = self.config.api_key
+        reconnect_config = {
+            "gateway_ws_url": self.config.gateway_ws_url,
+            "api_key": self.config.api_key,
+            "gateway_timeout": self.config.gateway_timeout,
+        }
+        logger.debug("reconnect_config: %s", reconnect_config)
 
-        # 注意：OpenClawClient.connect() 返回协程，需要先 await
-        # 然后返回的 OpenClawClient 实例才支持 async with
-        logger.debug("connect_kwargs: %s", connect_kwargs)
-        # client = await OpenClawClient.connect(**connect_kwargs)
-
-        async with await OpenClawClient.connect() as client:
+        async with await build_openclaw_client(**reconnect_config) as client:
             self.client = client
 
             # 1. 设置工作空间

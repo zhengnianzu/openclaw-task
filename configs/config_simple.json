@@ -10,7 +10,7 @@
   },
   "agents": [
     {
-      "name": "simple_assistant",
+      "name": "main",
       "config": [],
       "skills": [],
       "system_prompt": "You are a helpful AI assistant. Answer questions clearly and concisely."
@@ -18,7 +18,7 @@
   ],
   "queries": [
     {
-      "agent_name": "simple_assistant",
+      "agent_name": "main",
       "text": "What is the capital of France?",
       "session_name": "main",
       "timeout": 60
