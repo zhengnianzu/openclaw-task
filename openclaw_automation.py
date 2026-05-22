@@ -70,8 +70,8 @@ async def build_openclaw_client(
         api_key=api_key,
         timeout=gateway_timeout or 300,
     )
-    connect_timeout = float(gateway_timeout or 10)
-    default_timeout = float(gateway_timeout or 300)
+    connect_timeout = float(gateway_timeout or 600)
+    default_timeout = float(gateway_timeout or 600)
 
     gateway = ProtocolGateway(
         ws_url=gateway_ws_url or "ws://127.0.0.1:18789/gateway",
