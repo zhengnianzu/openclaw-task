@@ -57,6 +57,14 @@ def setup_logger(config_file: Optional[str] = None) -> logging.Logger:
 
 logger = logging.getLogger("openclaw_automation")
 
+# OpenClaw 连接/重试系统变量
+DEFAULT_GATEWAY_TIMEOUT_SECONDS = 600
+GATEWAY_CONNECT_GRACE_SECONDS = 5.0
+READINESS_MAX_ATTEMPTS = 4
+READINESS_WAIT_SECONDS = 40
+EXECUTION_MAX_ATTEMPTS = 3
+EXECUTION_RETRY_WAIT_SECONDS = 30
+
 
 async def build_openclaw_client(
     gateway_ws_url: Optional[str] = None,
@@ -68,10 +76,10 @@ async def build_openclaw_client(
         mode="protocol" if gateway_ws_url else "auto",
         gateway_ws_url=gateway_ws_url,
         api_key=api_key,
-        timeout=gateway_timeout or 300,
+        timeout=gateway_timeout or DEFAULT_GATEWAY_TIMEOUT_SECONDS,
     )
-    connect_timeout = float(gateway_timeout or 600)
-    default_timeout = float(gateway_timeout or 600)
+    connect_timeout = float(gateway_timeout or DEFAULT_GATEWAY_TIMEOUT_SECONDS)
+    default_timeout = float(gateway_timeout or DEFAULT_GATEWAY_TIMEOUT_SECONDS)
 
     gateway = ProtocolGateway(
         ws_url=gateway_ws_url or "ws://127.0.0.1:18789/gateway",
@@ -82,7 +90,10 @@ async def build_openclaw_client(
     )
     try:
         # SDK 内部 connect() 可能在 backoff 循环里停留很久，这里再包一层总超时。
-        await asyncio.wait_for(gateway.connect(), timeout=connect_timeout + 5.0)
+        await asyncio.wait_for(
+            gateway.connect(),
+            timeout=connect_timeout + GATEWAY_CONNECT_GRACE_SECONDS,
+        )
     except Exception:
         await gateway.close()
         raise
@@ -494,8 +505,8 @@ async def execute_queries(
 
     async def wait_for_execution_ready(agent_name: str, session_name: str) -> None:
         """执行前等待连接恢复，并测试当前 session 是否可访问。"""
-        max_attempts = 4
-        wait_seconds = 40
+        max_attempts = READINESS_MAX_ATTEMPTS
+        wait_seconds = READINESS_WAIT_SECONDS
 
         for attempt in range(1, max_attempts + 1):
             gateway = client.gateway
@@ -546,7 +557,7 @@ async def execute_queries(
 
     async def execute_with_reconnect(agent, query_text: str, options: Optional[ExecutionOptions]):
         """执行查询；遇到 GatewayError 时等待 10 秒后重连重试。"""
-        max_attempts = 3
+        max_attempts = EXECUTION_MAX_ATTEMPTS
 
         for attempt in range(1, max_attempts + 1):
             try:
@@ -560,12 +571,13 @@ async def execute_queries(
                     raise
 
                 logger.warning(
-                    "gateway 执行失败，第 %d/%d 次重试前等待 10 秒: %s",
+                    "gateway 执行失败，第 %d/%d 次重试前等待 %d 秒: %s",
                     attempt,
                     max_attempts,
+                    EXECUTION_RETRY_WAIT_SECONDS,
                     e,
                 )
-                await asyncio.sleep(30)
+                await asyncio.sleep(EXECUTION_RETRY_WAIT_SECONDS)
                 await wait_for_execution_ready(agent.agent_id, agent.session_name)
             except RuntimeError as e:
                 if attempt >= max_attempts:
@@ -573,12 +585,13 @@ async def execute_queries(
                     raise
 
                 logger.warning(
-                    "agent 返回空内容，第 %d/%d 次重试前等待 30 秒: %s",
+                    "agent 返回空内容，第 %d/%d 次重试前等待 %d 秒: %s",
                     attempt,
                     max_attempts,
+                    EXECUTION_RETRY_WAIT_SECONDS,
                     e,
                 )
-                await asyncio.sleep(30)
+                await asyncio.sleep(EXECUTION_RETRY_WAIT_SECONDS)
                 await wait_for_execution_ready(agent.agent_id, agent.session_name)
 
     for idx, query in enumerate(queries, 1):
