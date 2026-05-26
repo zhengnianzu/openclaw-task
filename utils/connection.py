@@ -36,6 +36,7 @@ _BACKOFF_MAX = 30.0
 _BACKOFF_JITTER = 0.5
 _TICK_WATCH_INTERVAL = 30
 _TICK_WATCH_HEALTH_TIMEOUT = 10
+_ENSURE_CONNECTED_TIMEOUT = 180  # ensure_connected 默认等待秒数
 
 
 # ============================================================================
@@ -83,8 +84,8 @@ class ResilientGateway(ProtocolGateway):
         self._ws = await asyncio.wait_for(
             ws_connect(
                 self._ws_url,
-                ping_interval=15,
-                ping_timeout=10,
+                ping_interval=20,
+                ping_timeout=30,
                 close_timeout=5,
             ),
             timeout=self._connect_timeout,
@@ -134,6 +135,25 @@ class ResilientGateway(ProtocolGateway):
                 )
             return self._reconnect_task
 
+    def _fail_pending(self, exc: Exception) -> None:
+        """Fail pending requests and consume unobserved exceptions for clean logs."""
+        pending = list(self._pending.values())
+        self._pending.clear()
+        for future in pending:
+            if future.done():
+                continue
+            future.set_exception(exc)
+            future.add_done_callback(self._consume_future_exception)
+
+    @staticmethod
+    def _consume_future_exception(future: asyncio.Future) -> None:
+        if future.cancelled():
+            return
+        try:
+            future.exception()
+        except Exception:
+            pass
+
     async def _reconnect_with_backoff(self) -> None:
         """指数退避重连，对标 TUI 的 scheduleReconnect。"""
         delay = _BACKOFF_INITIAL
@@ -146,11 +166,19 @@ class ResilientGateway(ProtocolGateway):
                 self._on_reconnected(attempt)
                 self._reconnect_event.set()
                 return
-            except GatewayError:
-                logger.error("重连认证失败，停止重连")
-                self._state = "disconnected"
-                self._reconnect_event.set()
-                return
+            except GatewayError as exc:
+                if self._closed:
+                    self._state = "closed"
+                    self._reconnect_event.set()
+                    return
+                jitter = random.uniform(-_BACKOFF_JITTER * delay, _BACKOFF_JITTER * delay)
+                wait = min(delay + jitter, _BACKOFF_MAX)
+                logger.warning(
+                    "WebSocket 重连第 %d 次失败 (%s)；%.1f 秒后重试",
+                    attempt, exc, wait,
+                )
+                await asyncio.sleep(wait)
+                delay = min(delay * 2, _BACKOFF_MAX)
             except Exception as exc:
                 if self._closed:
                     self._state = "closed"
@@ -209,13 +237,19 @@ class ResilientGateway(ProtocolGateway):
         **kwargs: Any,
     ) -> dict[str, Any]:
         """断线时等待重连完成再发请求，而不是直接抛异常。"""
-        await self.ensure_connected(timeout=60)
+        await self.ensure_connected(timeout=_ENSURE_CONNECTED_TIMEOUT)
         self._last_activity = time.monotonic()
         return await super().call(
             method, params, timeout=timeout, idempotency_key=idempotency_key, **kwargs
         )
 
-    async def ensure_connected(self, timeout: float = 60.0) -> None:
+    async def subscribe(self, event_types: list[str] | None = None):
+        """断线时等待重连完成再订阅事件。"""
+        await self.ensure_connected(timeout=_ENSURE_CONNECTED_TIMEOUT)
+        self._last_activity = time.monotonic()
+        return await super().subscribe(event_types=event_types)
+
+    async def ensure_connected(self, timeout: float = _ENSURE_CONNECTED_TIMEOUT) -> None:
         """等待现有重连完成，必要时主动拉起单飞重连。"""
         deadline = time.monotonic() + timeout
         while True:

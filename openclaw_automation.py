@@ -610,8 +610,22 @@ async def execute_queries(
                 raise RuntimeError(
                     "Agent returned empty content and chat.history had no new assistant reply"
                 )
-            except (GatewayError, asyncio.TimeoutError):
-                raise
+            except (GatewayError, asyncio.TimeoutError) as e:
+                if attempt >= max_attempts:
+                    raise
+                logger.warning(
+                    "gateway 连接异常,第 %d/%d 次重试前等待重连恢复: %s",
+                    attempt, max_attempts, e,
+                )
+                gw = client.gateway
+                if hasattr(gw, "ensure_connected"):
+                    try:
+                        await gw.ensure_connected(timeout=180)
+                        logger.info("gateway 重连恢复,继续重试")
+                    except GatewayError:
+                        logger.warning("gateway 重连未恢复,仍尝试下次重试")
+                await asyncio.sleep(EXECUTION_RETRY_WAIT_SECONDS)
+                continue
             except RuntimeError as e:
                 if attempt >= max_attempts:
                     logger.error("agent 连续返回空内容 %d 次: %s", attempt, e)
