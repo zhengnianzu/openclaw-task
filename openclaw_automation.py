@@ -66,11 +66,13 @@ logger = logging.getLogger("openclaw_automation")
 import time as _time
 _RUN_ID = _time.strftime("%Y%m%dT%H%M%S")
 
-DEFAULT_GATEWAY_TIMEOUT_SECONDS = 30
-EXECUTION_MAX_ATTEMPTS = 3
-EXECUTION_RETRY_WAIT_SECONDS = 30
+DEFAULT_GATEWAY_TIMEOUT_SECONDS = 3600
+EXECUTION_MAX_ATTEMPTS = 5
+EXECUTION_RETRY_WAIT_SECONDS = 60
 EXECUTION_HISTORY_FALLBACK_DELAY_SECONDS = 3
 EXECUTION_HISTORY_FALLBACK_LIMIT = 50
+EXECUTION_HISTORY_FALLBACK_MAX_POLLS = 40
+EXECUTION_HISTORY_FALLBACK_POLL_INTERVAL_SECONDS = 30.0
 
 
 # ============================================================================
@@ -142,7 +144,7 @@ class QueryItem(BaseModel):
     agent_name: str = Field(..., description="执行的 Agent 名称")
     text: str = Field(..., description="查询文本,支持 {result_xxx} 变量替换")
     session_name: Optional[str] = Field("main", description="会话名称")
-    timeout: Optional[int] = Field(300, description="超时时间(秒)")
+    timeout: Optional[int] = Field(3600, description="超时时间(秒)")
 
 
 class AutomationConfig(BaseModel):
@@ -571,13 +573,32 @@ async def execute_queries(
 
         async def history_fallback(
             before_history: List[dict[str, Any]],
+            max_polls: int = EXECUTION_HISTORY_FALLBACK_MAX_POLLS,
+            poll_interval: float = EXECUTION_HISTORY_FALLBACK_POLL_INTERVAL_SECONDS,
         ) -> Optional[str]:
-            await asyncio.sleep(EXECUTION_HISTORY_FALLBACK_DELAY_SECONDS)
-            after_history = await fetch_history()
-            text = find_new_assistant_text(before_history, after_history)
-            if text:
-                logger.info("execute 返回空内容,但从 chat.history 兜底获取到回复")
-                return text
+            """轮询 chat.history 等待旧 run 完成。
+
+            agent 长任务可能还在后台执行（WS 断开但 run 没停），
+            不能只查一次就放弃——需要多轮轮询直到出现新的 assistant 回复。
+            """
+            for poll in range(1, max_polls + 1):
+                await asyncio.sleep(poll_interval)
+                try:
+                    after_history = await fetch_history()
+                except Exception as e:
+                    logger.debug("history_fallback 第 %d/%d 次查询失败: %s", poll, max_polls, e)
+                    continue
+                text = find_new_assistant_text(before_history, after_history)
+                if text:
+                    logger.info(
+                        "execute 返回空内容,但第 %d 次 history 轮询获取到回复 (等待 %.0fs)",
+                        poll, poll * poll_interval,
+                    )
+                    return text
+                logger.debug(
+                    "history_fallback 第 %d/%d 次轮询,暂无新回复",
+                    poll, max_polls,
+                )
             return None
 
         for attempt in range(1, max_attempts + 1):
@@ -611,19 +632,33 @@ async def execute_queries(
                     "Agent returned empty content and chat.history had no new assistant reply"
                 )
             except (GatewayError, asyncio.TimeoutError) as e:
-                if attempt >= max_attempts:
-                    raise
                 logger.warning(
-                    "gateway 连接异常,第 %d/%d 次重试前等待重连恢复: %s",
+                    "gateway 连接异常 (第 %d/%d 次): %s，先查 history 看旧 run 是否已完成",
                     attempt, max_attempts, e,
                 )
                 gw = client.gateway
                 if hasattr(gw, "ensure_connected"):
                     try:
-                        await gw.ensure_connected(timeout=180)
-                        logger.info("gateway 重连恢复,继续重试")
+                        await gw.ensure_connected(timeout=DEFAULT_GATEWAY_TIMEOUT_SECONDS)
+                        logger.info("gateway 重连恢复")
                     except GatewayError:
-                        logger.warning("gateway 重连未恢复,仍尝试下次重试")
+                        logger.warning("gateway 重连未恢复")
+
+                fallback_text = await history_fallback(before_history)
+                if fallback_text:
+                    logger.info("WS 断开但 agent 已完成,从 history 获取到回复")
+                    return ExecutionResult(
+                        success=True,
+                        content=fallback_text,
+                        stop_reason="complete",
+                    )
+
+                if attempt >= max_attempts:
+                    raise
+                logger.warning(
+                    "history 也无结果,第 %d/%d 次重试前等待 %d 秒",
+                    attempt, max_attempts, EXECUTION_RETRY_WAIT_SECONDS,
+                )
                 await asyncio.sleep(EXECUTION_RETRY_WAIT_SECONDS)
                 continue
             except RuntimeError as e:

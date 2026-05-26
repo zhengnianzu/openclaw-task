@@ -28,15 +28,15 @@ logger = logging.getLogger("openclaw_automation")
 # 常量
 # ============================================================================
 
-DEFAULT_GATEWAY_TIMEOUT_SECONDS = 30
-GATEWAY_CONNECT_GRACE_SECONDS = 5.0
+DEFAULT_GATEWAY_TIMEOUT_SECONDS = 3600
+GATEWAY_CONNECT_GRACE_SECONDS = 30.0
 
 _BACKOFF_INITIAL = 1.0
-_BACKOFF_MAX = 30.0
+_BACKOFF_MAX = 60.0
 _BACKOFF_JITTER = 0.5
 _TICK_WATCH_INTERVAL = 30
-_TICK_WATCH_HEALTH_TIMEOUT = 10
-_ENSURE_CONNECTED_TIMEOUT = 180  # ensure_connected 默认等待秒数
+_TICK_WATCH_HEALTH_TIMEOUT = 30
+_ENSURE_CONNECTED_TIMEOUT = 3600  # ensure_connected 默认等待秒数
 
 
 # ============================================================================
@@ -85,7 +85,7 @@ class ResilientGateway(ProtocolGateway):
             ws_connect(
                 self._ws_url,
                 ping_interval=20,
-                ping_timeout=30,
+                ping_timeout=60,
                 close_timeout=5,
             ),
             timeout=self._connect_timeout,
@@ -199,23 +199,36 @@ class ResilientGateway(ProtocolGateway):
     # ------------------------------------------------------------------ #
 
     async def _tick_watch(self) -> None:
-        """轻量 idle watchdog，长时间无活动时主动断开触发重连。"""
+        """应用层心跳 + idle watchdog。
+
+        定期发 system-presence 保持应用层活跃，防止 gateway idle timeout 断连。
+        如果 health 调用失败，说明连接已实质断开，主动关闭触发重连。
+        """
         while not self._closed:
             await asyncio.sleep(_TICK_WATCH_INTERVAL)
             if not self._connected:
                 continue
-            elapsed = time.monotonic() - self._last_activity
-            if elapsed < _TICK_WATCH_INTERVAL * 2:
-                continue
-            logger.warning(
-                "Tick watch 检测到连接空闲 %.1f 秒，主动断开触发重连",
-                elapsed,
-            )
-            if self._ws:
-                try:
-                    await self._ws.close()
-                except Exception:
-                    pass
+
+            try:
+                status = await asyncio.wait_for(
+                    self.health(), timeout=_TICK_WATCH_HEALTH_TIMEOUT
+                )
+                if status.healthy:
+                    self._last_activity = time.monotonic()
+                else:
+                    logger.warning("Tick watch: health 返回 unhealthy，主动断开触发重连")
+                    if self._ws:
+                        try:
+                            await self._ws.close()
+                        except Exception:
+                            pass
+            except Exception:
+                logger.warning("Tick watch: health 调用失败，主动断开触发重连")
+                if self._ws:
+                    try:
+                        await self._ws.close()
+                    except Exception:
+                        pass
 
     def _start_tick_watch(self) -> None:
         if self._tick_task is None or self._tick_task.done():
