@@ -69,6 +69,8 @@ _RUN_ID = _time.strftime("%Y%m%dT%H%M%S")
 DEFAULT_GATEWAY_TIMEOUT_SECONDS = 30
 EXECUTION_MAX_ATTEMPTS = 3
 EXECUTION_RETRY_WAIT_SECONDS = 30
+EXECUTION_HISTORY_FALLBACK_DELAY_SECONDS = 3
+EXECUTION_HISTORY_FALLBACK_LIMIT = 50
 
 
 # ============================================================================
@@ -497,23 +499,125 @@ async def execute_queries(
         query_text: str,
         options: Optional[ExecutionOptions],
     ):
-        """执行查询,空内容时重试(连接重连由 monkey-patch 自动处理)。
-
-        快速空内容(< 5s)→ 调 sessions.reset 清场后再试。
-        """
+        """执行查询,空 final 时先查 history 兜底,再有限重试。"""
         max_attempts = EXECUTION_MAX_ATTEMPTS
+
+        def extract_message_text(message: Any) -> str:
+            if not isinstance(message, dict):
+                return ""
+            content = message.get("content")
+            if isinstance(content, str):
+                return content.strip()
+            if isinstance(content, list):
+                parts = []
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    text = block.get("text") or block.get("content")
+                    if isinstance(text, str):
+                        parts.append(text)
+                return "".join(parts).strip()
+            text = message.get("text")
+            return text.strip() if isinstance(text, str) else ""
+
+        def is_assistant_message(message: Any) -> bool:
+            return (
+                isinstance(message, dict)
+                and str(message.get("role", "")).lower() == "assistant"
+            )
+
+        async def fetch_history() -> List[dict[str, Any]]:
+            try:
+                return await agent._client.gateway.chat_history(  # type: ignore[attr-defined]
+                    agent.session_key,
+                    limit=EXECUTION_HISTORY_FALLBACK_LIMIT,
+                )
+            except Exception as e:
+                logger.debug("chat.history 兜底查询失败: %s", e)
+                return []
+
+        def find_new_assistant_text(
+            before: List[dict[str, Any]],
+            after: List[dict[str, Any]],
+        ) -> str:
+            before_signatures = {
+                (
+                    str(message.get("role", "")),
+                    extract_message_text(message),
+                    str(message.get("timestamp", "")),
+                    str(message.get("id", "")),
+                )
+                for message in before
+                if isinstance(message, dict)
+            }
+            new_messages = []
+            for message in after:
+                if not isinstance(message, dict):
+                    continue
+                signature = (
+                    str(message.get("role", "")),
+                    extract_message_text(message),
+                    str(message.get("timestamp", "")),
+                    str(message.get("id", "")),
+                )
+                if signature not in before_signatures:
+                    new_messages.append(message)
+            for message in reversed(new_messages):
+                if is_assistant_message(message):
+                    text = extract_message_text(message)
+                    if text:
+                        return text
+            return ""
+
+        async def history_fallback(
+            before_history: List[dict[str, Any]],
+        ) -> Optional[str]:
+            await asyncio.sleep(EXECUTION_HISTORY_FALLBACK_DELAY_SECONDS)
+            after_history = await fetch_history()
+            text = find_new_assistant_text(before_history, after_history)
+            if text:
+                logger.info("execute 返回空内容,但从 chat.history 兜底获取到回复")
+                return text
+            return None
+
         for attempt in range(1, max_attempts + 1):
+            before_history = await fetch_history()
             try:
                 result = await agent.execute(query_text, options=options)
-                if result is None or not getattr(result, "content", None):
-                    raise RuntimeError("Agent returned empty content")
-                return result
+                if result is None:
+                    raise RuntimeError("Agent returned None")
+
+                if getattr(result, "content", None):
+                    return result
+
+                fallback_text = await history_fallback(before_history)
+                if fallback_text:
+                    return result.model_copy(
+                        update={
+                            "success": True,
+                            "content": fallback_text,
+                            "stop_reason": result.stop_reason or "complete",
+                            "error_message": None,
+                        }
+                    )
+
+                error_message = getattr(result, "error_message", None)
+                if error_message and not str(error_message).startswith(
+                    "Agent completed with no response"
+                ):
+                    raise RuntimeError(error_message)
+
+                raise RuntimeError(
+                    "Agent returned empty content and chat.history had no new assistant reply"
+                )
+            except (GatewayError, asyncio.TimeoutError):
+                raise
             except RuntimeError as e:
                 if attempt >= max_attempts:
                     logger.error("agent 连续返回空内容 %d 次: %s", attempt, e)
                     raise
                 logger.warning(
-                    "agent 返回空内容,第 %d/%d 次重试前等待 %d 秒: %s",
+                    "agent 返回空内容且 history 无兜底,第 %d/%d 次重试前等待 %d 秒: %s",
                     attempt, max_attempts, EXECUTION_RETRY_WAIT_SECONDS, e,
                 )
                 await asyncio.sleep(EXECUTION_RETRY_WAIT_SECONDS)
