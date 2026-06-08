@@ -181,6 +181,12 @@ class AutomationConfig(BaseModel):
 
         return url
 
+def copy_path(src: Path, dst: Path):
+    """复制文件或目录，自动判断类型，目标已存在时合并/覆盖"""
+    if src.is_file():
+        shutil.copy2(src, dst)
+    elif src.is_dir():
+        shutil.copytree(src, dst, dirs_exist_ok=True)
 
 # ============================================================================
 # 工作空间管理器
@@ -246,11 +252,11 @@ class WorkspaceManager:
                     src = agent_source / config_file
                     if src.exists():
                         dst = workspace / config_file
-                        shutil.copy2(src, dst)
+                        copy_path(src, dst)
                         logger.info("复制 Agent 配置: %s -> %s", config_file, dst)
                         # 同时复制到 workspace 主目录
                         dst_main = self.base_dir / config_file
-                        shutil.copy2(src, dst_main)
+                        copy_path(src, dst_main)
                         logger.info("复制 Agent 配置: %s -> %s", config_file, dst_main)
                     else:
                         logger.warning("Agent 配置文件不存在: %s", src)
@@ -682,15 +688,18 @@ async def execute_queries(
 
         await check_readyz()
 
-        if simulator is not None:
-            simulator.update_origin_query(query_text)
+        use_simulator = getattr(query, 'use_simulator', True)
+        current_simulator = simulator if use_simulator else None
+        
+        if current_simulator is not None:
+            current_simulator.update_origin_query(query_text)
 
         current_query = query_text
         last_result = None
         success = False
         retry = 0
 
-        for turn in range(1, max_turn + 1 if simulator else 2):
+        for turn in range(1, max_turn + 1 if current_simulator else 2):
             logger.debug("[Q%d] %s", turn, current_query)
             agent = client.get_agent(query.agent_name, session_name)
 
@@ -720,11 +729,11 @@ async def execute_queries(
 
             retry = 0
 
-            if simulator is None:
+            if current_simulator is None:
                 success = True
                 break
 
-            user_reply = simulator.chat(agent_reply)
+            user_reply = current_simulator.chat(agent_reply)
             logger.debug("[S%d] %s", turn, user_reply)
 
             if "【Task_Done】" in user_reply:
@@ -749,7 +758,7 @@ async def execute_queries(
 
             current_query = user_reply
         else:
-            if simulator is not None:
+            if current_simulator is not None:
                 logger.warning("达到最大轮次 %d,任务未完成", max_turn)
 
         results[f"result_{query.agent_name}"] = last_result
