@@ -21,10 +21,12 @@
       "agent_name": "main",
       "text": "What is the capital of France?",
       "session_name": "main",
-      "timeout": 60
+      "timeout": 1800,
+      "use_simulator": false
     }
   ],
   "gateway_ws_url": "ws://127.0.0.1:18789/gateway",
+  "gateway_timeout": 600,
   "workspace_base": "~/.openclaw/workspace",
   "simulator_config": "configs/user_proxy_model.json"
 }

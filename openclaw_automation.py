@@ -145,6 +145,7 @@ class QueryItem(BaseModel):
     text: str = Field(..., description="查询文本,支持 {result_xxx} 变量替换")
     session_name: Optional[str] = Field("main", description="会话名称")
     timeout: Optional[int] = Field(3600, description="超时时间(秒)")
+    use_simulator: bool = Field(True, description="是否启用 user-simulator 进行多轮对话,默认 True")
 
 
 class AutomationConfig(BaseModel):
@@ -682,15 +683,17 @@ async def execute_queries(
 
         await check_readyz()
 
-        if simulator is not None:
-            simulator.update_origin_query(query_text)
+        query_simulator = simulator if query.use_simulator else None
+
+        if query_simulator is not None:
+            query_simulator.update_origin_query(query_text)
 
         current_query = query_text
         last_result = None
         success = False
         retry = 0
 
-        for turn in range(1, max_turn + 1 if simulator else 2):
+        for turn in range(1, max_turn + 1 if query_simulator else 2):
             logger.debug("[Q%d] %s", turn, current_query)
             agent = client.get_agent(query.agent_name, session_name)
 
@@ -720,11 +723,11 @@ async def execute_queries(
 
             retry = 0
 
-            if simulator is None:
+            if query_simulator is None:
                 success = True
                 break
 
-            user_reply = simulator.chat(agent_reply)
+            user_reply = query_simulator.chat(agent_reply)
             logger.debug("[S%d] %s", turn, user_reply)
 
             if "【Task_Done】" in user_reply:
@@ -749,7 +752,7 @@ async def execute_queries(
 
             current_query = user_reply
         else:
-            if simulator is not None:
+            if query_simulator is not None:
                 logger.warning("达到最大轮次 %d,任务未完成", max_turn)
 
         results[f"result_{query.agent_name}"] = last_result
