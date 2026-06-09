@@ -145,6 +145,7 @@ class QueryItem(BaseModel):
     text: str = Field(..., description="查询文本,支持 {result_xxx} 变量替换")
     session_name: Optional[str] = Field("main", description="会话名称")
     timeout: Optional[int] = Field(3600, description="超时时间(秒)")
+    use_simulator: Optional[bool] = True
 
 
 class AutomationConfig(BaseModel):
@@ -688,8 +689,11 @@ async def execute_queries(
 
         await check_readyz()
 
-        use_simulator = getattr(query, 'use_simulator', True)
+        use_simulator = query.use_simulator
+        if use_simulator is None:
+            use_simulator = False
         current_simulator = simulator if use_simulator else None
+        print(f"{idx=}\n{query=}\n---------------------------------{use_simulator=}\n------------------{current_simulator=}")
         
         if current_simulator is not None:
             current_simulator.update_origin_query(query_text)
