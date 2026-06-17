@@ -182,6 +182,12 @@ class AutomationConfig(BaseModel):
 
         return url
 
+def copy_path(src: Path, dst: Path):
+    """复制文件或目录，自动判断类型，目标已存在时合并/覆盖"""
+    if src.is_file():
+        shutil.copy2(src, dst)
+    elif src.is_dir():
+        shutil.copytree(src, dst, dirs_exist_ok=True)
 
 # ============================================================================
 # 工作空间管理器
@@ -247,11 +253,11 @@ class WorkspaceManager:
                     src = agent_source / config_file
                     if src.exists():
                         dst = workspace / config_file
-                        shutil.copy2(src, dst)
+                        copy_path(src, dst)
                         logger.info("复制 Agent 配置: %s -> %s", config_file, dst)
                         # 同时复制到 workspace 主目录
                         dst_main = self.base_dir / config_file
-                        shutil.copy2(src, dst_main)
+                        copy_path(src, dst_main)
                         logger.info("复制 Agent 配置: %s -> %s", config_file, dst_main)
                     else:
                         logger.warning("Agent 配置文件不存在: %s", src)
