@@ -11,7 +11,7 @@ import logging
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from dataclasses import dataclass, field
 import os
 import sys
@@ -538,7 +538,7 @@ async def process_turn(
 async def execute_queries(
     client: OpenClawClient,
     queries: List[QueryItem],
-    simulator: Optional[User_simulator] = None,
+    simulator_factory: Optional[Callable[[], Optional[User_simulator]]] = None,
     max_turn: int = 5,
     evaluator: Optional[Evaluator] = None,
 ) -> Dict[str, ExecutionResult]:
@@ -548,10 +548,14 @@ async def execute_queries(
     受 max_turn 控制。每轮捕获带证据的轨迹;当 evaluator 启用时,逐轮评估并把
     反馈喂回 simulator(由 simulator 拍板)。
 
+    simulator 记忆按 `session_name` 隔离:共享同一逻辑会话名的 query 复用同一个
+    User_simulator 实例(合法续聊);不同会话名互不可见(杜绝跨会话信息泄露)。
+
     Args:
         client: OpenClaw 客户端
         queries: 查询任务列表
-        simulator: 用户模拟器,None 则仅单轮
+        simulator_factory: 构造 User_simulator 的工厂(每个 session 调用一次);
+            返回 None 表示未启用 simulator → 仅单轮
         max_turn: 多轮对话最大轮次
         evaluator: 第三方 Evaluator,None 或 disabled 则退回 simulator 自判
 
@@ -755,6 +759,9 @@ async def execute_queries(
                 )
                 await asyncio.sleep(EXECUTION_RETRY_WAIT_SECONDS)
 
+    # simulator 按逻辑 session_name 隔离记忆:同会话复用实例、跨会话互不可见
+    simulators: Dict[str, User_simulator] = {}
+
     for idx, query in enumerate(queries, 1):
         logger.info("任务 %d/%d: [%s|%s]", idx, len(queries), query.agent_name, query.session_name)
         logger.info("[Q] %s", query.text)
@@ -766,7 +773,15 @@ async def execute_queries(
 
         await check_readyz()
 
-        query_simulator = simulator if query.use_simulator else None
+        # 按逻辑 session_name(裸名,不含 _RUN_ID)取/建 simulator 实例:
+        # 首见即建、再见复用 → 同会话续聊保留记忆,跨会话隔离不泄露。
+        query_simulator: Optional[User_simulator] = None
+        if query.use_simulator and simulator_factory is not None:
+            query_simulator = simulators.get(base_session)
+            if query_simulator is None:
+                query_simulator = simulator_factory()
+                if query_simulator is not None:
+                    simulators[base_session] = query_simulator
 
         if query_simulator is not None:
             query_simulator.update_origin_query(query_text)
@@ -895,15 +910,15 @@ class OpenClawAutomation:
 
             # 2. 注册 Agents
             await self._setup_agents()
-            # 3. 创建 Simulator
-            simulator = create_simulator(self.config)
+            # 3. 创建 Simulator 工厂(每个 session 构造一个独立实例,隔离记忆)
+            simulator_factory = lambda: create_simulator(self.config)
             # 4. 创建 Evaluator
             evaluator = create_evaluator(self.config.eval_config, client, _RUN_ID)
             # 5. 执行查询
             results = await execute_queries(
                 client,
                 self.config.queries,
-                simulator=simulator,
+                simulator_factory=simulator_factory,
                 max_turn=self.config.user_max_turn,
                 evaluator=evaluator,
             )

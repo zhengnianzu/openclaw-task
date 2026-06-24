@@ -104,15 +104,20 @@ def test_rubric_check_and_result_parse():
 
 
 def test_build_prompt_injects_rubric_when_present():
-    """5.2: 有 rubric 时注入逐条清单, 空 rubric 时不注入。"""
+    """5.2: 有 rubric 时注入逐条清单; 空 rubric 时不注入清单, 且声明 rubric_checks 须为空。"""
     ev = _mk_eval()
     traj, rec = _mk_turn()
     with_rubric = ev._build_prompt(traj, rec, None, rubric=RUBRIC)
-    assert "验收清单(Rubric" in with_rubric
+    assert "验收清单(Rubric · 逐条质检)" in with_rubric
     for c in RUBRIC:
         assert c in with_rubric  # 注入给 evaluator(非 simulator)
     without = ev._build_prompt(traj, rec, None, rubric=[])
-    assert "验收清单(Rubric" not in without  # 4.1: 空 rubric 走自由维度
+    # 4.1: 空 rubric 不注入逐条质检清单, 也不出现任一准则原文
+    assert "逐条质检" not in without
+    for c in RUBRIC:
+        assert c not in without
+    # 空 rubric 时显式声明 rubric_checks 必须为空数组(prompt 层约束)
+    assert "rubric_checks" in without and "空数组" in without
     print("✓ rubric 注入/缺省分支")
 
 
@@ -153,6 +158,37 @@ def test_feedback_to_simulator_switch():
     print("✓ feedback_to_simulator 开关/默认")
 
 
+def test_no_rubric_normalizes_rubric_checks_empty():
+    """1.2: 无 rubric 时即便模型自拟 rubric_checks, 也被确定性归一为空(落盘前)。"""
+    import asyncio
+    from openclaw_sdk.core.types import ExecutionResult
+
+    # 伪造一个会"幻觉"出 rubric_checks 的裁判 agent(无网络/无 LLM)
+    hallucinated = (
+        '{"completion": 50, "inclination": "uncertain", '
+        '"violations": [], "improvements": [], "citations": [], '
+        '"rubric_checks": [{"criterion": "自拟准则", "status": "partial", "evidence": "X"}], '
+        '"reason": "无 rubric 也乱填了"}'
+    )
+
+    class _FakeAgent:
+        async def execute(self, query: str) -> ExecutionResult:
+            return ExecutionResult(success=True, content=hallucinated, stop_reason="complete")
+
+    class _FakeClient:
+        gateway = None  # 触发 _push_review_files 早退
+        def get_agent(self, name, session):
+            return _FakeAgent()
+
+    ev = Evaluator(EvaluatorConfig(enabled=True, log_evaluations=False), client=_FakeClient(), run_id="t")
+    traj, rec = _mk_turn()
+    result = asyncio.run(ev.evaluate_turn(traj, rec, last_feedback=None, rubric=[]))
+    assert result is not None
+    assert result.rubric_checks == []  # 归一保底生效
+    assert result.completion == 50     # 其他字段不受影响
+    print("✓ 无 rubric 时 rubric_checks 被归一为空")
+
+
 if __name__ == "__main__":
     test_structured_eval_output_parses()
     test_false_positive_surfaced_to_evaluator()
@@ -163,4 +199,5 @@ if __name__ == "__main__":
     test_build_prompt_states_unverifiable_rule()
     test_format_feedback_does_not_leak_rubric()
     test_feedback_to_simulator_switch()
+    test_no_rubric_normalizes_rubric_checks_empty()
     print("\n全部通过 ✅ (test_evaluator)")

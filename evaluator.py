@@ -163,6 +163,11 @@ class Evaluator:
             self._log(trajectory, current_turn, None, error=str(e))
             return None
 
+        # 确定性归一:无冻结 rubric 时强制清空 rubric_checks,兜住模型自拟准则的幻觉。
+        # 仅归一、不判负/不重试,且置于落盘之前以保证评估日志干净。
+        if not rubric:
+            result.rubric_checks = []
+
         self._log(trajectory, current_turn, result)
 
         # Debug:打印 evaluator 本轮结构化输出,便于在线观测评估质量
@@ -238,6 +243,13 @@ class Evaluator:
                 "铁律:`unverifiable` 与「证据不完整(evidence_incomplete)」同源——"
                 "核验受阻 MUST NOT 当作 `fail` 据以判负,避免冤枉掉线的 harness。"
                 "每条都要在 evidence 里引用本轮证据中的具体依据。"
+            )
+        else:
+            # 无冻结 rubric:显式声明 rubric_checks 必须为空,避免模型把评估维度当准则自拟
+            parts.append(
+                "\n# 验收清单(Rubric)\n"
+                "本任务**没有**验收清单。你 MUST 让结构化输出的 `rubric_checks` 返回空数组 `[]`,"
+                "MUST NOT 自拟任何 rubric 准则,也 MUST NOT 把上面的评估维度当作 rubric 准则填入 `rubric_checks`。"
             )
         review_hint = ""
         if any(f.checked and f.exists for f in current_turn.files):
