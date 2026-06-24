@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 import os
+import sys
 import tempfile
 from user_simulator import User_simulator
 
@@ -21,6 +22,9 @@ from pydantic import BaseModel, Field, validator, field_validator
 from openclaw_sdk import OpenClawClient, AgentConfig, ExecutionOptions
 from openclaw_sdk.core.types import ExecutionResult
 from openclaw_sdk.core.exceptions import GatewayError
+
+from trajectory import Trajectory, build_turn_record, capture_file_evidence
+from evaluator import Evaluator, EvaluatorConfig
 
 from utils.connection import (
     build_openclaw_client,
@@ -48,7 +52,12 @@ def setup_logger(config_file: Optional[str] = None) -> logging.Logger:
     fh = logging.FileHandler(log_dir / log_name, encoding="utf-8", mode="w")
     fh.setLevel(logging.DEBUG)
 
-    ch = logging.StreamHandler()
+    # 控制台流强制 UTF-8,与文件 handler 对齐,避免 Windows GBK 控制台输出中文乱码
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")  # Python 3.7+
+    except (AttributeError, ValueError):
+        pass  # 某些被重定向/包装的流不支持 reconfigure,退回默认编码
+    ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.DEBUG)
 
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -146,6 +155,7 @@ class QueryItem(BaseModel):
     session_name: Optional[str] = Field("main", description="会话名称")
     timeout: Optional[int] = Field(3600, description="超时时间(秒)")
     use_simulator: bool = Field(True, description="是否启用 user-simulator 进行多轮对话,默认 True")
+    rubric: List[str] = Field(default_factory=list, description="验收清单:随本 query 传入,整段多轮对话中冻结,供 evaluator 逐条质检;空=退回自由维度评估")
 
 
 class AutomationConfig(BaseModel):
@@ -166,6 +176,9 @@ class AutomationConfig(BaseModel):
     simulator_config: Optional[str] = Field(None, description="Simulator 配置 JSON 绝对路径,含 model/api_key/base_url/proxy;不配置则从环境变量读取")
     user_max_turn: int = Field(5, description="多轮对话最大轮次")
 
+    # Evaluator(第三方裁判)配置;默认 enabled=False → 退回 simulator 自判旧行为
+    eval_config: EvaluatorConfig = Field(default_factory=EvaluatorConfig, description="第三方 Evaluator 配置段")
+
     @field_validator("gateway_ws_url", mode="before")
     @classmethod
     def normalize_gateway_ws_url(cls, v):
@@ -182,12 +195,6 @@ class AutomationConfig(BaseModel):
 
         return url
 
-def copy_path(src: Path, dst: Path):
-    """复制文件或目录，自动判断类型，目标已存在时合并/覆盖"""
-    if src.is_file():
-        shutil.copy2(src, dst)
-    elif src.is_dir():
-        shutil.copytree(src, dst, dirs_exist_ok=True)
 
 # ============================================================================
 # 工作空间管理器
@@ -253,11 +260,11 @@ class WorkspaceManager:
                     src = agent_source / config_file
                     if src.exists():
                         dst = workspace / config_file
-                        copy_path(src, dst)
+                        shutil.copy2(src, dst)
                         logger.info("复制 Agent 配置: %s -> %s", config_file, dst)
                         # 同时复制到 workspace 主目录
                         dst_main = self.base_dir / config_file
-                        copy_path(src, dst_main)
+                        shutil.copy2(src, dst_main)
                         logger.info("复制 Agent 配置: %s -> %s", config_file, dst_main)
                     else:
                         logger.warning("Agent 配置文件不存在: %s", src)
@@ -406,6 +413,11 @@ def create_simulator(config: "AutomationConfig") -> Optional[User_simulator]:
     )
 
 
+def create_evaluator(config: EvaluatorConfig, client: Any, run_id: str) -> Optional[Evaluator]:
+    """根据配置创建 Evaluator 实例,未启用则返回 None"""
+    return Evaluator.create(config, client, run_id)
+
+
 # ============================================================================
 # Agent 管理器
 # ============================================================================
@@ -430,11 +442,14 @@ class AgentManager:
 
         if agent_name not in existing_ids:
             workspace = self.workspace_manager.get_agent_workspace(agent_name)
+            # SDK 的 create_agent 不从 AgentConfig 读 workspace,必须显式传 kwarg,
+            # 否则 gateway 收到 "." → 解析为其自身 cwd(可能是 system32)→ EPERM。
             await self.client.create_agent(
                 AgentConfig(
                     agent_id=agent_name,
                     workspace=str(workspace),
-                )
+                ),
+                workspace=str(workspace),
             )
             logger.info("创建新 Agent: %s,等待 gateway 重启就绪...", agent_name)
             await self._wait_gateway_ready()
@@ -466,22 +481,79 @@ def _replace_variables(text: str, results: Dict[str, ExecutionResult]) -> str:
     return re.sub(pattern, replacer, text)
 
 
+async def process_turn(
+    client: OpenClawClient,
+    query: QueryItem,
+    turn: int,
+    current_query: str,
+    result: ExecutionResult,
+    evidence_incomplete: bool,
+    trajectory: Trajectory,
+    evaluator: Optional[Evaluator],
+    last_feedback: Optional[str],
+    frozen_rubric: List[str],
+) -> tuple[Optional[str], Optional[str]]:
+    """逐轮处理(仅多轮 simulator 路径):能力1 捕获带证据轨迹 + 能力2 第三方评估。
+
+    单轮对话不进入本函数(不采集轨迹)。两段逻辑高内聚:能力2 的评估依赖能力1
+    刚产出的 turn_record 与累积 trajectory,故合并为一次调用。
+
+    evaluator 未启用时,轨迹无人消费(evaluator 是其唯一 reader),故前置返回——
+    既不评估也不采集轨迹。
+
+    Returns:
+        (evaluator_feedback, last_feedback)
+        - evaluator_feedback: 本轮喂回 simulator 的反馈(feedback_to_simulator=False 时为 None)
+        - last_feedback: 更新后的上一轮反馈(供下一轮无状态投喂)
+    """
+    # evaluator 未启用:轨迹无人消费,既不评估也不采集,直接返回默认
+    if evaluator is None or not evaluator.enabled:
+        return None, last_feedback
+
+    # 能力1:逐轮捕获带证据的轨迹(tool_calls 内存直取,免费;文件证据升级为磁盘真相 D5)
+    turn_record = build_turn_record(turn, current_query, result, evidence_incomplete)
+    try:
+        await capture_file_evidence(client.gateway, query.agent_name, turn_record)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("文件证据捕获失败: %s", e)
+    trajectory.turns.append(turn_record)
+
+    # 能力2:逐轮第三方评估,反馈喂回 simulator(simulator 仍拍板)
+    evaluator_feedback: Optional[str] = None
+    try:
+        ev = await evaluator.evaluate_turn(
+            trajectory, turn_record, last_feedback, rubric=frozen_rubric
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("evaluator 调用异常: %s", e)
+        ev = None
+    if ev is not None:
+        last_feedback = evaluator.format_feedback(ev)
+        if evaluator.feedback_to_simulator:
+            evaluator_feedback = last_feedback
+
+    return evaluator_feedback, last_feedback
+
+
 async def execute_queries(
     client: OpenClawClient,
     queries: List[QueryItem],
     simulator: Optional[User_simulator] = None,
     max_turn: int = 5,
+    evaluator: Optional[Evaluator] = None,
 ) -> Dict[str, ExecutionResult]:
     """执行查询任务列表
 
     外循环遍历每个 query;当 simulator 存在时,内循环进行多轮对话,
-    受 max_turn 控制。
+    受 max_turn 控制。每轮捕获带证据的轨迹;当 evaluator 启用时,逐轮评估并把
+    反馈喂回 simulator(由 simulator 拍板)。
 
     Args:
         client: OpenClaw 客户端
         queries: 查询任务列表
         simulator: 用户模拟器,None 则仅单轮
         max_turn: 多轮对话最大轮次
+        evaluator: 第三方 Evaluator,None 或 disabled 则退回 simulator 自判
 
     Returns:
         {result_agent_name: ExecutionResult}
@@ -508,7 +580,12 @@ async def execute_queries(
         query_text: str,
         options: Optional[ExecutionOptions],
     ):
-        """执行查询,空 final 时先查 history 兜底,再有限重试。"""
+        """执行查询,空 final 时先查 history 兜底,再有限重试。
+
+        Returns:
+            (ExecutionResult, evidence_incomplete): 第二个值为 True 表示该结果经
+            history_fallback 兜底恢复(只剩文本、无工具/文件证据),供轨迹捕获标记。
+        """
         max_attempts = EXECUTION_MAX_ATTEMPTS
 
         def extract_message_text(message: Any) -> str:
@@ -616,7 +693,7 @@ async def execute_queries(
                     raise RuntimeError("Agent returned None")
 
                 if getattr(result, "content", None):
-                    return result
+                    return result, False
 
                 fallback_text = await history_fallback(before_history)
                 if fallback_text:
@@ -627,7 +704,7 @@ async def execute_queries(
                             "stop_reason": result.stop_reason or "complete",
                             "error_message": None,
                         }
-                    )
+                    ), True
 
                 error_message = getattr(result, "error_message", None)
                 if error_message and not str(error_message).startswith(
@@ -658,7 +735,7 @@ async def execute_queries(
                         success=True,
                         content=fallback_text,
                         stop_reason="complete",
-                    )
+                    ), True
 
                 if attempt >= max_attempts:
                     raise
@@ -699,12 +776,17 @@ async def execute_queries(
         success = False
         retry = 0
 
+        # 能力1:逐轮累积带证据的轨迹
+        trajectory = Trajectory(query=query_text, agent_name=query.agent_name)
+        last_feedback: Optional[str] = None  # 上一轮 evaluator 反馈(供无状态投喂)
+        frozen_rubric = list(query.rubric)  # 随 query 传入并在整段对话中冻结(循环内不改写)
+
         for turn in range(1, max_turn + 1 if query_simulator else 2):
             logger.debug("[Q%d] %s", turn, current_query)
             agent = client.get_agent(query.agent_name, session_name)
 
             try:
-                result = await execute_with_retry(
+                result, evidence_incomplete = await execute_with_retry(
                     agent, current_query, options
                 )
                 last_result = result
@@ -729,15 +811,23 @@ async def execute_queries(
 
             retry = 0
 
+            # 单轮对话:不采集轨迹进行评估，因为user_simulator不再回复，无需接收评估结果
             if query_simulator is None:
                 success = True
                 break
 
-            user_reply = query_simulator.chat(agent_reply)
+            # 能力1+能力2:逐轮捕获带证据轨迹 + 第三方评估,反馈喂回 simulator
+            evaluator_feedback, last_feedback = await process_turn(
+                client, query, turn, current_query, result, evidence_incomplete,
+                trajectory, evaluator, last_feedback, frozen_rubric,
+            )
+
+            user_reply = query_simulator.chat(agent_reply, evaluator_feedback=evaluator_feedback)
             logger.debug("[S%d] %s", turn, user_reply)
 
             if "【Task_Done】" in user_reply:
                 logger.info("任务完成(Turn %d)", turn)
+                trajectory.outcome = "done"
                 try:
                     await execute_with_retry(
                         agent, "真棒", options
@@ -748,6 +838,7 @@ async def execute_queries(
                 break
             elif "【Task_Failed】" in user_reply:
                 logger.error("任务失败(Turn %d):%s", turn, user_reply)
+                trajectory.outcome = "failed"
                 try:
                     await execute_with_retry(
                         agent, "好吧", options
@@ -759,6 +850,7 @@ async def execute_queries(
             current_query = user_reply
         else:
             if query_simulator is not None:
+                trajectory.outcome = "max_turn"
                 logger.warning("达到最大轮次 %d,任务未完成", max_turn)
 
         results[f"result_{query.agent_name}"] = last_result
@@ -803,14 +895,17 @@ class OpenClawAutomation:
 
             # 2. 注册 Agents
             await self._setup_agents()
-
-            # 3. 执行查询
+            # 3. 创建 Simulator
             simulator = create_simulator(self.config)
+            # 4. 创建 Evaluator
+            evaluator = create_evaluator(self.config.eval_config, client, _RUN_ID)
+            # 5. 执行查询
             results = await execute_queries(
                 client,
                 self.config.queries,
                 simulator=simulator,
                 max_turn=self.config.user_max_turn,
+                evaluator=evaluator,
             )
 
             return results
@@ -870,6 +965,34 @@ class OpenClawAutomation:
 
         for agent_config in self.config.agents:
             await agent_manager.setup_agent(agent_config)
+
+        await self._setup_evaluator_agent(agent_manager)
+
+    async def _setup_evaluator_agent(self, agent_manager: "AgentManager") -> None:
+        """注册独立 evaluator agent(D1:须 ≠ 任一执行 agent;独立工作区)。
+
+        注意:首次创建会触发约 90s 网关重启等待(见 AgentManager)。模型对齐
+        (D10)受限——SDK `agents.create` 仅传 name/workspace,不下发 llm_model,
+        故此处只记录意图、回退网关默认模型并告警。
+        """
+        ev_cfg = self.config.eval_config
+        if not ev_cfg.enabled:
+            return
+
+        exec_agent_names = {a.name for a in self.config.agents}
+        if ev_cfg.agent_name in exec_agent_names:
+            raise ValueError(
+                f"evaluator.agent_name '{ev_cfg.agent_name}' 不得与任一执行 agent 同名(须独立)"
+            )
+
+        if ev_cfg.model:
+            logger.warning(
+                "evaluator 期望模型=%s,但网关 agents.create 不下发模型,实际将用网关默认模型",
+                ev_cfg.model,
+            )
+
+        await agent_manager.setup_agent(AgentConfigItem(name=ev_cfg.agent_name))
+        logger.info("已注册独立 evaluator agent: %s", ev_cfg.agent_name)
 
 
 

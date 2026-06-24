@@ -20,7 +20,11 @@
       "agent_name": "main3",
       "text": "中国的经济中心是哪里",
       "session_name": "test",
-      "timeout": 600
+      "timeout": 600,
+      "rubric": [
+        "明确给出一个具体城市作为答案",
+        "给出该城市为经济中心的依据(如 GDP/金融机构/交易所等)"
+      ]
     },
     {
       "agent_name": "main3",
@@ -37,5 +41,10 @@
   ],
   "gateway_ws_url": "ws://127.0.0.1:18789",
   "gateway_timeout": 600,
-  "workspace_base": "~/.openclaw/workspace"
+  "workspace_base": "~/.openclaw/workspace",
+  "simulator_config": "configs/user_proxy_model.json",
+  "eval_config": {
+    "enabled": true,
+    "feedback_to_simulator": true
+  }
 }
