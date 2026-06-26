@@ -24,7 +24,7 @@ from openclaw_sdk.core.types import ExecutionResult
 from openclaw_sdk.core.exceptions import GatewayError
 
 from trajectory import Trajectory, build_turn_record, capture_file_evidence
-from evaluator import Evaluator, EvaluatorConfig
+from evaluator import Evaluator, EvaluateConfig
 
 from utils.connection import (
     build_openclaw_client,
@@ -145,7 +145,10 @@ class AgentConfigItem(BaseModel):
     config: List[str] = Field(default_factory=list, description="配置文件列表,如 USER.md, SOUL.md")
     skills: List[str] = Field(default_factory=list, description="所需技能列表")
     system_prompt: Optional[str] = Field(None, description="系统提示词")
-    model: Optional[str] = Field(None, description="使用的模型")
+    model: Optional[str] = Field(None, description="模型名,可带 provider 前缀 'provider/model';非空时经 agents.update 钉死(如 evaluator 用 flash 级)")
+    model_provider: Optional[str] = Field(None, description="provider 名(如 custom-yibuapi-com);与 model 拼成 'provider/model' 选择已在网关侧定义的 provider")
+    api_key: Optional[str] = Field(None, description="该 provider 的 api-key(信息性):本网关须在 models.providers 配置,harness 不下发")
+    base_url: Optional[str] = Field(None, description="该 provider 的 baseUrl(信息性):本网关须在 models.providers 配置,harness 不下发")
 
 
 class QueryItem(BaseModel):
@@ -155,7 +158,7 @@ class QueryItem(BaseModel):
     session_name: Optional[str] = Field("main", description="会话名称")
     timeout: Optional[int] = Field(3600, description="超时时间(秒)")
     use_simulator: bool = Field(True, description="是否启用 user-simulator 进行多轮对话,默认 True")
-    rubric: List[str] = Field(default_factory=list, description="验收清单:随本 query 传入,整段多轮对话中冻结,供 evaluator 逐条质检;空=退回自由维度评估")
+    evaluate: Optional[EvaluateConfig] = Field(None, description="第三方 evaluator 配置(query 内联块);为空则本 query 不评估。rubric/eval_step 等迁入此块")
 
 
 class AutomationConfig(BaseModel):
@@ -175,9 +178,6 @@ class AutomationConfig(BaseModel):
     user_profile: str = Field("", description="用户画像兜底文本,profile_file 不存在时使用")
     simulator_config: Optional[str] = Field(None, description="Simulator 配置 JSON 绝对路径,含 model/api_key/base_url/proxy;不配置则从环境变量读取")
     user_max_turn: int = Field(5, description="多轮对话最大轮次")
-
-    # Evaluator(第三方裁判)配置;默认 enabled=False → 退回 simulator 自判旧行为
-    eval_config: EvaluatorConfig = Field(default_factory=EvaluatorConfig, description="第三方 Evaluator 配置段")
 
     @field_validator("gateway_ws_url", mode="before")
     @classmethod
@@ -413,9 +413,24 @@ def create_simulator(config: "AutomationConfig") -> Optional[User_simulator]:
     )
 
 
-def create_evaluator(config: EvaluatorConfig, client: Any, run_id: str) -> Optional[Evaluator]:
-    """根据配置创建 Evaluator 实例,未启用则返回 None"""
-    return Evaluator.create(config, client, run_id)
+def create_evaluator(
+    evaluate: Optional[EvaluateConfig],
+    client: Any,
+    run_id: str,
+    query_session: str,
+    system_prompt: Optional[str] = None,
+) -> Optional[Evaluator]:
+    """据 query 的 evaluate 块创建 per-query Evaluator;无该块则返回 None。
+
+    evaluator 会话名:evaluate.session_name 或回退 query 的逻辑 session_name,
+    统一加 `eval_` 前缀并隔离 run,跨 turn 复用、每轮 reset。
+    system_prompt:evaluator agent 在 agents 中配置的 system_prompt(非空时作评估提示词模板)。
+    """
+    if evaluate is None:
+        return None
+    base = evaluate.session_name or query_session
+    session_name = f"eval_{base}_{run_id}"
+    return Evaluator.create(evaluate, client, run_id, session_name, system_prompt)
 
 
 # ============================================================================
@@ -454,6 +469,47 @@ class AgentManager:
             logger.info("创建新 Agent: %s,等待 gateway 重启就绪...", agent_name)
             await self._wait_gateway_ready()
 
+        # 钉死模型:agents.create 不下发模型,改用 agents.update 下发(网关侧认 camelCase
+        # model/modelProvider/apiKey)。evaluator 即靠此钉死独立的 flash 级裁判模型。
+        if agent_config.model:
+            await self._pin_model(agent_config)
+
+    async def _pin_model(self, agent_config: AgentConfigItem) -> None:
+        """钉死 agent 的模型(经 agents.update,本网关唯一可靠的 per-agent 通道)。
+
+        本网关事实(已实测探明):
+        - `agents.update` 只认 `model`,但 model **可带 provider 前缀** `"provider/model"`,
+          据此 per-agent 选择**已在网关侧定义**的 provider(provider 携带 baseUrl/apiKey)。
+        - provider 的 baseUrl/apiKey 定义在 `config.models.providers.<provider>`,须网关侧配置:
+          本网关 `config.set/patch` 整份回写被拒(invalid config),SDK 的 `set_agent_model`
+          又与本网关 `agents={defaults,list}` 结构不兼容,二者均不可用于 per-agent 下发 url/key。
+
+        故:模型名 + provider 选择经 agents.update 下发;新 provider 的 url/key 须网关侧配。
+        """
+        # 组装模型串:已带 'provider/' 前缀则原样;否则用 model_provider 拼 'provider/model'
+        model = agent_config.model
+        if model and "/" not in model and agent_config.model_provider:
+            model = f"{agent_config.model_provider}/{model}"
+
+        if agent_config.base_url or agent_config.api_key:
+            prov = agent_config.model_provider or (model.split("/", 1)[0] if model and "/" in model else "<provider>")
+            logger.info(
+                "agent '%s' 的 baseUrl/api_key 不经 harness 下发(本网关整份回写被拒);"
+                "请在网关侧 `config.models.providers.%s` 配置 baseUrl/apiKey,本 agent 仅引用模型串 '%s'",
+                agent_config.name, prov, model,
+            )
+        try:
+            resp = await self.client.gateway.agents_update(agent_config.name, model=model)
+            logger.info(
+                "已为 agent '%s' 钉死模型=%s(agents.update 返回: %s)",
+                agent_config.name, model, resp,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "为 agent '%s' 下发模型=%s 失败(MUST NOT 静默退回默认): %s",
+                agent_config.name, model, e,
+            )
+
     async def _wait_gateway_ready(self, wait: float = 90.0) -> None:
         """创建 agent 后 gateway 会重启,固定等待一段时间让其就绪。"""
         logger.info("等待 gateway 重启就绪,固定等待 %ds ...", int(wait))
@@ -490,27 +546,21 @@ async def process_turn(
     evidence_incomplete: bool,
     trajectory: Trajectory,
     evaluator: Optional[Evaluator],
-    last_feedback: Optional[str],
-    frozen_rubric: List[str],
-) -> tuple[Optional[str], Optional[str]]:
-    """逐轮处理(仅多轮 simulator 路径):能力1 捕获带证据轨迹 + 能力2 第三方评估。
+) -> Optional[str]:
+    """逐轮处理(仅多轮 simulator 路径):能力1 每轮捕获带证据轨迹 + 能力2 按 eval_step 节流评估。
 
-    单轮对话不进入本函数(不采集轨迹)。两段逻辑高内聚:能力2 的评估依赖能力1
-    刚产出的 turn_record 与累积 trajectory,故合并为一次调用。
-
-    evaluator 未启用时,轨迹无人消费(evaluator 是其唯一 reader),故前置返回——
-    既不评估也不采集轨迹。
+    单轮对话不进入本函数(不采集轨迹)。每个 turn 都捕获轨迹(供评审窗口取数),
+    但仅在评审点(`turn % eval_step == 0`)触发 evaluator;被跳过的轮给 simulator 喂空。
 
     Returns:
-        (evaluator_feedback, last_feedback)
-        - evaluator_feedback: 本轮喂回 simulator 的反馈(feedback_to_simulator=False 时为 None)
-        - last_feedback: 更新后的上一轮反馈(供下一轮无状态投喂)
+        evaluator_feedback: 本轮喂回 simulator 的反馈;跳过轮/未回流/评估失败均为 None。
     """
-    # evaluator 未启用:轨迹无人消费,既不评估也不采集,直接返回默认
-    if evaluator is None or not evaluator.enabled:
-        return None, last_feedback
+    # evaluator 未启用:轨迹无人消费(evaluator 是其唯一 reader),既不评估也不采集
+    if evaluator is None:
+        return None
 
     # 能力1:逐轮捕获带证据的轨迹(tool_calls 内存直取,免费;文件证据升级为磁盘真相 D5)
+    # 即便本轮不评审也要捕获,否则评审点窗口取不到中间轮数据。
     turn_record = build_turn_record(turn, current_query, result, evidence_incomplete)
     try:
         await capture_file_evidence(client.gateway, query.agent_name, turn_record)
@@ -518,21 +568,24 @@ async def process_turn(
         logger.debug("文件证据捕获失败: %s", e)
     trajectory.turns.append(turn_record)
 
-    # 能力2:逐轮第三方评估,反馈喂回 simulator(simulator 仍拍板)
-    evaluator_feedback: Optional[str] = None
+    # 能力2:eval_step 节流——仅在评审点触发评估;跳过轮喂空(simulator 仍拍板)
+    step = evaluator.config.eval_step
+    if turn % step != 0:
+        logger.debug("[Evaluator] turn=%d 未达评审点(eval_step=%d),跳过并喂空", turn, step)
+        return None
+
+    window = step  # 最近 X 轮 = eval_step,窗口正好覆盖两次评审之间的全部 turn
     try:
         ev = await evaluator.evaluate_turn(
-            trajectory, turn_record, last_feedback, rubric=frozen_rubric
+            trajectory, turn_record, rubric=evaluator.config.rubrics, window=window
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("evaluator 调用异常: %s", e)
         ev = None
-    if ev is not None:
-        last_feedback = evaluator.format_feedback(ev)
-        if evaluator.feedback_to_simulator:
-            evaluator_feedback = last_feedback
 
-    return evaluator_feedback, last_feedback
+    if ev is not None and evaluator.feedback_to_simulator:
+        return evaluator.format_feedback(ev)
+    return None
 
 
 async def execute_queries(
@@ -540,7 +593,7 @@ async def execute_queries(
     queries: List[QueryItem],
     simulator_factory: Optional[Callable[[], Optional[User_simulator]]] = None,
     max_turn: int = 5,
-    evaluator: Optional[Evaluator] = None,
+    agent_system_prompts: Optional[Dict[str, str]] = None,
 ) -> Dict[str, ExecutionResult]:
     """执行查询任务列表
 
@@ -793,8 +846,12 @@ async def execute_queries(
 
         # 能力1:逐轮累积带证据的轨迹
         trajectory = Trajectory(query=query_text, agent_name=query.agent_name)
-        last_feedback: Optional[str] = None  # 上一轮 evaluator 反馈(供无状态投喂)
-        frozen_rubric = list(query.rubric)  # 随 query 传入并在整段对话中冻结(循环内不改写)
+        # 能力2:per-query 构建持久 evaluator(无 evaluate 块则为 None);rubric/eval_step 取自该块。
+        # evaluator agent 若在 agents 中配了 system_prompt,则用它作评估提示词模板(替代内置默认)。
+        eval_sys_prompt = None
+        if query.evaluate is not None:
+            eval_sys_prompt = (agent_system_prompts or {}).get(query.evaluate.agent_name)
+        evaluator = create_evaluator(query.evaluate, client, _RUN_ID, base_session, eval_sys_prompt)
 
         for turn in range(1, max_turn + 1 if query_simulator else 2):
             logger.debug("[Q%d] %s", turn, current_query)
@@ -831,10 +888,10 @@ async def execute_queries(
                 success = True
                 break
 
-            # 能力1+能力2:逐轮捕获带证据轨迹 + 第三方评估,反馈喂回 simulator
-            evaluator_feedback, last_feedback = await process_turn(
+            # 能力1+能力2:逐轮捕获带证据轨迹 + 按 eval_step 节流的第三方评估,反馈喂回 simulator
+            evaluator_feedback = await process_turn(
                 client, query, turn, current_query, result, evidence_incomplete,
-                trajectory, evaluator, last_feedback, frozen_rubric,
+                trajectory, evaluator,
             )
 
             user_reply = query_simulator.chat(agent_reply, evaluator_feedback=evaluator_feedback)
@@ -912,15 +969,17 @@ class OpenClawAutomation:
             await self._setup_agents()
             # 3. 创建 Simulator 工厂(每个 session 构造一个独立实例,隔离记忆)
             simulator_factory = lambda: create_simulator(self.config)
-            # 4. 创建 Evaluator
-            evaluator = create_evaluator(self.config.eval_config, client, _RUN_ID)
-            # 5. 执行查询
+            # agent 名 → system_prompt(供 evaluator 复用为评估提示词模板)
+            agent_system_prompts = {
+                a.name: a.system_prompt for a in self.config.agents if a.system_prompt
+            }
+            # 4. 执行查询(evaluator 改为 per-query 在循环内据 query.evaluate 构建)
             results = await execute_queries(
                 client,
                 self.config.queries,
                 simulator_factory=simulator_factory,
                 max_turn=self.config.user_max_turn,
-                evaluator=evaluator,
+                agent_system_prompts=agent_system_prompts,
             )
 
             return results
@@ -981,33 +1040,28 @@ class OpenClawAutomation:
         for agent_config in self.config.agents:
             await agent_manager.setup_agent(agent_config)
 
-        await self._setup_evaluator_agent(agent_manager)
+        self._validate_evaluators()
 
-    async def _setup_evaluator_agent(self, agent_manager: "AgentManager") -> None:
-        """注册独立 evaluator agent(D1:须 ≠ 任一执行 agent;独立工作区)。
+    def _validate_evaluators(self) -> None:
+        """校验每个 query 的 evaluate 块:evaluator agent 须取自 agents 列表,且 ≠ 该 query 执行 agent。
 
-        注意:首次创建会触发约 90s 网关重启等待(见 AgentManager)。模型对齐
-        (D10)受限——SDK `agents.create` 仅传 name/workspace,不下发 llm_model,
-        故此处只记录意图、回退网关默认模型并告警。
+        evaluator agent 本身在上面的 `agents` 循环中已创建并(若配了 model)钉死模型,
+        故此处仅做装配期一致性校验,不再单独创建。
         """
-        ev_cfg = self.config.eval_config
-        if not ev_cfg.enabled:
-            return
-
-        exec_agent_names = {a.name for a in self.config.agents}
-        if ev_cfg.agent_name in exec_agent_names:
-            raise ValueError(
-                f"evaluator.agent_name '{ev_cfg.agent_name}' 不得与任一执行 agent 同名(须独立)"
-            )
-
-        if ev_cfg.model:
-            logger.warning(
-                "evaluator 期望模型=%s,但网关 agents.create 不下发模型,实际将用网关默认模型",
-                ev_cfg.model,
-            )
-
-        await agent_manager.setup_agent(AgentConfigItem(name=ev_cfg.agent_name))
-        logger.info("已注册独立 evaluator agent: %s", ev_cfg.agent_name)
+        declared = {a.name for a in self.config.agents}
+        for idx, query in enumerate(self.config.queries):
+            ev = query.evaluate
+            if ev is None:
+                continue
+            if ev.agent_name not in declared:
+                raise ValueError(
+                    f"query[{idx}] evaluate.agent_name '{ev.agent_name}' 不在顶层 agents 列表中,"
+                    "请先在 agents 中声明该 evaluator(并配置其 flash 模型)"
+                )
+            if ev.agent_name == query.agent_name:
+                raise ValueError(
+                    f"query[{idx}] evaluate.agent_name '{ev.agent_name}' 不得与执行 agent 同名(须独立裁判)"
+                )
 
 
 

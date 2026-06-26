@@ -52,6 +52,7 @@ class FileEvidence(BaseModel):
     exists: bool = False
     size: Optional[int] = None
     content: Optional[str] = None
+    path: Optional[str] = None  # 产物在被测工作区的路径,供"指针投喂"(filename + workspace_path)
     error: Optional[str] = None  # 取证失败原因(如路径不可达)→ 降级,不当负面证据
     discovered: bool = False  # True=经工作区清点主动发现(非 agent 自报)
 
@@ -80,6 +81,28 @@ class Trajectory(BaseModel):
         if not turns:
             return "（暂无历史轮次）"
         return "\n\n".join(_render_turn(t) for t in turns)
+
+    def render_recent(self, window: int) -> str:
+        """渲染最近 window 轮的轨迹(压缩版:保留 tool_calls,文件仅给指针不内联全文)。
+        建议window = eval_step, 正好覆盖两次评审之间的全部 turn,不留上下文空洞。
+        """
+        turns = self.turns[-window:] if window and window > 0 else self.turns
+        if not turns:
+            return "（暂无轮次）"
+        return "\n\n".join(_render_turn_compact(t) for t in turns)
+
+    def generated_file_pointers(self) -> list[dict]:
+        """累积全部产物的指针 {filename, workspace_path}(去重按 name,后出现覆盖)。
+
+        产物指针覆盖整段对话(非仅最近 X 轮)——避免 reset 后窗口外早期产物丢失;
+        evaluator 据指针用自身工具打开核验,而非凭文件名臆断。
+        """
+        seen: dict[str, Optional[str]] = {}
+        for t in self.turns:
+            for f in t.files:
+                if f.checked and f.exists:
+                    seen[f.name] = f.path
+        return [{"filename": n, "workspace_path": p} for n, p in seen.items()]
 
 
 def _render_turn(t: TurnRecord) -> str:
@@ -112,6 +135,27 @@ def _render_turn(t: TurnRecord) -> str:
     return "\n".join(lines)
 
 
+def _render_turn_compact(t: TurnRecord) -> str:
+    """压缩渲染单轮:保留 tool_calls(反幻觉底线),但文件**不内联全文**——
+    产物以指针(由 `Trajectory.generated_file_pointers` 统一汇总)交给 evaluator 用工具自查。
+    """
+    lines = [f"── Turn {t.turn} ──", f"[用户]: {t.user_input}", f"[Agent]: {t.agent_content}"]
+    if t.tool_calls:
+        lines.append("[工具调用]:")
+        for tc in t.tool_calls:
+            out = (tc.output or "")[:800]
+            lines.append(f"  - {tc.tool}(input={tc.input[:300]}) -> {out}")
+    if t.files:
+        # 仅列出本轮涉及的产物名(指针清单另行统一给出),不贴内容
+        names = ", ".join(f.name for f in t.files)
+        lines.append(f"[本轮产物]: {names}")
+    if t.stop_reason:
+        lines.append(f"[stop_reason]: {t.stop_reason}")
+    if t.evidence_incomplete:
+        lines.append("[注意]: 本轮证据不完整(经 history 兜底恢复)——证据缺失 ≠ 证据为负")
+    return "\n".join(lines)
+
+
 # ============================================================================
 # 捕获辅助
 # ============================================================================
@@ -136,7 +180,7 @@ def build_turn_record(
         )
         for tc in (result.tool_calls or [])
     ]
-    files = [FileEvidence(name=(gf.name or gf.path or "")) for gf in (result.files or [])]
+    files = [FileEvidence(name=(gf.name or gf.path or "")) for gf in (result.files or [])]  # gf = generated_file
     return TurnRecord(
         turn=turn,
         user_input=user_input,
@@ -180,6 +224,7 @@ async def _resolve_file_evidence(
     info = inventory.get(fe.name)
     if info is not None:
         fe.size = info.get("size")
+        fe.path = info.get("path")
     fe.checked = True
 
     get_missing = False
@@ -199,6 +244,8 @@ async def _resolve_file_evidence(
     local_path = (info.get("path") if info else None) or (
         str(Path(workspace_path) / fe.name) if workspace_path else None
     )
+    if fe.path is None:
+        fe.path = local_path
     content = _read_local(local_path)
     if content is not None:
         fe.exists = True
@@ -230,8 +277,7 @@ async def capture_file_evidence(
     D5 落实:不采信 `ExecutionResult.files` 自报(常为空)。流程:
     1. `agents.files.list` 取被测工作区**路径**与白名单文件清单;
     2. 升级 agent 自报的文件证据(get → 同机读盘 → 清点);
-    3. `discover=True` 时**直接扫描本地工作区目录**(网关 list 仅暴露脚手架白名单,
-       看不到用户新建文件),把非脚手架、自报未覆盖的文件作为新产物 surface 给 evaluator。
+    3. `discover=True` 时**直接扫描本地工作区目录**(主动去发现 agent 未自报的新文件）
 
     取证受阻一律降级为证据缺失,MUST NOT 当负面证据(由下游 evaluator 规则保证)。
     """
@@ -246,12 +292,12 @@ async def capture_file_evidence(
                 if not nm:
                     continue
                 inventory[nm] = {
-                    "exists": not e.get("missing", False),
+                    "exists": not e.get("missing", False), # OpenClaw-网关会判断对应的文件是否missing,避免虚假声称
                     "size": e.get("size"),
                     "path": e.get("path"),
                 }
         except Exception as e:  # noqa: BLE001
-            logger.debug("agents.files.list 不可用,降级为仅核验自报文件: %s", e)
+            logger.debug("agents_files_list 不可用,降级为仅核验自报文件: %s", e)
 
     # 2. 升级 agent 自报的文件
     for fe in record.files:
@@ -267,7 +313,7 @@ async def capture_file_evidence(
                 nm = child.name
                 if nm in claimed or nm in SCAFFOLDING_FILES:
                     continue
-                fe = FileEvidence(name=nm, discovered=True, checked=True, exists=True)
+                fe = FileEvidence(name=nm, discovered=True, checked=True, exists=True, path=str(child))
                 try:
                     fe.size = child.stat().st_size
                 except Exception:  # noqa: BLE001

@@ -13,6 +13,13 @@
       "name": "main3",
       "config": [],
       "skills": []
+    },
+    {
+      "name": "evaluator",
+      "config": [],
+      "skills": [],
+      "model": "gemini-3-flash-preview",
+      "model_provider": "custom-yibuapi-com"
     }
   ],
   "queries": [
@@ -20,11 +27,7 @@
       "agent_name": "main3",
       "text": "中国的经济中心是哪里",
       "session_name": "test",
-      "timeout": 600,
-      "rubric": [
-        "明确给出一个具体城市作为答案",
-        "给出该城市为经济中心的依据(如 GDP/金融机构/交易所等)"
-      ]
+      "timeout": 600
     },
     {
       "agent_name": "main3",
@@ -36,15 +39,22 @@
       "agent_name": "main3",
       "text": "这个城市的人口是多少?",
       "session_name": "test",
-      "timeout": 600
+      "timeout": 600,
+      "evaluate": {
+        "agent_name": "evaluator",
+        "session_name":"test",
+        "rubrics":[
+          "明确给出一个具体城市作为答案",
+          "给出该城市为经济中心的依据(如 GDP/金融机构/交易所等)"
+        ],
+        "eval_step" : 2,
+        "feedback_to_simulator": true
+      }
     }
   ],
   "gateway_ws_url": "ws://127.0.0.1:18789",
   "gateway_timeout": 600,
   "workspace_base": "~/.openclaw/workspace",
   "simulator_config": "configs/user_proxy_model.json",
-  "eval_config": {
-    "enabled": true,
-    "feedback_to_simulator": true
-  }
+  "user_max_turn": 6
 }

@@ -1,0 +1,108 @@
+第一轮任务说明：
+0625检视意见详细说明：
+1、Evaluator固定一个模型， 不需要和assitant一致，尽量不一致。建议用一个快一点的flash级别的不变。
+1.1. Harness创建模型时，能指定模型的连接吗？可以的，openclaw-sdk的AgentConfig是有模型字段的。用 agents.update(model/modelProvider/apiKey)。
+1.2. 一定要用agent。
+1.3. agent涉及的模型的URL + api-key的信息，补充在config_session.json里。
+
+2、Evaluator的配置项要重新改一下 （如上述示例）
+2.1. 这个直接解析修改就行了。
+2.2. 每个query可以自选agents字段中的agent作为evaluator。
+
+3、补充分析复杂任务场景下的轨迹 （评估效果、evaluator要不要配置专属的独立的skill, 资源开销[时间、token消耗]，轮数控制）
+3.1. 当前的config_session.log里的任务配置，问题太简单了，交互轮次不多。不能去评估复杂场景。
+
+4、Evaluator不再是完全无状态（agent 持久、会话仍无状态）。同一个query的不同turn都使用同一个agent,  和assistant保持一个对齐/跟随的状态, 每一个turn的记录不需要清理之前的历史信息。
+4.1. 如果是无状态的话，每个turn重新创建一个agent（与Harness建立连接，初始化agent的相关参数等），这样资源开销太大（时间）。
+4.2. 每次把历史状态传递给eval,  这样token资源开销太大了, 成本上涨很多。只传递最近X轮的。历史记录在 harness 的 trajectory 里;session 每轮
+  reset、不承担记忆职责
+4.3. 要避免evaluator被上一轮的判词影响， 但是evaluator-agent的历史回复不应被感知。
+4.4. 因为（agent自己的session里会存，且会传递到evalute过程）因此每次评估之前reset session。我们之前会记录trajectory, 对轨迹内容做压缩，
+仅包含最近X轮的回复，tool_calls,原始query, rubrics，generated_files字段。
+
+5、要不要每一个步骤都要评审？ 是不是每X步评审一下？
+5.1. 这个X要做成配置项，在不同配置下分别尝试一下效果。
+5.2. val_step 跳过的轮,evaluator_feedback 给 simulator 喂空。
+5.3. 最近 X 轮 就是 每X步评审的X。
+
+6、当前是把所有历史信息/工具调用/回复都传递给了eval, 这样资源开销太大了。只放最近X轮的。
+
+第二轮澄清：
+1、真实 flash 模型名、provider 和 api_key  是可配置的吗？先用user_proxy_model.json里的配置调试。
+1.1. 不能通过SDK配置url和api, 只能选择模型名，要在OC侧去做全局配置。 这没关系，我们可以提前在OC侧配置好。 
+当前 config: eval_step=10, 但 user_max_turn=5。导致eval_step不生效，没关系。把 config 的 eval_step 改成 2、user_max_turn 提到 6,然后跑一次完整 simulator 闭环(7.1),再用 eval_step=1/2/3 各跑一遍出实验对比(6.2)。 -->可以的
+
+第三轮：
+1、 如果是在OC侧写死了，还需要做agent.update来更新吗？
+1.1. 如果没有写死模型名， Create的时候可以指定吗？  因为OC侧有两个agent(assitant和evaluator)， 写死模型名的话， 两个agent的模型名会是一致的吗？  --> 要看写死在哪里，都可以的。
+1.2. 不可以，但是create后可以通过config.set_agent_model来指定。 
+2、 故 eval_step 对比改用受控多轮轨迹隔离。 --> 这句话是什么意思？ 
+2.1. 用一条人造的、固定的 6 轮对话作为相同输入,只改 eval_step,让真实 evaluator 去评,从而干净地隔离出 eval_step 单个变量的影响。
+
+第四轮：
+我要开始对代码进行检视，检视意见：
+1、scripts下生成了3个文件，这是干啥的？ 和我们这次提交有关吗？ -->  (b) 从主提交移走,挪到 openspec/changes/.../ 变更目录下(归档后自然随变更走,不污染 scripts/);
+2、简述一下对代码的主要改动（代码级）
+
+
+2. 代码级主要改动(三个源文件)
+
+  trajectory.py — 支撑"压缩投喂 + 产物指针":
+  - FileEvidence 加 path 字段(产物在工作区的路径,即指针的 workspace_path),并在取证/清点两处填充。 --> 为啥要加path字段？作用是？
+  - Trajectory 加 render_recent(window)(只渲染最近 N 轮、保留 tool_calls、文件只列名不贴全文)和 generated_file_pointers()(累积全部产物、按名去重的指针清单)。
+  - 新增 _render_turn_compact()。原 render_full(全量) 保留但评估路径不再用。
+
+  evaluator.py — 核心状态模型翻转:
+  - EvaluatorConfig(全局)→ EvaluateConfig(per-query):字段 agent_name/session_name/rubrics/eval_step/feedback_to_simulator/...;去掉 enabled(有 evaluate 块即启用)和 model(模型移到 agent 声明)。
+  - Evaluator.__init__ 多收一个 session_name(同 query 固定会话名);create() 改 per-query。
+  - evaluate_turn():去掉 last_feedback 入参(不再回投自身旧判词),加 window;流程改为 sessions.reset → 推产物 → 压缩投喂 → 结构化输出。
+  - 新增 _reset_session();_build_prompt() 重写为 origin_query + 最近 window 轮 + 产物指针 + rubric,删去全量历史投喂。
+  - _log 加 window/window_turns/prompt_chars/eval_step/evaluator_agent。
+
+  openclaw_automation.py — 配置与编排:
+  - AgentConfigItem 加 model_provider / api_key / base_url。
+  - QueryItem 删顶层 rubric,加 evaluate: Optional[EvaluateConfig](此前内联块被静默忽略,现真解析)。
+  - AutomationConfig 删全局 eval_config。
+  - create_evaluator() 改 per-query 签名;execute_queries 去掉 evaluator 入参;主循环内 per-query 构建 evaluator,删 last_feedback/frozen_rubric。
+  - process_turn():每轮都捕获轨迹,但 turn % eval_step == 0 才评、跳过轮喂空,单返回值。
+  - AgentManager 加 _pin_model()(组装 provider/model 经 agents.update 下发);_setup_evaluator_agent 删除,改为 _validate_evaluators(校验 evaluator∈agents 且≠执行 agent)。
+
+  configs/config_session.json:eval_step 10→2、加 user_max_turn:6、evaluator agent 加 model/model_provider、evaluate 块现在生效。
+
+
+
+第五轮：
+1. FileEvidence 加 path 字段(产物在工作区的路径,即指针的 workspace_path),并在取证/清点两处填充。 --> 为啥要加path字段？作用是？
+因为 OC 跨工作区读不了(evaluator.py:176 那条注释),evaluator 真正核验时读的是推进到自己 _under_review/ 的副本,不是这个 workspace_path。所以 path/workspace_path 当前主要是给 evaluator
+  看的"位置/身份"信息(消歧、说明产物在哪),不是它实际打开的路径。保留它是为了兑现 #6 的指针格式   ---> 保留它。
+
+
+2. EvaluateConfig中的prompt_file: Optional[str] = Field(None, description="评估 system prompt 模板路径;None=内置")  的作用是什么？
+当前有evalutor的prompt吗？还是只有写死在代码里的那个DEFAULT_EVAL_PROMPT。   --> 没有额外的prompt_file
+config 里 evaluator agent 的 system_prompt， 现在是不生效吗？ 现在不生效， 要改成：DEFAULT_EVAL_PROMPT =evaluate_agent.system_prompt
+
+3. def enabled(self) -> bool: return True      这个方法现在默认返回true了？有人调用吗？没人调用还要保留他吗？  --> 确认了，没人用，删除。
+4. SDK 的 `set_agent_model`又与本网关 `agents={defaults,list}` 结构不兼容,二者均不可用于 per-agent 下发 url/key。 什么意思？
+当前因为SDK和OC版本不匹配，无法使用set_agent_model来配置模型、URL、API_KEY等
+
+第六轮检视意见：
+1. configs/config_session.json中，config里为什么要提供model_provider？ 其实也可以在指定api_key和base_url，只是OC-SDK不支持远端下发。
+2. configs/config_session.json中，"simulator_config": "configs/user_proxy_model.json",  为何新增这个字段？
+3. openclaw_automation.py中为何要删除copy_path方法？
+4. process_turn ---更名---> evaluator_process_turn
+
+核心改动总览：
+1. user_simulator.chat 增加 evaluator_feedback入参。
+2. openclaw_automation.py：编排层、配置解析层
+2.1. config里新增model_provider， api_key和base_url。其中api_key和base_url，在OC-SDK不支持远端下发。需要提前在OC配置好。
+2.2. queryItem新增evaluteConfig配置解析。
+2.3. 新增create_evaluator方法，是对Evalutor.Create的封装（拼了一些session_name）。
+2.4. 支持Agent自行配置modelName --> _pin_model
+2.5. 抽象process_turn方法，对每一轮asssitant回复进行评估：evaluate判空 + 记录轨迹（InitQuery + assistant.result + assistatn.tool_call + FileEvidence），Evaluator消费刚刚记录的window轮trajectory。
+2.6. execute_queries的入参从user_simulator变为user_simulator的工厂类（原先的逻辑有bug, 不同session共享同一个user_simulator.）。
+2.7. execute_queries增加agent_system_pompts作为显式入参。
+
+
+3. Trajectory.py:
+3.1. 对编排层暴露Trajectory, build_turn_record, capture_file_evidence三个方法。capture_file_evidence是通过SDK/OS两层校验来判定文件确实存在。
+3.1. 为什么需要Trajectory? Trajectory记录了历史的所有轨迹信息 （原先难道没有轨迹信息吗？没有的，历史信息存在agent侧），同时负责收集ToolCallEvidence + FileEvidence, 负责eval_step逻辑抽象。

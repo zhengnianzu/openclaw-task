@@ -17,8 +17,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -41,12 +40,17 @@ eval_logger.propagate = False
 # 配置 / 结构化输出
 # ============================================================================
 
-class EvaluatorConfig(BaseModel):
-    """Evaluator 配置段。默认 enabled=False → 退回 simulator 自判旧行为。"""
-    enabled: bool = Field(False, description="是否启用第三方 evaluator")
-    agent_name: str = Field("evaluator", description="evaluator 的独立 OC agent 名(须 ≠ 任一执行 agent)")
-    model: Optional[str] = Field(None, description="评估模型;初期对齐 user_simulator,None=网关默认")
-    prompt_file: Optional[str] = Field(None, description="评估 system prompt 模板路径;None=内置")
+class EvaluateConfig(BaseModel):
+    """Per-query 评估配置(query 内联 `evaluate` 块)。
+
+    出现该块即表示本 query 启用第三方 evaluator(不再有独立 enabled 开关)。
+    `agent_name` 须取自顶层 `agents` 列表中的某个已声明 agent,且 ≠ 本 query 的执行 agent;
+    其裁判模型在 agent 声明处经 `agents.update` 钉死(见 openclaw_automation._setup_*)。
+    """
+    agent_name: str = Field("evaluator", description="充当 evaluator 的 OC agent 名(须取自 agents 列表,且 ≠ 执行 agent)")
+    session_name: Optional[str] = Field(None, description="evaluator 会话名;None=复用 query.session_name 跟随被测会话")
+    rubrics: List[str] = Field(default_factory=list, description="验收清单:随 query 冻结,供逐条质检;空=自由维度评估")
+    eval_step: int = Field(1, ge=1, description="评审频率 X:每 X 个 turn 评一次;最近 X 轮投喂窗口的 X 同此值")
     feedback_to_simulator: bool = Field(
         False,
         description="True=评估反馈回流 simulator;False=只评估并落盘、不回流(安全默认,先行观测质量)",
@@ -99,35 +103,53 @@ DEFAULT_EVAL_PROMPT = """你是一个独立、严格的任务评估专家(Evalua
 # ============================================================================
 
 class Evaluator:
-    """驱动独立 evaluator OC agent,逐轮无状态评估。"""
+    """驱动一个**持久** evaluator OC agent,逐评审点评估。
 
-    def __init__(self, config: EvaluatorConfig, client: Any, run_id: str):
+    状态模型:agent 实体在同一 query 内复用(不每轮重建,省建连/初始化开销);
+    但**每次评估前 reset 其会话**——因为 OC 会话会持久化并回放 agent 自身上一轮的判词,
+    不清空会造成判词自我锚定。历史由 harness 的 trajectory 承载,session 不承担记忆。
+    """
+
+    def __init__(
+        self,
+        config: EvaluateConfig,
+        client: Any,
+        run_id: str,
+        session_name: str,
+        system_prompt: Optional[str] = None,
+    ):
         self.config = config
         self.client = client
         self.run_id = run_id
-        self._prompt_template = DEFAULT_EVAL_PROMPT
-        if config.prompt_file:
-            p = Path(config.prompt_file)
-            if p.exists():
-                self._prompt_template = p.read_text(encoding="utf-8")
-            else:
-                logger.warning("evaluator prompt_file 不存在,回退内置模板: %s", p)
+        # 同一 query 内固定的 evaluator 会话名(跨 turn 复用、每轮 reset)
+        self.session_name = session_name
+        # 评估提示词模板:优先用 evaluator agent 配置的 system_prompt(配了就用它),
+        # 否则回退内置 DEFAULT_EVAL_PROMPT。注:本网关下 agent 的 system_prompt 不会下发到
+        # OC 层,这里把它复用为评估指令模板(作为每轮 user 消息注入),使该配置真正生效。
+        self._prompt_template = system_prompt or DEFAULT_EVAL_PROMPT
 
     @classmethod
-    def create(cls, config: "EvaluatorConfig", client: Any, run_id: str) -> Optional["Evaluator"]:
-        """根据配置创建 Evaluator 实例,未启用则返回 None"""
-        if not config.enabled:
+    def create(
+        cls,
+        config: Optional["EvaluateConfig"],
+        client: Any,
+        run_id: str,
+        session_name: str,
+        system_prompt: Optional[str] = None,
+    ) -> Optional["Evaluator"]:
+        """据 query 的 evaluate 块创建 Evaluator;无该块(config=None)则返回 None。
+
+        system_prompt: evaluator agent 在 `agents` 中配置的 system_prompt;非空时作为
+        评估提示词模板替代 DEFAULT_EVAL_PROMPT。
+        """
+        if config is None:
             return None
-        evaluator = cls(config, client, run_id)
+        evaluator = cls(config, client, run_id, session_name, system_prompt)
         logger.info(
-            "Evaluator 已启用(feedback_to_simulator=%s,agent=%s)",
-            config.feedback_to_simulator, config.agent_name,
+            "Evaluator 已启用(agent=%s,session=%s,eval_step=%d,feedback_to_simulator=%s)",
+            config.agent_name, session_name, config.eval_step, config.feedback_to_simulator,
         )
         return evaluator
-
-    @property
-    def enabled(self) -> bool:
-        return self.config.enabled
 
     @property
     def feedback_to_simulator(self) -> bool:
@@ -137,22 +159,29 @@ class Evaluator:
         self,
         trajectory: Trajectory,
         current_turn: TurnRecord,
-        last_feedback: Optional[str] = None,
         rubric: Optional[list[str]] = None,
+        window: int = 1,
     ) -> Optional[EvaluationResult]:
-        """对本轮做一次无状态评估;失败返回 None(安全降级,不阻断任务)。
+        """对当前进展做一次评估;失败返回 None(安全降级,不阻断任务)。
 
-        rubric: 随 query 传入并在整段对话中冻结的验收清单;非空时逐条质检。
+        持久 agent + 每轮 reset:先清空会话防判词锚定,再投喂压缩 trajectory
+        (origin_query + rubrics + 最近 window 轮含 tool_calls + 产物指针)。
+        rubric: 随 query 冻结的验收清单;非空时逐条质检。window: 最近投喂轮数(=eval_step)。
         """
+        # 持久 agent:同一 query 复用同一会话名(不每轮新建)
+        eval_agent = self.client.get_agent(self.config.agent_name, self.session_name)
+
+        # D1:评估前 reset 会话,确保自身上一轮判词不被回放(防锚定)
+        await self._reset_session(eval_agent)
+
         # 投递(b):把磁盘真相文件推进 evaluator 自己的工作区,供其用工具就地核验
+        # (reset 清的是对话,不动工作区,故顺序 reset → push → send 安全)
+        # OpenClaw 的设计中，每个 Agent 的工具只能访问自己的工作区，无法跨界读取其他 Agent 的文件
         await self._push_review_files(current_turn)
 
-        # 投递(a):任务 + 历轮全文 + 上轮反馈 + 本轮证据 拼进提示词
-        prompt = self._build_prompt(trajectory, current_turn, last_feedback, rubric)
-
-        # D4 无状态:每轮新开 session
-        session = f"eval_{self.run_id}_{trajectory.agent_name}_{current_turn.turn}"
-        eval_agent = self.client.get_agent(self.config.agent_name, session)
+        # 投递(a):origin_query + rubrics + 最近 window 轮 + 产物指针(不投全量历史/不投自身旧判词)
+        prompt = self._build_prompt(trajectory, rubric, window)
+        prompt_chars = len(prompt)  # token 代理量,供 eval_step 实验对比开销
 
         try:
             result = await StructuredOutput.execute(
@@ -160,7 +189,7 @@ class Evaluator:
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("evaluator 第 %d 轮评估失败: %s", current_turn.turn, e)
-            self._log(trajectory, current_turn, None, error=str(e))
+            self._log(trajectory, current_turn, None, error=str(e), window=window, prompt_chars=prompt_chars)
             return None
 
         # 确定性归一:无冻结 rubric 时强制清空 rubric_checks,兜住模型自拟准则的幻觉。
@@ -168,7 +197,7 @@ class Evaluator:
         if not rubric:
             result.rubric_checks = []
 
-        self._log(trajectory, current_turn, result)
+        self._log(trajectory, current_turn, result, window=window, prompt_chars=prompt_chars)
 
         # Debug:打印 evaluator 本轮结构化输出,便于在线观测评估质量
         logger.debug(
@@ -201,6 +230,16 @@ class Evaluator:
 
     # ------------------------------------------------------------------ #
 
+    async def _reset_session(self, eval_agent: Any) -> None:
+        """评估前清空 evaluator 会话(防判词锚定)。失败则降级继续(不阻断任务)。"""
+        gateway = getattr(self.client, "gateway", None)
+        if gateway is None:
+            return
+        try:
+            await gateway.sessions_reset(eval_agent.session_key)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("evaluator 会话 reset 失败(降级继续): %s", e)
+
     async def _push_review_files(self, turn: TurnRecord) -> None:
         gateway = getattr(self.client, "gateway", None)
         if gateway is None:
@@ -217,20 +256,30 @@ class Evaluator:
     def _build_prompt(
         self,
         trajectory: Trajectory,
-        current_turn: TurnRecord,
-        last_feedback: Optional[str],
         rubric: Optional[list[str]] = None,
+        window: int = 1,
     ) -> str:
-        from trajectory import _render_turn  # 复用渲染
+        """构建压缩投喂:origin_query + 最近 window 轮(含 tool_calls)+ 产物指针 + rubrics。
 
+        刻意**不投**全量历史、**不投**文件全文、**不投** evaluator 自身上一轮判词(防锚定)。
+        进步感知由窗口内 window 轮的证据变化体现。
+        """
         parts = [
             self._prompt_template,
             f"\n# 原始任务(Origin_query)\n{trajectory.query}",
-            f"\n# 历史轮次(全文)\n{trajectory.render_full(exclude_last=True)}",
+            f"\n# 最近 {window} 轮执行证据(含工具调用)\n{trajectory.render_recent(window)}",
         ]
-        if last_feedback:
-            parts.append(f"\n# 上一轮你的评估反馈\n{last_feedback}")
-        parts.append(f"\n# 本轮待评估的执行证据\n{_render_turn(current_turn)}")
+        pointers = trajectory.generated_file_pointers()
+        if pointers:
+            ptr_lines = "\n".join(
+                f"- {p['filename']} (workspace_path={p['workspace_path']})" for p in pointers
+            )
+            parts.append(
+                f"\n# 产物文件(指针·累积)\n"
+                f"以下产物已推进到你工作区的 `{self.config.review_subdir}/` 下,"
+                "请用你自己的工具打开/检索/核验其内容,MUST NOT 凭文件名臆断:\n"
+                f"{ptr_lines}"
+            )
         if rubric:
             criteria = "\n".join(f"{i}. {c}" for i, c in enumerate(rubric, 1))
             parts.append(
@@ -251,14 +300,9 @@ class Evaluator:
                 "本任务**没有**验收清单。你 MUST 让结构化输出的 `rubric_checks` 返回空数组 `[]`,"
                 "MUST NOT 自拟任何 rubric 准则,也 MUST NOT 把上面的评估维度当作 rubric 准则填入 `rubric_checks`。"
             )
-        review_hint = ""
-        if any(f.checked and f.exists for f in current_turn.files):
-            review_hint = (
-                f"\n(被审查的产物文件已放入你工作区的 `{self.config.review_subdir}/` 下,"
-                "可用你自己的工具打开/检索/核验。)"
-            )
         parts.append(
-            f"\n# 你的任务{review_hint}\n请基于以上证据评估执行 agent 本轮表现,输出结构化裁决。"
+            "\n# 你的任务\n请基于以上证据评估执行 agent 的当前表现(以最近 "
+            f"{window} 轮证据 + 产物指针为准),输出结构化裁决。"
         )
         return "\n".join(parts)
 
@@ -268,9 +312,12 @@ class Evaluator:
         turn: TurnRecord,
         result: Optional[EvaluationResult],
         error: Optional[str] = None,
+        window: int = 1,
+        prompt_chars: int = 0,
     ) -> None:
         if not self.config.log_evaluations:
             return
+        win_start = max(1, turn.turn - window + 1)  # 本次投喂窗口的起始轮
         record: dict[str, Any] = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "run_id": self.run_id,
@@ -278,7 +325,11 @@ class Evaluator:
             "query": trajectory.query,
             "turn": turn.turn,
             "evidence_incomplete": turn.evidence_incomplete,
-            "evaluator_model": self.config.model,
+            "evaluator_agent": self.config.agent_name,
+            "eval_step": self.config.eval_step,
+            "window": window,
+            "window_turns": [win_start, turn.turn],  # 本次评审覆盖的轮次范围(含端点)
+            "prompt_chars": prompt_chars,  # 投喂提示词字符数(token 代理量)
             "feedback_to_simulator": self.config.feedback_to_simulator,
         }
         if result is not None:
