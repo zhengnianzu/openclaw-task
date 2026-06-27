@@ -1,8 +1,17 @@
-# OpenClaw 自动化任务系统
+# AI AGENT 自动化任务系统
+一个强大的、配置驱动的自动化系统，用于编排和执行 AI Agent 任务。支持多 Agent 协作、工作空间管理、结果传递等功能。目前支持框架如下：
+- OpenClaw
+- Hermes
 
+## OpenClaw 
 > 基于 openclaw-sdk 的配置驱动任务编排框架
+| `openclaw_automation.py` | OpenClaw 网关 | WebSocket → `openclaw-sdk` | 已有 OpenClaw 实例 (`ws://127.0.0.1:18789`) |
 
-一个强大的、配置驱动的自动化系统，用于编排和执行 OpenClaw AI Agent 任务。支持多 Agent 协作、工作空间管理、结果传递等功能。
+## Hermes
+> from run_agent import AIAgent
+| `hermes_automation.py`   | 进程内 AIAgent | 直接 `from run_agent import AIAgent` | 想跑 hermes-agent、无网关、最少依赖 |
+
+Hermes 端的详细说明见 [`docs/README_HERMES.md`](docs/README_HERMES.md)。
 
 ## 特性
 
@@ -19,7 +28,8 @@
 ### 1. 安装依赖
 
 ```bash
-pip install openclaw-sdk pydantic
+# 一份 requirements.txt 涵盖两个后端 (openclaw + hermes)
+pip install -r requirements.txt
 ```
 
 ### 2. 确保 OpenClaw 运行
@@ -53,7 +63,9 @@ curl http://127.0.0.1:18789/health
 ### 4. 运行
 
 ```bash
-python openclaw_automation.py config.json
+# 同一份 config.json,两个后端任挑
+python openclaw_automation.py --config configs/config_simple.json
+python hermes_automation.py   --config configs/config_simple.json
 ```
 
 ## 文档
@@ -80,6 +92,17 @@ python openclaw_automation.py config.json
 | `example_config.json` | 完整示例 - 研究+写作流水线 |
 | `config_simple.json` | 简单示例 - 基础问答 |
 | `config_code_review.json` | 高级示例 - 代码审查流程 |
+
+### Hermes 端文件 (一体化新增)
+
+| 文件 | 说明 |
+|------|------|
+| `hermes_automation.py` | 进程内 AIAgent 前端，与 `openclaw_automation.py` 等价 |
+| `hermes_utils/hermes_client.py` | `HermesClient` / `HermesAgent` 库封装 (lazy import `run_agent.AIAgent`) |
+| `hermes_utils/__init__.py` | 独立包,跟 `utils/` 并列;避免跟 hermes-agent 顶层 `utils.py` 重名 |
+| `docs/README_HERMES.md` | Hermes 后端的详细说明、配置示例、跨框架兼容字段 |
+| `test/smoke_test.py` | Hermes 离线冒烟（imports / 配置校验 / 变量替换） |
+| `test/test_hermes_client.py` | Hermes 端到端: 真实拉起 AIAgent 跑一条 query |
 
 ## 使用示例
 

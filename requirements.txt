@@ -1,2 +1,9 @@
+# openclaw_automation.py
 openclaw-sdk==2.1.0
 aiohttp
+
+# hermes_automation.py
+pydantic>=2,<3
+openai>=1.0
+httpx>=0.27
+pyyaml
