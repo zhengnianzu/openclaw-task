@@ -1,0 +1,902 @@
+"""
+Hermes 自动化任务执行系统 (进程内 AIAgent 版本)
+
+  - 共享段 (配置模型 / Simulator 工厂 / 变量替换 / ConfigLoader / main / CLI 入口)
+  - 特有段 (WorkspaceManager / AgentManager / execute_queries /
+    HermesAutomation) 走 hermes 的进程内实现
+    AIAgent + per-agent HERMES_HOME profile 路径。
+"""
+
+import asyncio
+import json
+import logging
+import re
+import shutil
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+import os
+import sys
+import tempfile
+from user_simulator import User_simulator
+
+from pydantic import BaseModel, Field, validator, field_validator
+
+from hermes_utils.hermes_client import (
+    HermesAgent,
+    HermesClient,
+    HermesError,
+    ExecutionOptions,
+    ExecutionResult,
+    build_hermes_client
+)
+
+
+
+def setup_logger(config_file: Optional[str] = None) -> logging.Logger:
+    logger = logging.getLogger("hermes_automation")
+    logger.setLevel(logging.DEBUG)
+
+    if logger.handlers:
+        return logger
+
+    log_dir = Path(__file__).parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+
+    if config_file:
+        log_name = Path(config_file).stem + ".log"
+    else:
+        log_name = "hermes_automation.log"
+
+    fh = logging.FileHandler(log_dir / log_name, encoding="utf-8", mode="w")
+    fh.setLevel(logging.DEBUG)
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    fh.setFormatter(fmt)
+    ch.setFormatter(fmt)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger
+
+
+logger = logging.getLogger("hermes_automation")
+
+# 本次 run 的唯一 id,用于 session_name 隔离,避免跨 run 复用残留 session
+import time as _time
+_RUN_ID = _time.strftime("%Y%m%dT%H%M%S")
+
+DEFAULT_GATEWAY_TIMEOUT_SECONDS = 3600
+EXECUTION_MAX_ATTEMPTS = 5
+EXECUTION_RETRY_WAIT_SECONDS = 60
+EXECUTION_HISTORY_FALLBACK_DELAY_SECONDS = 3
+EXECUTION_HISTORY_FALLBACK_LIMIT = 50
+EXECUTION_HISTORY_FALLBACK_MAX_POLLS = 40
+EXECUTION_HISTORY_FALLBACK_POLL_INTERVAL_SECONDS = 30.0
+
+PROJECT_ROOT = Path(__file__).parent.resolve()
+
+
+# ============================================================================
+# 配置模型定义
+# ============================================================================
+
+class SystemConfig(BaseModel):
+    """系统配置"""
+    platform: List[str] = Field(default=["windows", "linux"])
+    python: str = Field(default="3.12")
+    tools: List[str] = Field(default_factory=list)
+
+
+class UserDirConfig(BaseModel):
+    """用户目录配置"""
+    path: str = Field(..., description="用户数据目录路径")
+    map_file: Optional[str] = Field(None, description="映射文件名(相对于 path),如 'MAP_Linux',自动补 .json 后缀")
+    profile_file: Optional[str] = Field(None, description="用户画像 JSON 文件名(相对于 path),如 'profile_analyzed.json'")
+
+
+class InputDirConfig(BaseModel):
+    """输入目录配置"""
+    skill_dir: Optional[str] = Field(None, description="技能根目录路径,下面每个子目录对应一个技能")
+    user_dir: Optional[UserDirConfig] = Field(None, description="用户目录,支持字符串路径或 {path, map_file} 对象")
+    agent_dir: Optional[str] = Field(None, description="Agent 源文件目录,包含各 agent 的子目录(如 agent_dir/paper_reader/SOUL.md)")
+
+    @field_validator('skill_dir', mode='before')
+    @classmethod
+    def coerce_skill_dir(cls, v):
+        """兼容旧格式:空 dict {} 转为 None"""
+        if isinstance(v, dict):
+            return None
+        return v
+
+    @field_validator('user_dir', mode='before')
+    @classmethod
+    def coerce_user_dir(cls, v):
+        """兼容旧格式,同时拦截 path 为 null 的情况"""
+        # 1. 如果传进来的是普通字符串,转为对象
+        if isinstance(v, str):
+            return UserDirConfig(path=v)
+
+        # 2. 核心修改:如果传进来的是字典,且 path 为 null (None)
+        if isinstance(v, dict) and v.get('path') is None:
+            # 分配一个系统的临时空目录作为"虚空地址"
+            dummy_path = os.path.join(tempfile.gettempdir(), "hermes_void_dir")
+
+            # 如果这个虚空目录不存在,顺手建一个,防止后续文件系统操作报错
+            if not os.path.exists(dummy_path):
+                os.makedirs(dummy_path, exist_ok=True)
+
+            v['path'] = dummy_path
+            logging.getLogger("hermes_automation").warning(
+                "检测到 user_dir.path 为空,已自动重定向至虚空地址: %s", dummy_path)
+        return v
+
+
+class AgentConfigItem(BaseModel):
+    """单个 Agent 配置"""
+    name: str = Field(..., description="Agent 名称")
+    config: List[str] = Field(default_factory=list, description="配置文件列表,如 USER.md, SOUL.md")
+    skills: List[str] = Field(default_factory=list, description="所需技能列表")
+    system_prompt: Optional[str] = Field(None, description="系统提示词")
+    model: Optional[str] = Field(None, description="使用的模型")
+
+
+class QueryItem(BaseModel):
+    """查询任务配置"""
+    agent_name: str = Field(..., description="执行的 Agent 名称")
+    text: str = Field(..., description="查询文本,支持 {result_xxx} 变量替换")
+    session_name: Optional[str] = Field("main", description="会话名称")
+    timeout: Optional[int] = Field(3600, description="超时时间(秒)")
+    use_simulator: bool = Field(True, description="是否启用 user-simulator 进行多轮对话,默认 True")
+
+
+class AutomationConfig(BaseModel):
+    """完整的自动化配置"""
+    system: SystemConfig = Field(default_factory=SystemConfig)
+    input_dir: InputDirConfig = Field(default_factory=InputDirConfig)
+    agents: List[AgentConfigItem] = Field(default_factory=list)
+    queries: List[QueryItem] = Field(default_factory=list)
+
+    # 网关连接配置 — 跨框架兼容字段
+    gateway_ws_url: Optional[str] = Field(None, description="WebSocket 网关 URL")
+    api_key: Optional[str] = Field(None, description="API Key")
+    gateway_timeout: Optional[int] = Field(None, description="Gateway 连接/调用超时(秒)")
+    workspace_base: str = Field(r"C:\Users\nianzu\.openclaw\workspace", description="工作空间基础目录")
+
+    # User Simulator 配置
+    user_profile: str = Field("", description="用户画像兜底文本,profile_file 不存在时使用")
+    simulator_config: Optional[str] = Field(None, description="Simulator 配置 JSON 绝对路径,含 model/api_key/base_url/proxy;不配置则从环境变量读取")
+    user_max_turn: int = Field(5, description="多轮对话最大轮次")
+
+    @field_validator("gateway_ws_url", mode="before")
+    @classmethod
+    def normalize_gateway_ws_url(cls, v):
+        """兼容只填 host:port 的写法,自动补全 /gateway。"""
+        if not isinstance(v, str):
+            return v
+
+        url = v.strip()
+        if not url:
+            return None
+
+        if url.startswith(("ws://", "wss://")) and "/gateway" not in url:
+            return url.rstrip("/") + "/gateway"
+
+        return url
+
+
+# ============================================================================
+# 工作空间管理器
+# ============================================================================
+#   - get_agent_workspace 改为返回 hermes profile 目录 (走 hermes 官方 API
+#     创建, 跟用户 `hermes profile create xxx --no-alias --no-skills` 等价)
+#   - setup_agent_files 内部把 SOUL.md 放 profile 根, USER.md/MEMORY.md 放
+#     memories/, skills 放 skills/<name>/, 其余 user_dir 整体复制行为不变
+#   - setup_from_map 跟 openclaw 同款实现 (映射表逐条复制)
+
+class WorkspaceManager:
+    """管理 Agent 工作空间和文件"""
+
+    def __init__(self, base_dir: Optional[str] = None):
+        self.base_dir = Path.home() / ".hermes" / "profiles"
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        # 缓存已确保存在的 profile 名, 避免重复 create 调用
+        self._ensured: set = set()
+
+    def get_agent_workspace(self, agent_name: str) -> Path:
+        """获取 Agent 工作空间路径
+
+        规则:
+        - 如果 agent_name 是 "main",返回全局 ~/.hermes (HERMES_HOME 根)
+        - 否则返回 ~/.hermes/profiles/<agent_name>/ (hermes 官方 profile)
+          首次访问时用 hermes_cli.profiles.create_profile() 创建,
+          等价于 `hermes profile create <agent_name> --no-alias --no-skills`。
+        """
+        if agent_name == "main":
+            workspace = Path.home() / ".hermes"
+            self._ensured.add("main")
+            return workspace
+
+        profiles = _import_hermes_profiles()
+        canon = profiles.normalize_profile_name(agent_name)
+        if canon == "default":
+            # 'default' 是 hermes 保留名 (= ~/.hermes 根), 不能作为子 profile。
+            canon = "agent-default"
+            logger.warning(
+                "agent_name 'default' 是 hermes 保留名, 自动改用 profile 'agent-default'",
+            )
+
+        workspace: Path = profiles.get_profile_dir(canon)
+        if canon in self._ensured and workspace.is_dir():
+            return workspace
+
+        if not workspace.is_dir():
+            try:
+                workspace = profiles.create_profile(
+                    name=canon,
+                    no_alias=True,
+                    no_skills=True,
+                )
+                logger.info(
+                    "创建 hermes profile: %s -> %s ",
+                    canon, workspace, canon,
+                )
+            except FileExistsError:
+                workspace = profiles.get_profile_dir(canon)
+            except Exception as e:
+                raise RuntimeError(f"创建 hermes profile '{canon}' 失败: {e}") from e
+
+        (workspace / "memories").mkdir(exist_ok=True)
+        (workspace / "skills").mkdir(exist_ok=True)
+        self._ensured.add(canon)
+        return workspace
+
+    def setup_agent_files(
+        self,
+        agent_name: str,
+        config_files: List[str],
+        skill_base_dir: Optional[str],
+        agent_skills: List[str],
+        agent_dir: Optional[str] = None,
+        user_dir: Optional[str] = None
+    ) -> None:
+        """设置 Agent 工作空间文件
+
+        Args:
+            agent_name: Agent 名称
+            config_files: 配置文件列表(如 SOUL.md, USER.md)
+            skill_base_dir: 技能根目录,下面每个子目录对应一个技能
+            agent_skills: 该 agent 需要的技能名称列表
+            agent_dir: Agent 源文件目录,包含配置文件(如 SOUL.md, USER.md)
+            user_dir: 用户数据目录(整体复制到 workspace)
+        """
+        workspace = self.get_agent_workspace(agent_name)
+
+        logger.info("workspace: %s", workspace)
+        if skill_base_dir and agent_skills:
+            logger.info("skills_dst: %s", workspace / 'skills')
+        if user_dir:
+            logger.info("user_dir -> workspace: %s -> %s", Path(user_dir).expanduser(), workspace)
+
+        # 1. 从 agent_dir/ 复制配置文件 (SOUL.md / USER.md / MEMORY.md ...)
+        #    跟 openclaw 不同: SOUL.md 放 profile 根, USER.md/MEMORY.md 放
+        #    memories/ 下, 这样 hermes prompt builder 才能扫到。
+        if agent_dir and config_files:
+            agent_source = Path(agent_dir).expanduser() / agent_name
+            if not agent_source.is_dir():
+                # 兼容旧布局: agent_dir 直接放 SOUL.md 等
+                agent_source = Path(agent_dir).expanduser()
+            if agent_source.exists():
+                for config_file in config_files:
+                    src = agent_source / config_file
+                    if src.exists():
+                        dst = workspace / _PERSONA_DST.get(config_file, Path(config_file))
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src, dst)
+                        logger.info("复制 Agent 配置: %s -> %s", config_file, dst)
+                    else:
+                        logger.warning("Agent 配置文件不存在: %s", src)
+            else:
+                logger.warning("Agent 源目录不存在: %s", agent_source)
+
+        # 2. 复制技能目录: skill_base_dir/<skill_path>/ -> workspace/skills/<skill_name>/
+        if skill_base_dir and agent_skills:
+            skills_dst = workspace / "skills"
+            skills_dst.mkdir(exist_ok=True)
+            for skill_path in agent_skills:
+                # skill_path 形如 "category/author__skill-name",取最后一段作为目标目录名
+                skill_name = Path(skill_path).name
+                src = Path(skill_base_dir) / skill_path
+                if src.exists() and src.is_dir():
+                    dst = skills_dst / skill_name
+                    if dst.exists():
+                        shutil.rmtree(dst)
+                    shutil.copytree(src, dst)
+                    logger.info("复制技能: %s -> %s", skill_path, dst)
+                else:
+                    logger.warning("技能目录不存在: %s", src)
+
+        # 3. 整体复制 user_dir 到 workspace
+        if user_dir:
+            user_path = Path(user_dir).expanduser()
+            logger.debug("check user_path: %s", user_path)
+            if user_path.exists() and user_path.is_dir():
+                content_root = user_path / user_path.name
+
+                if not content_root.exists() or not content_root.is_dir():
+                    logger.warning("user_dir content root does not exist or is not a directory: %s", content_root)
+                    return
+
+                # 复制到 workspace 根目录
+                for item in content_root.iterdir():
+                    item_dst = workspace / item.name
+                    if item_dst.exists():
+                        if item_dst.is_dir():
+                            shutil.rmtree(item_dst)
+                        else:
+                            item_dst.unlink()
+                    if item.is_dir():
+                        shutil.copytree(item, item_dst)
+                    else:
+                        shutil.copy2(item, item_dst)
+                logger.info("复制用户目录: %s -> %s", content_root, workspace)
+            else:
+                logger.warning("用户目录不存在或不是目录: %s", user_path)
+
+    def setup_from_map(self, map_file: str, base_dir: Optional[str] = None) -> None:
+        """根据 map.json 按映射逐条复制文件/目录
+
+        Args:
+            map_file: map.json 路径,格式 {"src_path": "dst_path"}
+            base_dir: 若提供,map 的 key(源路径)相对于此目录解析;
+                      否则 key 视为绝对路径(支持 ~ 展开)
+                      dst 路径始终支持 ~ 展开,不存在时自动创建父目录
+        """
+        map_path = Path(map_file)
+        if not map_path.exists():
+            logger.warning("map 文件不存在: %s", map_path)
+            return
+
+        mapping: Dict[str, str] = json.loads(map_path.read_text(encoding="utf-8"))
+        base = Path(base_dir) if base_dir else None
+        logger.info("读取 map 文件: %s,共 %d 条映射", map_path, len(mapping))
+        if base:
+            logger.info("源路径基准目录: %s", base)
+
+        for src_str, dst_str in mapping.items():
+            src = (base / src_str) if base else Path(src_str).expanduser()
+            dst = Path(dst_str).expanduser()
+
+            if not src.exists():
+                logger.warning("源路径不存在,跳过: %s", src)
+                continue
+
+            dst.parent.mkdir(parents=True, exist_ok=True)
+
+            if src.is_dir():
+                if dst.exists():
+                    shutil.rmtree(dst)
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
+
+            logger.info("映射复制: %s -> %s", src_str, dst_str)
+
+
+# persona 文件 → hermes profile 内的标准位置。
+_PERSONA_DST: Dict[str, Path] = {
+    "SOUL.md":   Path("SOUL.md"),
+    "USER.md":   Path("memories/USER.md"),
+    "MEMORY.md": Path("memories/MEMORY.md"),
+}
+
+
+# ---------------------------------------------------------------------------
+# Lazy import of hermes 的 profile 管理 API
+# ---------------------------------------------------------------------------
+
+_HERMES_AGENT_ROOT_DEFAULT = "/home/ma-user/.hermes/hermes-agent"
+_hermes_profiles_mod = None  # type: ignore[assignment]
+
+
+def _import_hermes_profiles():
+    """Return hermes_cli.profiles module (lazy)."""
+    global _hermes_profiles_mod
+    if _hermes_profiles_mod is not None:
+        return _hermes_profiles_mod
+    hermes_path = os.environ.get("HERMES_AGENT_ROOT", _HERMES_AGENT_ROOT_DEFAULT)
+    if hermes_path not in sys.path:
+        sys.path.insert(0, hermes_path)
+    try:
+        import importlib
+        mod = importlib.import_module("hermes_cli.profiles")
+    except Exception as e:
+        raise RuntimeError(
+            f"无法 import hermes_cli.profiles (检查 {hermes_path}): {e}"
+        ) from e
+    _hermes_profiles_mod = mod
+    return mod
+
+
+# ============================================================================
+# Simulator 工厂函数
+# ============================================================================
+
+def create_simulator(config: "AutomationConfig") -> Optional[User_simulator]:
+    """根据配置创建 User_simulator 实例,无配置则返回 None"""
+    import os
+
+    user_profile = config.user_profile
+    user_dir_cfg = config.input_dir.user_dir
+    if user_dir_cfg:
+        profile_filename = user_dir_cfg.profile_file or "user_profile.json"
+        profile_path = Path(user_dir_cfg.path) / profile_filename
+        if profile_path.exists():
+            profile_data = json.loads(profile_path.read_text(encoding="utf-8"))
+            user_profile = json.dumps(profile_data, ensure_ascii=False, indent=2)
+        elif user_dir_cfg.profile_file:
+            logger.warning("profile_file 不存在: %s,回退到 config.user_profile", profile_path)
+
+    if not config.simulator_config:
+        logger.info("simulator_config 未配置,将跳过多轮对话(仅执行单轮)")
+        return None
+
+    proxy_cfg_path = Path(config.simulator_config)
+    if proxy_cfg_path.exists():
+        proxy_cfg = json.loads(proxy_cfg_path.read_text(encoding="utf-8"))
+        logger.info("Simulator 配置来自: %s", proxy_cfg_path)
+    else:
+        logger.warning("simulator_config 文件不存在: %s,回退到环境变量", proxy_cfg_path)
+        proxy_cfg = {}
+
+    model    = proxy_cfg.get("model")    or os.environ.get("SIMULATOR_MODEL", "gpt-4o")
+    api_key  = proxy_cfg.get("api_key")  or os.environ.get("SIMULATOR_OPENAI_API_KEY")
+    base_url = proxy_cfg.get("base_url") or os.environ.get("SIMULATOR_OPENAI_BASE_URL")
+    proxy    = proxy_cfg.get("proxy")    or os.environ.get("SIMULATOR_PROXY")
+
+    user_directory = ""
+    if user_dir_cfg:
+        root = Path(user_dir_cfg.path)
+        if root.exists():
+            lines = []
+            for p in sorted(root.rglob("*")):
+                depth = len(p.relative_to(root).parts) - 1
+                indent = "    " * depth
+                lines.append(f"{indent}{'└── ' if p.is_file() else ''}{p.name}{'/' if p.is_dir() else ''}")
+            user_directory = "\n".join(lines)
+
+    return User_simulator(
+        origin_query="",
+        user_profile=user_profile,
+        user_directory=user_directory,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        proxy=proxy,
+    )
+
+
+# ============================================================================
+# Agent 管理器
+# ============================================================================
+
+class AgentManager:
+    """管理 Agent 的创建和注册"""
+
+    def __init__(self, client: HermesClient, workspace_manager: WorkspaceManager):
+        self.client = client
+        self.workspace_manager = workspace_manager
+
+    async def setup_agent(self, agent_config: AgentConfigItem) -> None:
+        """设置单个 Agent
+
+        Args:
+            agent_config: Agent 配置
+        """
+        agent_name = agent_config.name
+        logger.info("设置 Agent: %s", agent_name)
+        # hermes 没有 gateway 注册流程; 这里只是确认 workspace (profile) 已就绪。
+        self.workspace_manager.get_agent_workspace(agent_name)
+
+    async def _wait_gateway_ready(self, wait: float = 0.0) -> None:
+        """hermes 没有 gateway 热重启, 直接返回 (跟 openclaw 保持同名 hook)。"""
+        return
+
+
+# ============================================================================
+# 查询执行
+# ============================================================================
+
+def _replace_variables(text: str, results: Dict[str, ExecutionResult]) -> str:
+    """替换查询文本中的变量,支持 {result_agent_name}"""
+    pattern = r'\{result_(\w+)\}'
+
+    def replacer(match):
+        result_key = match.group(0)[1:-1]
+        result = results.get(result_key)
+        if result is None:
+            return f"[Error: {result_key} not found]"
+        elif hasattr(result, 'content'):
+            return result.content
+        return str(result)
+
+    return re.sub(pattern, replacer, text)
+
+
+async def execute_queries(
+    client: HermesClient,
+    queries: List[QueryItem],
+    simulator: Optional[User_simulator] = None,
+    max_turn: int = 5,
+    workspace_manager: Optional[WorkspaceManager] = None,
+) -> Dict[str, ExecutionResult]:
+    """执行查询任务列表
+
+    外循环遍历每个 query;当 simulator 存在时,内循环进行多轮对话,
+    受 max_turn 控制。
+
+    Args:
+        client: Hermes 客户端 (AIAgent 实例池)
+        queries: 查询任务列表
+        simulator: 用户模拟器,None 则仅单轮
+        max_turn: 多轮对话最大轮次
+        workspace_manager: 用于把 per-agent HERMES_HOME 传给 client.get_agent
+
+    Returns:
+        {result_agent_name: ExecutionResult}
+    """
+    logger.info("=" * 60)
+    logger.info("开始执行查询任务")
+    logger.info("=" * 60)
+
+    results: Dict[str, ExecutionResult] = {}
+
+    async def execute_with_retry(
+        agent: HermesAgent,
+        query_text: str,
+        options: Optional[ExecutionOptions],
+    ) -> ExecutionResult:
+        """执行查询, 失败做指数退避重试 (进程内调用, 无 history fallback)。"""
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, EXECUTION_MAX_ATTEMPTS + 1):
+            try:
+                result = await agent.execute(query_text, options=options)
+                if result is None:
+                    raise HermesError("AIAgent returned None")
+
+                if result.success and result.content:
+                    return result
+
+                if not result.success:
+                    raise HermesError(result.error_message or "AIAgent returned error")
+
+                # success=True 但 content 为空 — 视为软错重试
+                raise HermesError("AIAgent returned empty content")
+
+            except (HermesError, asyncio.TimeoutError) as e:
+                last_exc = e
+                if attempt >= EXECUTION_MAX_ATTEMPTS:
+                    raise
+                logger.warning(
+                    "调用失败 (第 %d/%d 次): %s; %ds 后重试",
+                    attempt, EXECUTION_MAX_ATTEMPTS, e, EXECUTION_RETRY_WAIT_SECONDS,
+                )
+                await asyncio.sleep(EXECUTION_RETRY_WAIT_SECONDS)
+
+        if last_exc is not None:
+            raise last_exc
+        raise HermesError("AIAgent: unknown error after retries")
+
+    for idx, query in enumerate(queries, 1):
+        logger.info("任务 %d/%d: [%s|%s]", idx, len(queries), query.agent_name, query.session_name)
+        logger.info("[Q] %s", query.text)
+
+        query_text = _replace_variables(query.text, results)
+        options = ExecutionOptions(timeout_seconds=query.timeout) if query.timeout else None
+        base_session = query.session_name or "main"
+        session_name = f"{base_session}_{_RUN_ID}"
+
+        # hermes 端不需要 check_readyz: 进程内调用没有 WS 健康概念。
+
+        query_simulator = simulator if query.use_simulator else None
+
+        if query_simulator is not None:
+            query_simulator.update_origin_query(query_text)
+
+        current_query = query_text
+        last_result = None
+        success = False
+        retry = 0
+
+        for turn in range(1, max_turn + 1 if query_simulator else 2):
+            logger.debug("[Q%d] %s", turn, current_query)
+            hermes_home = (
+                workspace_manager.get_agent_workspace(query.agent_name)
+                if workspace_manager is not None else None
+            )
+            agent = client.get_agent(query.agent_name, session_name, hermes_home=hermes_home)
+
+            try:
+                result = await execute_with_retry(
+                    agent, current_query, options
+                )
+                last_result = result
+                agent_reply = result.content
+                logger.info("[A%d] %s", turn, agent_reply)
+                if not agent_reply:
+                    logger.debug(result)
+
+            except Exception as e:
+                import traceback
+                logger.error("Agent 执行失败: %s", e)
+                logger.debug(traceback.format_exc())
+                break
+
+            if not agent_reply:
+                retry += 1
+                if retry >= 3:
+                    logger.error("连续3次未收到回复,任务失败")
+                    break
+                current_query = "没有看到你的回复,请重新执行。"
+                continue
+
+            retry = 0
+
+            if query_simulator is None:
+                success = True
+                break
+
+            user_reply = query_simulator.chat(agent_reply)
+            logger.debug("[S%d] %s", turn, user_reply)
+
+            if "【Task_Done】" in user_reply:
+                logger.info("任务完成(Turn %d)", turn)
+                try:
+                    await execute_with_retry(
+                        agent, "真棒", options
+                    )
+                except Exception:
+                    pass
+                success = True
+                break
+            elif "【Task_Failed】" in user_reply:
+                logger.error("任务失败(Turn %d):%s", turn, user_reply)
+                try:
+                    await execute_with_retry(
+                        agent, "好吧", options
+                    )
+                except Exception:
+                    pass
+                break
+
+            current_query = user_reply
+        else:
+            if query_simulator is not None:
+                logger.warning("达到最大轮次 %d,任务未完成", max_turn)
+
+        results[f"result_{query.agent_name}"] = last_result
+
+        if not success:
+            logger.error("任务 %d 失败,终止后续 %d 个任务", idx, len(queries) - idx)
+            break
+
+    return results
+
+
+
+# ============================================================================
+# 主执行器
+# ============================================================================
+
+class HermesAutomation:
+    """Hermes 自动化任务执行主类"""
+
+    def __init__(self, config: AutomationConfig):
+        self.config = config
+        # config.workspace_base 是 openclaw 字段, hermes 必须落到 ~/.hermes/profiles/,
+        self.workspace_manager = WorkspaceManager(config.workspace_base)
+
+    async def run(self) -> Dict[str, ExecutionResult]:
+        """运行自动化流程"""
+        logger.info("=" * 60)
+        logger.info("Hermes 自动化任务系统")
+        logger.info("=" * 60)
+
+        # 跨框架兼容字段诊断
+        legacy_oc = {}
+        if self.config.gateway_ws_url:
+            legacy_oc["gateway_ws_url"] = self.config.gateway_ws_url
+        if self.config.gateway_timeout is not None:
+            legacy_oc["gateway_timeout"] = self.config.gateway_timeout
+        if self.config.api_key:
+            legacy_oc["api_key"] = "<redacted>"
+        if legacy_oc:
+            logger.info(
+                "[跨框架兼容] 接受到 openclaw 风格字段 %s; hermes 已全部忽略，配置路径 %s",
+                legacy_oc, self.workspace_manager.base_dir,
+            )
+
+        # hermes 端: HermesClient 是同进程的 AIAgent 实例池, 不需要建立网络连接
+        async with await build_hermes_client() as client:
+            self.client = client
+
+            # 1. 设置工作空间
+            await self._setup_workspaces()
+
+            # 2. 注册 Agents
+            await self._setup_agents()
+
+            # 3. 执行查询
+            simulator = create_simulator(self.config)
+            results = await execute_queries(
+                client,
+                self.config.queries,
+                simulator=simulator,
+                max_turn=self.config.user_max_turn,
+                workspace_manager=self.workspace_manager,
+            )
+
+            return results
+
+    async def _setup_workspaces(self) -> None:
+        """设置工作空间"""
+        logger.info("设置工作空间...")
+
+        # 解析 user_dir:有 map_file 则按映射复制,否则整体复制(旧行为)
+        user_dir_config = self.config.input_dir.user_dir
+        user_dir_path: Optional[str] = None
+
+        if user_dir_config:
+            user_path = Path(user_dir_config.path).expanduser()
+            content_root = user_path / user_path.name
+
+            if not content_root.exists() or not content_root.is_dir():
+                # env文件夹不存在时,copy_map_not_workspace必须不存在
+                assert not user_dir_config.map_file, (
+                    "input_dir.user_dir.map_file must be omitted when "
+                    "user_path / user_path.name does not exist"
+                )
+            elif user_dir_config.map_file:
+                # env文件夹存在,copy_map_not_workspace是True时,map_file必须存在。
+                map_path = self._resolve_map_file(user_dir_config.path, user_dir_config.map_file)
+                # 数据子目录 = user_dir.path / user_dir_name(同名子文件夹)
+                data_dir = str(content_root)
+                self.workspace_manager.setup_from_map(map_path, base_dir=data_dir)
+            else:
+                # env文件夹存在时,copy_map_not_workspace必须显式设置成True或False
+                user_dir_path = user_dir_config.path
+                    # copy_map_not_workspace是False时,不会按照map_file的指导复制,此时如果存在map_file,需要给出wraning
+
+        for agent_config in self.config.agents:
+            self.workspace_manager.setup_agent_files(
+                agent_name=agent_config.name,
+                config_files=agent_config.config,
+                skill_base_dir=self.config.input_dir.skill_dir,
+                agent_skills=agent_config.skills,
+                agent_dir=self.config.input_dir.agent_dir,
+                user_dir=user_dir_path
+            )
+
+    @staticmethod
+    def _resolve_map_file(base_path: str, map_file: str) -> str:
+        """解析 map_file 路径:相对于 base_path,自动补 .json 后缀"""
+        p = Path(base_path) / map_file
+        if not p.suffix:
+            p = p.with_suffix('.json')
+        return str(p)
+
+    async def _setup_agents(self) -> None:
+        """注册 Agents"""
+        logger.info("设置 Agents...")
+
+        agent_manager = AgentManager(self.client, self.workspace_manager)
+
+        for agent_config in self.config.agents:
+            await agent_manager.setup_agent(agent_config)
+
+
+
+# ============================================================================
+# 配置加载器
+# ============================================================================
+
+class ConfigLoader:
+    """配置文件加载器"""
+
+    @staticmethod
+    def load_from_file(file_path: str) -> AutomationConfig:
+        """从文件加载配置
+
+        支持 JSON 和 YAML 格式
+        """
+        path = Path(file_path)
+
+        if not path.exists():
+            raise FileNotFoundError(f"配置文件不存在: {file_path}")
+
+        content = path.read_text(encoding="utf-8")
+
+        # 尝试解析 JSON
+        if path.suffix.lower() in ['.json']:
+            data = json.loads(content)
+        elif path.suffix.lower() in ['.yaml', '.yml']:
+            try:
+                import yaml
+                data = yaml.safe_load(content)
+            except ImportError:
+                raise ImportError("YAML 支持需要安装 PyYAML: pip install pyyaml")
+        else:
+            # 默认尝试 JSON
+            data = json.loads(content)
+
+        return AutomationConfig(**data)
+
+    @staticmethod
+    def load_from_dict(data: Dict[str, Any]) -> AutomationConfig:
+        """从字典加载配置"""
+        return AutomationConfig(**data)
+
+
+# ============================================================================
+# 主入口函数
+# ============================================================================
+
+async def main(config_file: Optional[str] = None, config_dict: Optional[Dict] = None) -> None:
+    """主入口函数
+
+    Args:
+        config_file: 配置文件路径
+        config_dict: 配置字典(直接传入)
+
+    Examples:
+        # 从文件加载
+        await main(config_file="config.json")
+
+        # 从字典加载
+        await main(config_dict={...})
+    """
+    # 初始化 logger
+    setup_logger(config_file)
+
+    # 加载配置
+    if config_file:
+        config = ConfigLoader.load_from_file(config_file)
+    elif config_dict:
+        config = ConfigLoader.load_from_dict(config_dict)
+    else:
+        raise ValueError("必须提供 config_file 或 config_dict")
+
+    # 运行自动化流程
+    automation = HermesAutomation(config)
+    results = await automation.run()
+
+    logger.info("所有任务执行完成!")
+    return results
+
+
+# ============================================================================
+# 命令行入口
+# ============================================================================
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Hermes 自动化任务执行系统")
+    parser.add_argument(
+        "--config",
+        help="配置文件路径 (JSON/YAML)"
+    )
+    parser.add_argument(
+        "--workspace",
+        default="./workspaces",
+        help="工作空间基础目录"
+    )
+
+    args = parser.parse_args()
+
+    # 运行
+    asyncio.run(main(config_file=args.config))
+
