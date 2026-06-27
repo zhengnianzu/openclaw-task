@@ -1,0 +1,38 @@
+{
+  "system": { "platform": ["windows"], "python": "3.11", "tools": [] },
+  "input_dir": { "skill_dir": {}, "user_dir": null },
+  "agents": [
+    { "name": "main3", "config": [], "skills": [] },
+    {
+      "name": "evaluator",
+      "config": [],
+      "skills": [],
+      "model": "gemini-3-flash-preview",
+      "model_provider": "custom-yibuapi-com"
+    }
+  ],
+  "queries": [
+    {
+      "agent_name": "main3",
+      "text": "请在你的工作区真实创建一个小工具,分三个文件:1) calc.py 实现 add/sub/mul/div 四个函数;2) test_calc.py 用 assert 覆盖四则运算的正常用例以及 div 除零抛异常;3) README.md 用中文写明每个函数的用途和一个调用示例。三个文件都必须真实写入工作区,不能只在回复里贴代码。",
+      "session_name": "exp",
+      "timeout": 600,
+      "evaluate": {
+        "agent_name": "evaluator",
+        "session_name": "exp",
+        "rubrics": [
+          "calc.py 真实存在且实现了 add/sub/mul/div 四个函数",
+          "test_calc.py 真实存在且覆盖四则运算正常用例与 div 除零异常",
+          "README.md 真实存在且用中文说明各函数用途与至少一个调用示例"
+        ],
+        "eval_step": 1,
+        "feedback_to_simulator": true
+      }
+    }
+  ],
+  "gateway_ws_url": "ws://127.0.0.1:18789",
+  "gateway_timeout": 600,
+  "workspace_base": "~/.openclaw/workspace",
+  "simulator_config": "configs/user_proxy_model.json",
+  "user_max_turn": 6
+}
