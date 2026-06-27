@@ -232,58 +232,6 @@ results = await automation.run()
 
 ---
 
-## 轨迹捕获与第三方评估（Trajectory Evaluator）
-
-为根治"`user_simulator` 既当用户又当裁判"导致的假阳性（被话术哄过）/假阴性
-（人设太较真），系统引入逐轮证据捕获 + 独立第三方裁判。**默认关闭
-（`evaluator.enabled=false`），开启前行为与旧版一致。**
-
-### 闭环流程（每个 turn）
-
-```
-simulator 发起 ─▶ agent 回复(含 tool_calls/files)
-                      │
-                      ▼
-        harness 取证(trajectory.py)
-          • tool_calls 内存直取
-          • 文件经 agents.files.get(被测 agentId) 读「磁盘真相」
-          • history 兜底恢复的 turn 标 evidence_incomplete
-                      │
-                      ▼
-        独立 evaluator(evaluator.py,另一个 OC agent)
-          • 每轮新开 session(无状态),投喂:任务+历轮全文+上轮反馈+本轮证据
-          • 若 query 携带冻结 rubric:逐条质检,每条产出 pass/fail/partial/unverifiable + 引证
-          • 被审查产物推进其 _under_review/ 工作区,用工具就地核验
-          • 结构化输出:完成度/改进点/不符合项/倾向 + 引证 + 逐条 rubric → evaluator_use.log
-                      │
-                      ▼ 反馈(仅 feedback_to_simulator=true 时回流;不含 rubric 原文)
-        user_simulator.chat(agent_reply, evaluator_feedback)
-          • simulator 参考反馈,仍由它拍板 Task_Done/Failed/继续
-```
-
-### 关键设计
-
-- **证据为准**：以磁盘真相为依据，拆穿"声称生成文件但磁盘上没有"的话术型假阳性。
-  > 网关现实限制(实测 2026.2.26)：`agents.files.list/get/set` 仅暴露 agent 脚手架白名单
-  > (AGENTS.md/SOUL.md…)，**看不到用户新建文件**。故 `capture_file_evidence` 经 `files.list`
-  > 取 workspace 路径后**直扫本地工作区目录读盘**(harness 与网关同机)发现新产物;
-  > 证据投递以"拼提示词(a)"为主,"推 `_under_review`(b)"因 `files.set` 白名单暂不可用。
-- **裁判独立且无状态**：evaluator 是独立 OC agent（≠ 执行 agent），每轮新 session、
-  显式投喂，避免自评自盖章与跨轮自我锚定。
-- **simulator 终审**：evaluator 只给软反馈、不硬否决，最终判定权仍在 simulator。
-- **rubric 逐条质检**：`queries[].rubric` 随 query 传入并在整段对话中**冻结**，作为无状态
-  evaluator 的稳定锚点，逐条核验 agent 产物。`unverifiable` 与 `evidence_incomplete` 同源
-  （核验受阻不判负）。rubric 为可选，缺省即退回自由维度评估。
-- **边界 X**：rubric 原文**只作用于 evaluator**，simulator 不感知 rubric；evaluator 按 rubric
-  打分后的提炼反馈（未满足项/改进点）仍回流，逐条 rubric 结果只进 `evaluator_use.log`。
-- **回滚**：`evaluator.enabled=false` 即退回 simulator 自判旧行为；`feedback_to_simulator=false`
-  （默认）则只评估落盘、不影响 simulator 判定。
-
-相关代码：`trajectory.py`（捕获）、`evaluator.py`（评估）、`openclaw_automation.py`
-中 `execute_queries` 的接入、`system_prompt.md` 的 `{evaluator_feedback}` 占位符。
-
----
-
 ## 配置详解
 
 ### 完整配置示例

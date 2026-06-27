@@ -1,5 +1,1 @@
-utils/__pycache__/*
-*__pycache__*
-.claude/
-logs/*
-*log
+__pycache__/*
