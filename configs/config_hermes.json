@@ -1,5 +1,5 @@
 {
-  "harness_type": "openclaw",
+  "harness_type": "hermes",
   "system": {
     "platform": ["windows"],
     "python": "3.11",
