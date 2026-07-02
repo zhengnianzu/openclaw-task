@@ -14,6 +14,8 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+from src.evaluator.evaluator import EvaluateConfig, Rubric
+
 logger = logging.getLogger("harness_automation")
 
 
@@ -72,6 +74,47 @@ class AgentConfigItem(BaseModel):
     model: Optional[str] = Field(None, description="使用的模型")
 
 
+class AgentModelConfig(BaseModel):
+    """按 agent_name 外挂的模型配置。字段名与 user_proxy_model.json 一致。
+    命中的 agent 配置(hermes profile / claude settings / openclaw 网关 provider)。
+    """
+    model_config = {"extra": "ignore"}
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+
+
+def load_agent_model_configs(path: Optional[str]) -> Dict[str, "AgentModelConfig"]:
+    """加载 simulator_config JSON,返回 {agent_name: AgentModelConfig}。
+
+    路径为空/不存在 → 返回 {};JSON/格式错误让它自然抛(格式钉死,不应静默降级)。
+    """
+    if not path:
+        return {}
+    p = Path(path).expanduser()
+    if not p.is_file():
+        logger.warning("simulator_config 文件不存在: %s", p)
+        return {}
+
+    data = json.loads(p.read_text(encoding="utf-8"))
+    out = {name: AgentModelConfig.model_validate(spec) for name, spec in data.items()}
+    logger.info("已加载 simulator_config: %s (agents=%s)", p, sorted(out))
+    return out
+
+
+def warn_agent_model_conflict(
+    agent_name: str,
+    configured_model: Optional[str],
+    cfg: "AgentModelConfig",
+) -> None:
+    """agents[].model 与 simulator_config 里同名 agent 的 model 冲突时打 warning。"""
+    if configured_model and cfg.model and configured_model != cfg.model:
+        logger.warning(
+            "agent '%s' model 冲突: 配置 '%s' vs simulator_config '%s';采用 simulator_config",
+            agent_name, configured_model, cfg.model,
+        )
+
+
 class QueryItem(BaseModel):
     """查询任务配置"""
     agent_name: str = Field(..., description="执行的 Agent 名称")
@@ -79,6 +122,7 @@ class QueryItem(BaseModel):
     session_name: Optional[str] = Field("main", description="会话名称")
     timeout: Optional[int] = Field(3600, description="超时时间(秒)")
     use_simulator: bool = Field(True, description="是否启用 user-simulator 进行多轮对话,默认 True")
+    evaluate: Optional[EvaluateConfig] = Field(None, description="第三方 evaluator 配置(query 内联块);为空则本 query 不评估。rubric/eval_step 等迁入此块")
 
 
 class AutomationConfig(BaseModel):
@@ -98,7 +142,7 @@ class AutomationConfig(BaseModel):
 
     # User Simulator 配置
     user_profile: str = Field("", description="用户画像兜底文本,profile_file 不存在时使用")
-    simulator_config: Optional[str] = Field(None, description="Simulator 配置 JSON 绝对路径,含 model/api_key/base_url/proxy;不配置则从环境变量读取")
+    simulator_config: Optional[str] = Field(None, description="模型配置 JSON 绝对路径,顶层 model/api_key/base_url 用于 user_simulator;可选嵌套 {agent_name: {model,api_key,base_url}} 用于覆盖 harness agent")
     user_max_turn: int = Field(5, description="多轮对话最大轮次")
 
     @field_validator("gateway_ws_url", mode="before")
@@ -117,6 +161,71 @@ class AutomationConfig(BaseModel):
 # ============================================================================
 # 配置加载器
 # ============================================================================
+def _resolve_json_pointer(data: Any, pointer: str) -> Any:
+    """按 RFC6901 JSON-Pointer 解引用(形如 /0/evaluate/0/custom_rubrics)。数字段转列表下标。"""
+    cur = data
+    for seg in pointer.split("/"):
+        if seg == "":
+            continue
+        seg = seg.replace("~1", "/").replace("~0", "~")  # RFC6901 转义
+        if isinstance(cur, list):
+            cur = cur[int(seg)]
+        else:
+            cur = cur[seg]
+    return cur
+
+
+def _resolve_evaluate_refs(config: "AutomationConfig", user_dir: Path) -> None:
+    """解引用各 query 的 evaluate 块外部引用,以 user_dir目录为相对基准。
+
+    - oracle_ref:加载 ground-truth → ev.oracle_data。
+    - rubrics_ref:JSON-Pointer 解引用 → ev.structured_rubrics。
+    - scoring_ref:JSON-Pointer 解引用 → ev.scoring(唯一评分来源,无隐式兜底)。
+    路径/指针缺失显式报错(不静默退空)。最后 resolve_runtime() 合成 scoring_spec。
+    """
+    for q in config.queries:
+        ev = q.evaluate
+        if ev is None:
+            continue
+
+        if ev.oracle_ref:
+            op = (user_dir / ev.oracle_ref)
+            if not op.exists():
+                raise FileNotFoundError(f"evaluate.oracle_ref 不存在: {op}")
+            oracle_text = op.read_text(encoding="utf-8")
+            ev.oracle_data = json.loads(oracle_text)
+            # 留存原始字节+绝对路径,供执行期隔离/还原(整文件粒度,逐字节回写)
+            ev.file_vault[str(op.resolve())] = oracle_text
+
+        if ev.rubrics_ref:
+            file_part, _, ptr = ev.rubrics_ref.partition("#")
+            rp = (user_dir / file_part)
+            if not rp.exists():
+                raise FileNotFoundError(f"evaluate.rubrics_ref 不存在: {rp}")
+            rubrics_text = rp.read_text(encoding="utf-8")
+            raw = json.loads(rubrics_text)
+            arr = _resolve_json_pointer(raw, ptr) if ptr else raw
+            ev.structured_rubrics = [Rubric.from_raw(r, i) for i, r in enumerate(arr, 1)]
+            # 片段引用也按整文件留存(删除/还原以整文件为单位)
+            ev.file_vault[str(rp.resolve())] = rubrics_text
+
+        if ev.scoring_ref:
+            # scoring 唯一来源:显式解析 scoring_ref 指针(与 rubrics_ref 对称),无隐式兜底。
+            file_part, _, ptr = ev.scoring_ref.partition("#")
+            sp = (user_dir / file_part)
+            if not sp.exists():
+                raise FileNotFoundError(f"evaluate.scoring_ref 不存在: {sp}")
+            scoring_text = sp.read_text(encoding="utf-8")
+            raw = json.loads(scoring_text)
+            resolved = _resolve_json_pointer(raw, ptr) if ptr else raw
+            if not isinstance(resolved, dict):
+                raise ValueError(f"evaluate.scoring_ref 未解析到 scoring 块(dict): {ev.scoring_ref}")
+            ev.scoring = resolved
+            # 整文件留存(删除/还原以整文件为单位;与 oracle/rubrics 同构)
+            ev.file_vault[str(sp.resolve())] = scoring_text
+
+        ev.resolve_runtime()  # 合成 scoring_spec
+
 
 class ConfigLoader:
     """配置文件加载器"""
@@ -140,9 +249,12 @@ class ConfigLoader:
                 raise ImportError("YAML 支持需要安装 PyYAML: pip install pyyaml")
         else:
             data = json.loads(content)
-
-        return AutomationConfig(**data)
+        
+        config = AutomationConfig(**data)
+        _resolve_evaluate_refs(config, Path(config.input_dir.user_dir.path))
+        return config
 
     @staticmethod
     def load_from_dict(data: Dict[str, Any]) -> AutomationConfig:
         return AutomationConfig(**data)
+

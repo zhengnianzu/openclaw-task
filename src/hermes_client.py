@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from run_agent import AIAgent as _AIAgent  # noqa: F401
 
 from src.workspace import BaseWorkspaceManager
+from src.config import AgentModelConfig, warn_agent_model_conflict
 
 logger = logging.getLogger("harness_automation")
 
@@ -232,6 +233,7 @@ class HermesAgent:
         session_name: str,
         system_prompt: Optional[str] = None,
         hermes_home: Optional[Path] = None,
+        model_override: Optional[AgentModelConfig] = None,
     ):
         self._client = client
         self.agent_name = agent_name
@@ -240,6 +242,7 @@ class HermesAgent:
         self.session_key = session_name
         self._system_prompt = system_prompt
         self.hermes_home: Optional[Path] = Path(hermes_home).expanduser() if hermes_home else None
+        self._model_override = model_override
         self._agent: Optional[Any] = None
         self._history: List[Dict[str, Any]] = []
 
@@ -276,7 +279,31 @@ class HermesAgent:
         if self._agent is not None:
             return self._agent
         AIAgent = _import_AIAgent()
-        ctor_kwargs = _load_aiagent_kwargs_from_config()
+        # profile 的 config.yaml 优先(~/.hermes/profiles/<name>/config.yaml);
+        # 缺失/没配 hermes_home 则退回全局 ~/.hermes/config.yaml。
+        cfg_path: Optional[Path] = None
+        if self.hermes_home is not None:
+            candidate = self.hermes_home / "config.yaml"
+            if candidate.is_file():
+                cfg_path = candidate
+        ctor_kwargs = _load_aiagent_kwargs_from_config(cfg_path)
+
+        # simulator_config 命中时,以其中的 model_cfg 为准 (逐字段覆盖,不整份替换)。
+        # 关键:pop 掉从 yaml 读来的 provider,避免 AIAgent 用 provider 表里的
+        # base_url/api_key 反向覆盖 override。
+        ov = self._model_override
+        if ov is not None:
+            if ov.model:
+                ctor_kwargs["model"] = ov.model
+            if ov.base_url:
+                ctor_kwargs["base_url"] = ov.base_url
+            if ov.api_key:
+                ctor_kwargs["api_key"] = ov.api_key
+            ctor_kwargs.pop("provider", None)
+            logger.info(
+                "agent=%s 应用 simulator_config 覆盖: model=%r base_url=%r",
+                self.agent_name, ov.model, ov.base_url,
+            )
         try:
             self._agent = AIAgent(**ctor_kwargs)
         except Exception as e:
@@ -396,6 +423,7 @@ class HermesClient:
         *,
         system_prompt: Optional[str] = None,
         hermes_home: Optional[Path] = None,
+        model_override: Optional[AgentModelConfig] = None,
     ) -> HermesAgent:
         key = (agent_name, session_name)
         if key not in self._agents:
@@ -405,6 +433,7 @@ class HermesClient:
                 session_name=session_name,
                 system_prompt=system_prompt,
                 hermes_home=hermes_home,
+                model_override=model_override,
             )
         return self._agents[key]
 
@@ -484,13 +513,13 @@ class HermesWorkspaceManager(BaseWorkspaceManager):
     """Hermes 工作空间管理器: 走 hermes profile API,路径为 ~/.hermes/profiles/<name>"""
 
     def __init__(self, base_dir: Optional[str] = None):
-        self.base_dir = Path.home() / ".hermes" / "profiles"
+        self.base_dir = Path(base_dir).expanduser()
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self._ensured: set = set()
 
     def get_agent_workspace(self, agent_name: str) -> Path:
         if agent_name == "main":
-            workspace = Path.home() / ".hermes"
+            workspace = self.base_dir
             self._ensured.add("main")
             return workspace
 
@@ -555,13 +584,25 @@ class HermesWorkspaceManager(BaseWorkspaceManager):
 class HermesAgentManager:
     """Hermes Agent 管理器 — 仅验证 profile 存在"""
 
-    def __init__(self, client: HermesClient, workspace_manager: HermesWorkspaceManager):
+    def __init__(
+        self,
+        client: HermesClient,
+        workspace_manager: HermesWorkspaceManager,
+        agent_overrides: Optional[Dict[str, AgentModelConfig]] = None,
+    ):
         self.client = client
         self.workspace_manager = workspace_manager
+        self.agent_overrides: Dict[str, AgentModelConfig] = agent_overrides or {}
 
     async def setup_agent(self, agent_config) -> None:
         agent_name = agent_config.name
-        logger.info("设置 Agent: %s", agent_name)
+        override = self.agent_overrides.get(agent_name)
+        if override:
+            warn_agent_model_conflict(agent_name, agent_config.model, override)
+        if agent_config.model:
+            logger.info("设置 Agent: %s | model=%s", agent_name, agent_config.model)
+        else:
+            logger.info("设置 Agent: %s", agent_name)
         self.workspace_manager.get_agent_workspace(agent_name)
 
 
@@ -570,7 +611,13 @@ class HermesAgentManager:
 # ============================================================================
 
 def make_hermes_execute_with_retry(client: HermesClient, workspace_manager: Optional[HermesWorkspaceManager] = None):
-    """返回 hermes 专用的 execute_with_retry 闭包 (简单重试,无 history fallback)"""
+    """返回 hermes 专用的 execute_with_retry 闭包 (简单重试,无 history fallback)。
+
+    返回 `(result, evidence_incomplete)`,签名与 OpenClaw 对齐:
+    - 本地直连正常返回 → `(result, False)`;
+    - stop_reason 为 timeout/error 但能拿到部分 content → `(result, True)`,提示下游
+      evaluator:本轮回复可能被截断,证据缺失不得当负面证据(D5)。
+    """
 
     async def execute_with_retry(agent, query_text: str, options):
         last_exc: Optional[BaseException] = None
@@ -580,7 +627,9 @@ def make_hermes_execute_with_retry(client: HermesClient, workspace_manager: Opti
                 if result is None:
                     raise HermesError("AIAgent returned None")
                 if result.success and result.content:
-                    return result
+                    # stop_reason 非 "complete" 说明本轮被截断/异常返回,标 incomplete
+                    evidence_incomplete = (result.stop_reason or "complete") != "complete"
+                    return result, evidence_incomplete
                 if not result.success:
                     raise HermesError(result.error_message or "AIAgent returned error")
                 raise HermesError("AIAgent returned empty content")
@@ -600,14 +649,22 @@ def make_hermes_execute_with_retry(client: HermesClient, workspace_manager: Opti
     return execute_with_retry
 
 
-def make_hermes_get_agent(client: HermesClient, workspace_manager: Optional[HermesWorkspaceManager] = None):
-    """返回 hermes 专用的 get_agent_fn 闭包 (含 hermes_home 注入)"""
+def make_hermes_get_agent(
+    client: HermesClient,
+    workspace_manager: Optional[HermesWorkspaceManager] = None,
+    agent_overrides: Optional[Dict[str, AgentModelConfig]] = None,
+):
+    """返回 hermes 专用的 get_agent_fn 闭包 (含 hermes_home + model_override 注入)"""
+    overrides = agent_overrides or {}
 
     def get_agent(agent_name: str, session_name: str):
         hermes_home = (
             workspace_manager.get_agent_workspace(agent_name)
             if workspace_manager is not None else None
         )
-        return client.get_agent(agent_name, session_name, hermes_home=hermes_home)
-
+        return client.get_agent(
+            agent_name, session_name,
+            hermes_home=hermes_home,
+            model_override=overrides.get(agent_name),
+        )
     return get_agent
