@@ -1,19 +1,13 @@
 {
   "user_simulator": {
     "model": "gemini-3-flash-preview",
-    "api_key": "xxxxxxxxxxxxxx",
-    "base_url": "http://192.168.30.95:8084"
+    "base_url": "http://192.168.30.95:8084",
+    "api_key": "xxxxx"
   },
   "evaluator": {
+    "model":"deepseek-v4-flash",
     "base_url": "http://192.168.30.95:8084",
     "api_key": "user-key",
-    "api": "openai-completions",
-    "models": [
-      {
-        "id": "deepseek-v4-flash",
-        "name": "deepseek-v4-flash",
-        "api": "openai-completions"
-      }
-    ]
+    "api": "openai-completions"
   }
 }

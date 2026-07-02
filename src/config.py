@@ -76,43 +76,16 @@ class AgentConfigItem(BaseModel):
 
 class AgentModelConfig(BaseModel):
     """按 agent_name 外挂的模型配置。字段名与 user_proxy_model.json 一致。
-
-    命中的 agent 用这份 model/api_key/base_url 覆盖 harness 默认环境
-    (hermes profile / claude settings / openclaw 网关 provider)。
+    命中的 agent 配置(hermes profile / claude settings / openclaw 网关 provider)。
     """
+    model_config = {"extra": "ignore"}
     model: Optional[str] = None
     api_key: Optional[str] = None
     base_url: Optional[str] = None
 
 
-def _parse_agent_model_spec(spec: dict) -> AgentModelConfig:
-    """把一段 agent 配置归一化成 AgentModelConfig。
-
-    同时接受两种命名风格:
-      - snake_case: model / api_key / base_url  (user_proxy_model 风格)
-      - camelCase + models[]: apiKey / baseUrl / models[0].id  (hermes UI provider 风格)
-    """
-    model = spec.get("model")
-    if not model:
-        models = spec.get("models") or []
-        if models and isinstance(models[0], dict):
-            model = models[0].get("id") or models[0].get("name")
-    return AgentModelConfig(
-        model=model,
-        api_key=spec.get("api_key") or spec.get("apiKey"),
-        base_url=spec.get("base_url") or spec.get("baseUrl"),
-    )
-
-
 def load_agent_model_configs(path: Optional[str]) -> Dict[str, "AgentModelConfig"]:
     """加载 simulator_config JSON,返回 {agent_name: AgentModelConfig}。
-
-    JSON 结构 (顶层 key = agent_name,`user_simulator` 是保留名):
-        {
-          "user_simulator": {"model": "...", "api_key": "***", "base_url": "..."},
-          "evaluator":      {"baseUrl": "...", "apiKey": "***",
-                             "models": [{"id": "...", "name": "..."}]}
-        }
 
     路径为空/不存在 → 返回 {};JSON/格式错误让它自然抛(格式钉死,不应静默降级)。
     """
@@ -124,7 +97,7 @@ def load_agent_model_configs(path: Optional[str]) -> Dict[str, "AgentModelConfig
         return {}
 
     data = json.loads(p.read_text(encoding="utf-8"))
-    out = {name: _parse_agent_model_spec(spec) for name, spec in data.items()}
+    out = {name: AgentModelConfig.model_validate(spec) for name, spec in data.items()}
     logger.info("已加载 simulator_config: %s (agents=%s)", p, sorted(out))
     return out
 

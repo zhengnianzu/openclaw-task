@@ -551,9 +551,10 @@ class ClaudecodeAgentManager:
             logger.info("设置 Agent: %s", agent_name)
         workspace = self.workspace_manager.get_agent_workspace(agent_name)
 
-        # override 命中时:model 用 override 的,base_url/api_key 走 claude CLI 子进程环境变量。
-        # (claude CLI 原生认 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_MODEL)
+        # 有 override 的 agent (如 evaluator): setting_sources=["project"] → 跳过 ~/.claude/settings.json
+        # 没 override 的 agent (如 assistant1): 走原路径 (SDK 默认 ["user", "project"] 或类似) → 继续继承 ~/.claude/settings.json 里的根目录配置
         env: Dict[str, str] = {}
+        extra_options: Dict[str, Any] = {}
         effective_model = getattr(agent_config, "model", None)
         if override:
             if override.model:
@@ -563,21 +564,16 @@ class ClaudecodeAgentManager:
                 env["ANTHROPIC_BASE_URL"] = override.base_url
             if override.api_key:
                 env["ANTHROPIC_AUTH_TOKEN"] = override.api_key
+            # 只读 project 段(通常不存在) → user 段完全跳过 → env 注入生效
+            extra_options["setting_sources"] = ["project"]
 
-        # 诊断:确认 override 到底把哪把 key 写进了 env(仅打印前缀 + 后 4 位,不泄露)
-        _tok = env.get("ANTHROPIC_AUTH_TOKEN")
-        _tok_view = f"{_tok[:6]}...{_tok[-4:]}" if _tok else "<inherit-parent-env>"
-        logger.info(
-            "Agent %s | override=%s | model=%s | base=%s | token=%s",
-            agent_name, bool(override), effective_model,
-            env.get("ANTHROPIC_BASE_URL", "<inherit>"), _tok_view,
-        )
         self.client.register_agent_defaults(
             agent_name=agent_name,
             system_prompt=getattr(agent_config, "system_prompt", None),
             model=effective_model,
             cwd=workspace,
             permission_mode="bypassPermissions",
+            extra_options=extra_options or None,
             env=env or None,
         )
 
