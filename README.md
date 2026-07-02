@@ -6,12 +6,17 @@
 ## OpenClaw 
 > 基于 openclaw-sdk 的配置驱动任务编排框架
 | `openclaw_automation.py` | OpenClaw 网关 | WebSocket → `openclaw-sdk` | 已有 OpenClaw 实例 (`ws://127.0.0.1:18789`) |
+详见 `src/openclaw_client.py`。
 
 ## Hermes
 > from run_agent import AIAgent
 | `hermes_automation.py`   | 进程内 AIAgent | 直接 `from run_agent import AIAgent` | 想跑 hermes-agent、无网关、最少依赖 |
+详见 `src/hermes_client.py`。
 
-Hermes 端的详细说明见 [`docs/README_HERMES.md`](docs/README_HERMES.md)。
+## ClaudeCode
+> 基于 `claude_agent_sdk` 的进程内 harness — 直接复用官方 `ClaudeSDKClient` / `ClaudeAgentOptions` / `query()`等。
+| `from claude_agent_sdk import ClaudeSDKClient` | 需要 `claude` CLI 已安装 (`claude --version`) |
+详见 `src/claudecode_client.py`。
 
 ## 特性
 
@@ -281,6 +286,47 @@ orchestrator.generate_report("report.txt")
 automation = OpenClawAutomation(config)
 results = await automation.run()
 ```
+
+### Evaluator(第三方裁判)
+
+为某个 query 配置独立 evaluator,逐评审点基于**可核验证据**(tool_calls + 磁盘真相文件)评估
+agent 表现,并把反馈喂回 user_simulator(simulator 仍拍板)。
+
+**用法:在 query 上加 `evaluate` 内联块,并在顶层 `agents` 声明裁判 agent(钉一个 flash 级模型)。**
+
+```jsonc
+{
+  "agents": [
+    { "name": "main3" },
+    {                                    // 裁判 agent:独立、刻意用 flash 级快模型
+      "name": "evaluator",
+      "model": "gemini-3-flash-preview", // 经 agents.update 钉死(可带 provider 前缀)
+      "model_provider": "custom-yibuapi-com" // 与 model 拼成 "provider/model" 选已定义的 provider
+    }
+  ],
+  "queries": [{
+    "agent_name": "main3",
+    "text": "...",
+    "evaluate": {
+      "agent_name": "evaluator",         // 从 agents 自选,须 ≠ 执行 agent
+      "session_name": "exp",
+      "rubrics": ["验收准则1", "验收准则2"], // 随 query 冻结,逐条质检;空=自由维度评估
+      "eval_step": 2,                     // 每 X 轮评一次;最近 X 轮也作投喂窗口
+      "feedback_to_simulator": true       // 是否把评估反馈回流 simulator
+    }
+  }]
+}
+```
+
+要点:
+- **持久 agent + 每轮 reset 会话**:同一 query 各轮复用同一 evaluator agent(省建连),但每次评估前
+  `sessions.reset` 清空会话以**防自身判词锚定**;历史由 harness 的 trajectory 承载。
+- **有界压缩投喂**:每次只投 `origin_query + rubrics + 最近 eval_step 轮(含 tool_calls)+ 产物指针`,
+  不投全量历史、不内联文件全文(evaluator 用自身工具打开 `_under_review/` 下产物核验)。
+- **eval_step 取舍**(实测):越大越省(次数≈⌈N/step⌉、时延≈1/step),反馈越稀疏;默认 2 为折中。
+- **模型钉死**:经 `agents.update(model="provider/model")` per-agent 选模型+选 provider;
+  provider 的 baseUrl/apiKey 须在网关侧 `config.models.providers.<provider>` 定义(harness 不下发)。
+- 每次评估落盘 `evaluator_use.log`(含 rubric 逐条结果 / window_turns / prompt_chars),供离线复核。
 
 ## 变量替换
 

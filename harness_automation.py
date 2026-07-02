@@ -17,7 +17,7 @@ from typing import Any, Dict, Optional
 
 from user_simulator import User_simulator
 
-from src.config import AutomationConfig, ConfigLoader
+from src.config import AutomationConfig, ConfigLoader, load_agent_model_configs
 
 import time as _time
 _RUN_ID = _time.strftime("%Y%m%dT%H%M%S")
@@ -66,8 +66,16 @@ logger = logging.getLogger("harness_automation")
 # Simulator 工厂函数
 # ============================================================================
 
-def create_simulator(config: AutomationConfig) -> Optional[User_simulator]:
-    """根据配置创建 User_simulator 实例,无配置则返回 None"""
+def create_simulator(
+    config: AutomationConfig,
+    simulator_model_cfg=None,
+) -> Optional[User_simulator]:
+    """根据配置创建 User_simulator 实例,无配置则返回 None。
+
+    simulator_model_cfg: AgentModelConfig(model/api_key/base_url),
+    由 HarnessAutomation 从 simulator_config JSON 顶层解析后传入;
+    未提供则回退到 SIMULATOR_MODEL / SIMULATOR_OPENAI_* 环境变量。
+    """
 
     user_profile = config.user_profile
     user_dir_cfg = config.input_dir.user_dir
@@ -80,22 +88,19 @@ def create_simulator(config: AutomationConfig) -> Optional[User_simulator]:
         elif user_dir_cfg.profile_file:
             logger.warning("profile_file 不存在: %s,回退到 config.user_profile", profile_path)
 
-    if not config.simulator_config:
+    if simulator_model_cfg is None and not config.simulator_config:
         logger.info("simulator_config 未配置,将跳过多轮对话(仅执行单轮)")
         return None
 
-    proxy_cfg_path = Path(config.simulator_config)
-    if proxy_cfg_path.exists():
-        proxy_cfg = json.loads(proxy_cfg_path.read_text(encoding="utf-8"))
-        logger.info("Simulator 配置来自: %s", proxy_cfg_path)
-    else:
-        logger.warning("simulator_config 文件不存在: %s,回退到环境变量", proxy_cfg_path)
-        proxy_cfg = {}
+    # 从 AgentModelConfig 取三元组;缺项回退环境变量
+    cfg_model    = simulator_model_cfg.model    if simulator_model_cfg else None
+    cfg_api_key  = simulator_model_cfg.api_key  if simulator_model_cfg else None
+    cfg_base_url = simulator_model_cfg.base_url if simulator_model_cfg else None
 
-    model    = proxy_cfg.get("model")    or os.environ.get("SIMULATOR_MODEL", "gpt-4o")
-    api_key  = proxy_cfg.get("api_key")  or os.environ.get("SIMULATOR_OPENAI_API_KEY")
-    base_url = proxy_cfg.get("base_url") or os.environ.get("SIMULATOR_OPENAI_BASE_URL")
-    proxy    = proxy_cfg.get("proxy")    or os.environ.get("SIMULATOR_PROXY")
+    model    = cfg_model    or os.environ.get("SIMULATOR_MODEL", "gpt-4o")
+    api_key  = cfg_api_key  or os.environ.get("SIMULATOR_OPENAI_API_KEY")
+    base_url = cfg_base_url or os.environ.get("SIMULATOR_OPENAI_BASE_URL")
+    proxy    = os.environ.get("SIMULATOR_PROXY")
 
     user_directory = ""
     if user_dir_cfg:
@@ -129,13 +134,21 @@ class HarnessAutomation:
     def __init__(self, config: AutomationConfig):
         self.config = config
         self.harness_type = config.harness_type
+        # 从 simulator_config JSON 一次加载全部:{"user_simulator": AgentModelConfig, "<agent>": ...}
+        all_cfgs = load_agent_model_configs(config.simulator_config)
+        # user_simulator 段单独取出给 create_simulator 用;剩下的按 agent_name 传给 harness
+        self.simulator_model_cfg = all_cfgs.pop("user_simulator", None)
+        self.agent_overrides = all_cfgs
 
         if self.harness_type == "hermes":
             from src.hermes_client import HermesWorkspaceManager
-            self.workspace_manager = HermesWorkspaceManager(config.workspace_base)
+            self.workspace_manager = HermesWorkspaceManager("~/.hermes")
+        elif self.harness_type == "claudecode":
+            from src.claudecode_client import ClaudecodeWorkspaceManager
+            self.workspace_manager = ClaudecodeWorkspaceManager("~/.claude/workspace")
         else:
             from src.openclaw_client import OpenclawWorkspaceManager
-            self.workspace_manager = OpenclawWorkspaceManager(config.workspace_base)
+            self.workspace_manager = OpenclawWorkspaceManager("~/.openclaw/workspace")
 
     async def run(self) -> Dict[str, Any]:
         """运行自动化流程"""
@@ -145,6 +158,8 @@ class HarnessAutomation:
 
         if self.harness_type == "hermes":
             return await self._run_hermes()
+        elif self.harness_type == "claudecode":
+            return await self._run_claudecode()
         else:
             return await self._run_openclaw()
 
@@ -169,17 +184,22 @@ class HarnessAutomation:
 
             await self._setup_workspaces()
 
-            agent_manager = OpenclawAgentManager(client, self.workspace_manager)
+            agent_manager = OpenclawAgentManager(client, self.workspace_manager, agent_overrides=self.agent_overrides)
             for agent_config in self.config.agents:
                 await agent_manager.setup_agent(agent_config)
 
-            simulator = create_simulator(self.config)
+            simulator_factory = lambda: create_simulator(self.config, self.simulator_model_cfg)
+            agent_system_prompts = {
+                a.name: a.system_prompt for a in self.config.agents if a.system_prompt
+            }
             results = await execute_queries(
                 queries=self.config.queries,
+                client=client,
                 get_agent_fn=lambda name, session: client.get_agent(name, session),
                 execute_with_retry_fn=make_openclaw_execute_with_retry(client),
-                simulator=simulator,
+                simulator_factory=simulator_factory,
                 max_turn=self.config.user_max_turn,
+                agent_system_prompts=agent_system_prompts,
                 run_id=_RUN_ID,
                 pre_query_hook=lambda: openclaw_check_readyz(client),
             )
@@ -212,16 +232,68 @@ class HarnessAutomation:
 
             await self._setup_workspaces()
 
-            agent_manager = HermesAgentManager(client, self.workspace_manager)
+            agent_manager = HermesAgentManager(client, self.workspace_manager, agent_overrides=self.agent_overrides)
             for agent_config in self.config.agents:
                 await agent_manager.setup_agent(agent_config)
 
-            simulator = create_simulator(self.config)
+            simulator_factory = lambda: create_simulator(self.config, self.simulator_model_cfg)
+            agent_system_prompts = {
+                a.name: a.system_prompt for a in self.config.agents if a.system_prompt
+            }
             results = await execute_queries(
                 queries=self.config.queries,
-                get_agent_fn=make_hermes_get_agent(client, workspace_manager=self.workspace_manager),
+                client=client,
+                get_agent_fn=make_hermes_get_agent(client, workspace_manager=self.workspace_manager, agent_overrides=self.agent_overrides),
                 execute_with_retry_fn=make_hermes_execute_with_retry(client, workspace_manager=self.workspace_manager),
-                simulator=simulator,
+                simulator_factory=simulator_factory,
+                agent_system_prompts=agent_system_prompts,
+                max_turn=self.config.user_max_turn,
+                run_id=_RUN_ID,
+            )
+            return results
+
+    async def _run_claudecode(self) -> Dict[str, Any]:
+        from src.claudecode_client import (
+            build_claudecode_client,
+            ClaudecodeAgentManager,
+            make_claudecode_execute_with_retry,
+            make_claudecode_get_agent,
+        )
+        from src.executor import execute_queries
+
+        legacy_oc = {}
+        if self.config.gateway_ws_url:
+            legacy_oc["gateway_ws_url"] = self.config.gateway_ws_url
+        if self.config.gateway_timeout is not None:
+            legacy_oc["gateway_timeout"] = self.config.gateway_timeout
+        if self.config.api_key:
+            legacy_oc["api_key"] = "<redacted>"
+        if legacy_oc:
+            logger.info(
+                "[跨框架兼容] 接受到 openclaw 风格字段 %s; claudecode 已全部忽略",
+                legacy_oc,
+            )
+
+        async with await build_claudecode_client() as client:
+            self.client = client
+
+            await self._setup_workspaces()
+
+            agent_manager = ClaudecodeAgentManager(client, self.workspace_manager, agent_overrides=self.agent_overrides)
+            for agent_config in self.config.agents:
+                await agent_manager.setup_agent(agent_config)
+
+            simulator_factory = lambda: create_simulator(self.config, self.simulator_model_cfg)
+            agent_system_prompts = {
+                a.name: a.system_prompt for a in self.config.agents if a.system_prompt
+            }
+            results = await execute_queries(
+                queries=self.config.queries,
+                client=client,
+                get_agent_fn=make_claudecode_get_agent(client, workspace_manager=self.workspace_manager),
+                execute_with_retry_fn=make_claudecode_execute_with_retry(client, workspace_manager=self.workspace_manager),
+                simulator_factory=simulator_factory,
+                agent_system_prompts=agent_system_prompts,
                 max_turn=self.config.user_max_turn,
                 run_id=_RUN_ID,
             )
@@ -272,7 +344,11 @@ class HarnessAutomation:
 # 主入口函数
 # ============================================================================
 
-async def main(config_file: Optional[str] = None, config_dict: Optional[Dict] = None) -> None:
+async def main(
+    config_file: Optional[str] = None,
+    config_dict: Optional[Dict] = None,
+    harness_type: Optional[str] = None,
+) -> None:
     """主入口函数"""
     setup_logger(config_file)
 
@@ -282,6 +358,10 @@ async def main(config_file: Optional[str] = None, config_dict: Optional[Dict] = 
         config = ConfigLoader.load_from_dict(config_dict)
     else:
         raise ValueError("必须提供 config_file 或 config_dict")
+
+    # CLI 覆盖:显式传入的 harness_type 优先于配置文件
+    if harness_type:
+        config.harness_type = harness_type
 
     automation = HarnessAutomation(config)
     results = await automation.run()
@@ -304,10 +384,16 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--workspace",
-        default="./workspaces",
+        default="~/.openclaw/workspace",
         help="工作空间基础目录"
+    )
+    parser.add_argument(
+        "--harness",
+        default="openclaw",
+        help="harness类型"
     )
 
     args = parser.parse_args()
 
-    asyncio.run(main(config_file=args.config))
+    asyncio.run(main(config_file=args.config, harness_type=args.harness))
+

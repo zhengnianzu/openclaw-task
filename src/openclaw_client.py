@@ -29,6 +29,7 @@ from openclaw_sdk.core.types import ExecutionResult
 from openclaw_sdk.gateway.protocol import ProtocolGateway
 
 from src.workspace import BaseWorkspaceManager, copy_path
+from src.config import AgentModelConfig, warn_agent_model_conflict
 
 logger = logging.getLogger("harness_automation")
 
@@ -478,14 +479,27 @@ class OpenclawWorkspaceManager(BaseWorkspaceManager):
 class OpenclawAgentManager:
     """OpenClaw Agent 注册管理器"""
 
-    def __init__(self, client: OpenClawClient, workspace_manager: OpenclawWorkspaceManager):
+    def __init__(
+        self,
+        client: OpenClawClient,
+        workspace_manager: OpenclawWorkspaceManager,
+        agent_overrides: Optional[Dict[str, AgentModelConfig]] = None,
+    ):
         self.client = client
         self.workspace_manager = workspace_manager
+        self.agent_overrides: Dict[str, AgentModelConfig] = agent_overrides or {}
 
     async def setup_agent(self, agent_config) -> None:
         agent_name = agent_config.name
-        logger.info("设置 Agent: %s", agent_name)
+        override = self.agent_overrides.get(agent_name)
+        if override:
+            warn_agent_model_conflict(agent_name, agent_config.model, override)
+        if agent_config.model:
+            logger.info("设置 Agent: %s | model=%s", agent_name, agent_config.model)
+        else:
+            logger.info("设置 Agent: %s", agent_name)
 
+        # 预设Agent:evaluator
         existing_ids = {a.agent_id for a in await self.client.list_agents()}
 
         if agent_name not in existing_ids:
@@ -494,10 +508,47 @@ class OpenclawAgentManager:
                 AgentConfig(
                     agent_id=agent_name,
                     workspace=str(workspace),
-                )
+                ),
+                workspace=str(workspace),
             )
             logger.info("创建新 Agent: %s,等待 gateway 重启就绪...", agent_name)
             await self._wait_gateway_ready()
+
+        # 钉死模型:agents.create 不下发模型,改用 agents.update 下发(网关侧
+        # baseUrl/apiKey 整份回写被拒,只能网关侧 `config.models.providers.*` 配)。
+        # override.model 优先;否则用 agent_config.model。
+        model = (override.model if override and override.model else agent_config.model)
+        if model:
+            await self._pin_model(agent_name, model, has_endpoint_info=bool(override))
+
+    async def _pin_model(
+        self,
+        agent_name: str,
+        model: str,
+        has_endpoint_info: bool = False,
+    ) -> None:
+        """经 agents.update 下发 model 串(本网关唯一可靠的 per-agent 模型通道)。
+
+        has_endpoint_info=True 表示 override 里带了 baseUrl/apiKey,本 harness 无法
+        下发,只是提示用户去网关侧配好 provider。
+        """
+        if has_endpoint_info:
+            logger.info(
+                "agent '%s' 的 baseUrl/apiKey 不经 harness 下发(本网关整份回写被拒);"
+                "请在网关侧 `config.models.providers.*` 配置,本 agent 仅引用模型串 '%s'",
+                agent_name, model,
+            )
+        try:
+            resp = await self.client.gateway.agents_update(agent_name, model=model)
+            logger.info(
+                "已为 agent '%s' 钉死模型=%s (agents.update 返回: %s)",
+                agent_name, model, resp,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "为 agent '%s' 下发模型=%s 失败: %s",
+                agent_name, model, e,
+            )
 
     async def _wait_gateway_ready(self, wait: float = 90.0) -> None:
         logger.info("等待 gateway 重启就绪,固定等待 %ds ...", int(wait))
@@ -624,9 +675,10 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                 result = await agent.execute(query_text, options=options)
                 if result is None:
                     raise RuntimeError("Agent returned None")
-
+                if query_text == "真棒" or query_text == "好吧":
+                    print(f"openclaw res={result}")
                 if getattr(result, "content", None):
-                    return result
+                    return result, False
 
                 fallback_text = await history_fallback(before_history)
                 if fallback_text:
@@ -637,7 +689,7 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                             "stop_reason": result.stop_reason or "complete",
                             "error_message": None,
                         }
-                    )
+                    ), True
 
                 error_message = getattr(result, "error_message", None)
                 if error_message and not str(error_message).startswith(
@@ -668,7 +720,7 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                         success=True,
                         content=fallback_text,
                         stop_reason="complete",
-                    )
+                    ), True
 
                 if attempt >= max_attempts:
                     raise
@@ -689,3 +741,4 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                 await asyncio.sleep(EXECUTION_RETRY_WAIT_SECONDS)
 
     return execute_with_retry
+
