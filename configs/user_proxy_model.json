@@ -1,6 +1,19 @@
 {
-  "model": "claude-haiku-4-5-20251001",
-  "api_key": "sk-1234",
-  "base_url": "http://127.0.0.1:4000",
-  "proxy": null
+  "user_simulator": {
+    "model": "gemini-3-flash-preview",
+    "api_key": "xxxxxxxxxxxxxx",
+    "base_url": "http://192.168.30.95:8084"
+  },
+  "evaluator": {
+    "base_url": "http://192.168.30.95:8084",
+    "api_key": "user-key",
+    "api": "openai-completions",
+    "models": [
+      {
+        "id": "deepseek-v4-flash",
+        "name": "deepseek-v4-flash",
+        "api": "openai-completions"
+      }
+    ]
+  }
 }
