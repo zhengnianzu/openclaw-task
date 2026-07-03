@@ -1,0 +1,53 @@
+{
+  "rubrics": [
+    {
+      "id": "G1",
+      "when": "gate",
+      "evaluator": "llm_judge",
+      "text": "回答中包含快速排序的核心思想（分治、选取pivot、分区）"
+    },
+    {
+      "id": "G2",
+      "when": "gate",
+      "evaluator": "llm_judge",
+      "text": "没有将快速排序与其他排序算法混淆（如归并排序、堆排序）"
+    },
+    {
+      "id": "C1",
+      "when": "final",
+      "evaluator": "llm_judge",
+      "text": "正确给出平均时间复杂度 O(n log n) 和最坏时间复杂度 O(n²)"
+    },
+    {
+      "id": "C2",
+      "when": "final",
+      "evaluator": "llm_judge",
+      "text": "给出了可运行的 Python 代码实现"
+    },
+    {
+      "id": "C3",
+      "when": "final",
+      "evaluator": "llm_judge",
+      "text": "代码逻辑正确（包含 partition 步骤和递归调用）"
+    },
+    {
+      "id": "PT1",
+      "when": "per_turn",
+      "evaluator": "llm_judge",
+      "text": "回答使用中文，表述清晰易懂"
+    }
+  ],
+  "scoring": {
+    "gate_zero": true,
+    "weights": {
+      "correctness": 0.6,
+      "presentation": 0.2,
+      "process": 0.2
+    },
+    "bucket_map": {
+      "correctness": ["C1", "C2", "C3"],
+      "presentation": ["PT1"],
+      "process": []
+    }
+  }
+}

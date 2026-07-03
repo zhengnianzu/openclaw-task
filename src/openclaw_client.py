@@ -516,8 +516,8 @@ class OpenclawAgentManager:
 
         # 钉死模型:agents.create 不下发模型,改用 agents.update 下发(网关侧
         # baseUrl/apiKey 整份回写被拒,只能网关侧 `config.models.providers.*` 配)。
-        # override.model 优先;否则用 agent_config.model。
-        model = (override.model if override and override.model else agent_config.model)
+        # override.resolved_model(provider/model) 优先;否则用 agent_config.model。
+        model = (override.resolved_model if override and override.model else agent_config.model)
         if model:
             await self._pin_model(agent_name, model, has_endpoint_info=bool(override))
 

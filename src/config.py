@@ -80,8 +80,18 @@ class AgentModelConfig(BaseModel):
     """
     model_config = {"extra": "ignore"}
     model: Optional[str] = None
+    provider: Optional[str] = None
     api_key: Optional[str] = None
     base_url: Optional[str] = None
+
+    @property
+    def resolved_model(self) -> Optional[str]:
+        """返回 provider/model 格式的完整模型串。provider 缺省时原样返回 model。"""
+        if not self.model:
+            return None
+        if self.provider and "/" not in self.model:
+            return f"{self.provider}/{self.model}"
+        return self.model
 
 
 def load_agent_model_configs(path: Optional[str]) -> Dict[str, "AgentModelConfig"]:
@@ -108,10 +118,11 @@ def warn_agent_model_conflict(
     cfg: "AgentModelConfig",
 ) -> None:
     """agents[].model 与 simulator_config 里同名 agent 的 model 冲突时打 warning。"""
-    if configured_model and cfg.model and configured_model != cfg.model:
+    resolved = cfg.resolved_model
+    if configured_model and resolved and configured_model != resolved:
         logger.warning(
             "agent '%s' model 冲突: 配置 '%s' vs simulator_config '%s';采用 simulator_config",
-            agent_name, configured_model, cfg.model,
+            agent_name, configured_model, resolved,
         )
 
 
@@ -175,18 +186,26 @@ def _resolve_json_pointer(data: Any, pointer: str) -> Any:
     return cur
 
 
-def _resolve_evaluate_refs(config: "AutomationConfig", user_dir: Path) -> None:
+def _resolve_evaluate_refs(config: "AutomationConfig", user_dir: Optional[Path]) -> None:
     """解引用各 query 的 evaluate 块外部引用,以 user_dir目录为相对基准。
 
     - oracle_ref:加载 ground-truth → ev.oracle_data。
     - rubrics_ref:JSON-Pointer 解引用 → ev.structured_rubrics。
     - scoring_ref:JSON-Pointer 解引用 → ev.scoring(唯一评分来源,无隐式兜底)。
     路径/指针缺失显式报错(不静默退空)。最后 resolve_runtime() 合成 scoring_spec。
+    user_dir 为 None 时,若 evaluate 块不含 *_ref 则安全跳过;含 *_ref 则显式报错。
     """
     for q in config.queries:
         ev = q.evaluate
         if ev is None:
             continue
+
+        has_refs = ev.oracle_ref or ev.rubrics_ref or ev.scoring_ref
+        if has_refs and user_dir is None:
+            raise ValueError(
+                f"query '{q.text[:40]}...' 的 evaluate 块包含外部引用"
+                f"(oracle_ref/rubrics_ref/scoring_ref),但 input_dir.user_dir 未配置"
+            )
 
         if ev.oracle_ref:
             op = (user_dir / ev.oracle_ref)
@@ -251,10 +270,14 @@ class ConfigLoader:
             data = json.loads(content)
         
         config = AutomationConfig(**data)
-        _resolve_evaluate_refs(config, Path(config.input_dir.user_dir.path))
+        user_dir_path = Path(config.input_dir.user_dir.path) if config.input_dir.user_dir else None
+        _resolve_evaluate_refs(config, user_dir_path)
         return config
 
     @staticmethod
     def load_from_dict(data: Dict[str, Any]) -> AutomationConfig:
-        return AutomationConfig(**data)
+        config = AutomationConfig(**data)
+        user_dir_path = Path(config.input_dir.user_dir.path) if config.input_dir.user_dir else None
+        _resolve_evaluate_refs(config, user_dir_path)
+        return config
 

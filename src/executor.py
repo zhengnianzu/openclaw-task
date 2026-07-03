@@ -287,23 +287,11 @@ async def execute_queries(
             if "【Task_Done】" in user_reply:
                 logger.info("任务完成(Turn %d)", turn)
                 trajectory.outcome = "done"
-                try:
-                    await execute_with_retry_fn(
-                        agent, "真棒", options
-                    )
-                except Exception:
-                    pass
                 success = True
                 break
             elif "【Task_Failed】" in user_reply:
                 logger.error("任务失败(Turn %d):%s", turn, user_reply)
                 trajectory.outcome = "failed"
-                try:
-                    await execute_with_retry_fn(
-                        agent, "好吧", options
-                    )
-                except Exception:
-                    pass
                 break
 
             current_query = user_reply

@@ -26,7 +26,8 @@ def load_proxy_config(proxy_config_path: str) -> dict:
     path = Path(proxy_config_path)
     if not path.exists():
         raise FileNotFoundError(f"user_proxy_model 文件不存在: {path}")
-    cfg = json.loads(path.read_text(encoding="utf-8"))
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    cfg = raw.get("user_simulator", raw)
     print(f"✓ 加载 Simulator 配置: {path}")
     print(f"  model    = {cfg.get('model')}")
     print(f"  base_url = {cfg.get('base_url')}")

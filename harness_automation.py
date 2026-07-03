@@ -389,8 +389,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--harness",
-        default="openclaw",
-        help="harness类型"
+        default=None,
+        help="harness类型(不指定则使用配置文件中的 harness_type,缺省为 openclaw)"
     )
 
     args = parser.parse_args()
