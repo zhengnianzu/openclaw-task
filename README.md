@@ -109,6 +109,72 @@ python hermes_automation.py   --config configs/config_simple.json
 | `test/smoke_test.py` | Hermes 离线冒烟（imports / 配置校验 / 变量替换） |
 | `test/test_hermes_client.py` | Hermes 端到端: 真实拉起 AIAgent 跑一条 query |
 
+## 测试矩阵（3 Harness × 3 配置）
+
+系统支持 3 种 harness 后端和 3 种配置模式的自由组合，共 9 种场景。核心配置文件为：
+
+| 配置文件 | 模式 | `use_simulator` | `evaluate` |
+|----------|------|:-:|:-:|
+| `config_simple.json` | 单轮测试 | `false` | 无 |
+| `config_user.json` | + User Simulator | `true` | 无 |
+| `config_simple_eval.json` | + Evaluator | `true` | 有 |
+
+### 3 × 3 矩阵
+
+| | `config_simple.json` | `config_user.json` | `config_simple_eval.json` |
+|---|---|---|---|
+| **OpenClaw** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
+| **Hermes** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
+| **ClaudeCode** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
+
+### 运行方式
+
+```bash
+# OpenClaw（默认 harness，不需要 --harness 参数）
+python harness_automation.py --config configs/config_simple.json
+python harness_automation.py --config configs/config_user.json
+python harness_automation.py --config configs/config_simple_eval.json
+
+# Hermes — CLI --harness 覆盖 config 内的 harness_type
+python harness_automation.py --harness hermes --config configs/config_simple.json
+python harness_automation.py --harness hermes --config configs/config_user.json
+python harness_automation.py --harness hermes --config configs/config_simple_eval.json
+
+# ClaudeCode
+python harness_automation.py --harness claudecode --config configs/config_simple.json
+python harness_automation.py --harness claudecode --config configs/config_user.json
+python harness_automation.py --harness claudecode --config configs/config_simple_eval.json
+```
+
+### 三种配置模式
+
+| 模式 | 说明 |
+|------|------|
+| **单轮测试** | 单轮问答，无 simulator 无 evaluator |
+| **+ User Simulator** | 多轮对话，simulator 扮演用户并仲裁 Task_Done/Failed |
+| **+ Evaluator** | 多轮对话 + 第三方 evaluator 逐轮评估，反馈回流 simulator |
+
+### 模型配置差异
+
+| Harness | 模型路由 | 模型串格式 | `provider` 字段 |
+|---|---|---|---|
+| **OpenClaw** | 网关 `agents_update` | `provider/model`（如 `api-proxy-deepseek/deepseek-v4-flash`） | 必填 |
+| **Hermes** | `AIAgent` 构造参数 | 裸模型名（如 `deepseek-v4-flash`） | 不需要 |
+| **ClaudeCode** | 环境变量 `ANTHROPIC_MODEL` | 裸模型名 | 不需要 |
+
+`user_proxy_model.json` 统一调配各 agent 的模型。OpenClaw 场景需要配 `provider` 字段拼接 `provider/model`，其他 harness 忽略该字段：
+
+```json
+{
+  "evaluator": {
+    "model": "deepseek-v4-flash",
+    "provider": "api-proxy-deepseek",
+    "base_url": "http://...",
+    "api_key": "sk-..."
+  }
+}
+```
+
 ## 使用示例
 
 ### 基础使用
@@ -289,44 +355,228 @@ results = await automation.run()
 
 ### Evaluator(第三方裁判)
 
-为某个 query 配置独立 evaluator,逐评审点基于**可核验证据**(tool_calls + 磁盘真相文件)评估
-agent 表现,并把反馈喂回 user_simulator(simulator 仍拍板)。
+为某个 query 配置独立 evaluator，逐评审点基于**可核验证据**(tool_calls + 磁盘真相文件)评估
+agent 表现，并把反馈喂回 user_simulator（simulator 仍拍板）。
 
-**用法:在 query 上加 `evaluate` 内联块,并在顶层 `agents` 声明裁判 agent(钉一个 flash 级模型)。**
+#### 架构概览
 
-```jsonc
+```
+execute_queries() 每轮循环
+  |
+  +-- agent.execute(query) --> agent_reply
+  |
+  +-- process_turn()
+  |     +-- evaluator.evaluate_turn() --> EvaluationResult
+  |           +-- Scorer.score(rubric_checks) --> completion (确定性算出，非模型自报)
+  |           +-- format_feedback(result) --> evaluator_feedback (文本)
+  |
+  +-- simulator.chat(agent_reply, evaluator_feedback) --> 下一轮 user_query 或 Task_Done/Failed
+```
+
+**User Simulator** 和 **Evaluator** 的关键区别：
+
+| | User Simulator | Evaluator |
+|---|---|---|
+| API 通道 | 自建 OpenAI client，独立于 harness | 走 harness 的 agent 通道（openclaw/hermes/claudecode） |
+| 配置位置 | `simulator_config` JSON 的 `user_simulator` 段 | `agents[]` 声明 + `queries[].evaluate` 块 |
+| 角色 | 最终仲裁者（拍板 Task_Done/Failed） | 顾问（软反馈，无硬否决权） |
+
+#### 配置方式
+
+在 query 上加 `evaluate` 块，并在顶层 `agents` 声明裁判 agent：
+
+```json
 {
   "agents": [
-    { "name": "main3" },
-    {                                    // 裁判 agent:独立、刻意用 flash 级快模型
-      "name": "evaluator",
-      "model": "gemini-3-flash-preview", // 经 agents.update 钉死(可带 provider 前缀)
-      "model_provider": "custom-yibuapi-com" // 与 model 拼成 "provider/model" 选已定义的 provider
-    }
+    { "name": "main" },
+    { "name": "evaluator", "model": "deepseek-v4-flash" }
   ],
   "queries": [{
-    "agent_name": "main3",
+    "agent_name": "main",
     "text": "...",
     "evaluate": {
-      "agent_name": "evaluator",         // 从 agents 自选,须 ≠ 执行 agent
-      "session_name": "exp",
-      "rubrics": ["验收准则1", "验收准则2"], // 随 query 冻结,逐条质检;空=自由维度评估
-      "eval_step": 2,                     // 每 X 轮评一次;最近 X 轮也作投喂窗口
-      "feedback_to_simulator": true       // 是否把评估反馈回流 simulator
+      "agent_name": "evaluator",
+      "eval_step": 1,
+      "to_simulator": true,
+      "rubrics": ["准则1", "准则2"]
     }
   }]
 }
 ```
 
-要点:
-- **持久 agent + 每轮 reset 会话**:同一 query 各轮复用同一 evaluator agent(省建连),但每次评估前
-  `sessions.reset` 清空会话以**防自身判词锚定**;历史由 harness 的 trajectory 承载。
-- **有界压缩投喂**:每次只投 `origin_query + rubrics + 最近 eval_step 轮(含 tool_calls)+ 产物指针`,
-  不投全量历史、不内联文件全文(evaluator 用自身工具打开 `_under_review/` 下产物核验)。
-- **eval_step 取舍**(实测):越大越省(次数≈⌈N/step⌉、时延≈1/step),反馈越稀疏;默认 2 为折中。
-- **模型钉死**:经 `agents.update(model="provider/model")` per-agent 选模型+选 provider;
-  provider 的 baseUrl/apiKey 须在网关侧 `config.models.providers.<provider>` 定义(harness 不下发)。
-- 每次评估落盘 `evaluator_use.log`(含 rubric 逐条结果 / window_turns / prompt_chars),供离线复核。
+#### evaluate 块字段
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `agent_name` | str | `"evaluator"` | 评估器 agent 名称（须在 agents 列表中声明，且不等于执行 agent） |
+| `session_name` | str? | null | 评估器会话名；null 则复用 query 的 session_name |
+| `eval_step` | int | `1` | 每 N 轮评估一次；同时也是投喂窗口大小 |
+| `to_simulator` | bool | `false` | 是否将评估反馈回流给 simulator |
+| `isolate_eval_files` | bool | `true` | 执行期间是否从磁盘隔离 oracle/rubrics 文件（防 agent 读到答案） |
+
+#### Rubric 配置：两种方式
+
+**方式一：内联字符串 `rubrics`**（简单场景，不依赖外部文件）
+
+```json
+"evaluate": {
+  "agent_name": "evaluator",
+  "rubrics": [
+    "[gate] 回答包含核心概念",
+    "[final] 给出了代码实现",
+    "[per_turn] 使用中文回答"
+  ]
+}
+```
+
+内联 rubrics 会自动归一化：id 补为 R1/R2/...，evaluator 设为 `llm_judge`，所有条目按 `when=final` 处理（文本中的 `[gate]` 等标记仅作语义提示，不自动解析）。Scorer 将所有非 gate rubric 归入单桶等权。
+
+**方式二：外部引用 `rubrics_ref` + `scoring_ref`**（精细控制，需要 `user_dir`）
+
+```json
+"input_dir": {
+  "user_dir": { "path": "configs" }
+},
+"queries": [{
+  "evaluate": {
+    "agent_name": "evaluator",
+    "rubrics_ref": "eval_rubrics.json#/rubrics",
+    "scoring_ref": "eval_rubrics.json#/scoring",
+    "oracle_ref": "oracle.json"
+  }
+}]
+```
+
+引用的 rubrics 文件示例（如 `eval_rubrics.json`）：
+
+```json
+{
+  "rubrics": [
+    {
+      "id": "G1",
+      "when": "gate",
+      "evaluator": "llm_judge",
+      "text": "回答包含核心概念"
+    },
+    {
+      "id": "C1",
+      "when": "final",
+      "evaluator": "oracle_cmp",
+      "text": "数值结果与标准答案一致",
+      "formula": "|agent_value - oracle_value| <= 0.01",
+      "gt_ref": "derived.mean_wage"
+    },
+    {
+      "id": "PT1",
+      "when": "per_turn",
+      "evaluator": "llm_judge",
+      "text": "使用中文回答"
+    }
+  ],
+  "scoring": {
+    "gate_zero": true,
+    "weights": {
+      "correctness": 0.7,
+      "presentation": 0.3
+    },
+    "bucket_map": {
+      "correctness": ["C1"],
+      "presentation": ["PT1"]
+    }
+  }
+}
+```
+
+**两种方式互斥**：`structured_rubrics`（来自 `rubrics_ref`）优先；为空才回退到内联 `rubrics`。
+
+#### Rubric 字段说明
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | str | 唯一标识，如 G1、C1、PT1 |
+| `when` | `gate` / `final` / `per_turn` | 评分角色（见下方说明） |
+| `evaluator` | str | 判定方式：`llm_judge`（LLM 判断）/ `oracle_cmp`（与标准答案比对）/ `program`（公式判定） |
+| `text` | str | 自然语言描述 |
+| `formula` | str? | 半形式化判据（伪代码 DSL，供 evaluator 参考） |
+| `gt_ref` | str? | oracle 中对应 ground-truth 字段的引用路径 |
+
+#### `when` 的三种类型
+
+| `when` | 含义 | 评分行为 |
+|--------|------|---------|
+| `gate` | 门禁 / 一票否决 | 任何一条 gate 判 0 -> **整体 completion 直接归零** |
+| `final` | 最终加权项 | 归入对应 bucket，按桶内通过比例 x 权重计算得分 |
+| `per_turn` | 每轮加权项 | 评分逻辑与 final 一致，语义上提示 evaluator 每轮都检查 |
+
+#### Scoring 评分机制
+
+评分公式：
+
+```
+completion = (所有gate的乘积) x SUM[ bucket权重 x (桶内通过数 / 桶内总数) ]
+```
+
+示例（3 gate + 4 桶）：
+
+```
+G1=1, G2=1, G3=0  -->  completion = 0（gate 一票否决）
+
+G1=1, G2=1, G3=1 的情况下：
+  correctness(w=0.6): C1=1, C2=1, C3=0  --> 0.6 x 2/3 = 0.4
+  provenance(w=0.2):  P1=1              --> 0.2 x 1/1 = 0.2
+  process(w=0.2):     PT1=1, PT2=0      --> 0.2 x 1/2 = 0.1
+  --> completion = 0.4 + 0.2 + 0.1 = 0.7
+```
+
+空桶（`rubric_ids` 为空）不参与归一化。
+
+#### oracle_ref（可选）
+
+指向 ground-truth JSON 文件（相对于 `user_dir.path`），内容会注入 evaluator prompt 供 `oracle_cmp` 类 rubric 比对：
+
+```json
+{
+  "derived": {
+    "mean_wage": 8060.0,
+    "r_edu_wage": 0.9483,
+    "edu_wage_significant_at_05": true
+  }
+}
+```
+
+#### 配置示例
+
+| 配置文件 | 场景 | rubric 方式 |
+|----------|------|------------|
+| `configs/config_simple_eval.json` | 快排算法题，快速验证 | `rubrics_ref` 引用 `simple_eval_rubrics.json` |
+| `configs/config_evaluator.json` | 经济中心问答，内联 rubrics | 内联 `rubrics` 字符串 |
+| `configs/config_eval.json` | 科研数据分析，完整评估 | `rubrics_ref` + `scoring_ref` + `oracle_ref` |
+
+#### 测试
+
+```bash
+# Scorer 纯逻辑测试（不调 API）
+python test/test_evaluator.py --mode scorer
+
+# 端到端测试（调 evaluator 模型 API）
+python test/test_evaluator_e2e.py --mock-reply good
+python test/test_evaluator_e2e.py --mock-reply bad
+```
+
+#### 日志
+
+每次评估落盘到 `logs/evaluator_use.log`（JSON lines），包含：
+- rubric 逐条 0/1 结果、evidence 引证
+- Scorer 算出的 completion / gate_status / bucket_scores
+- 投喂窗口范围（window_turns）、prompt 字符数
+- 轨迹落盘到 `logs/trajectories/{run_id}/{session_name}.json`
+
+#### 设计要点
+
+- **持久 agent + 每轮 reset 会话**：同一 query 各轮复用同一 evaluator agent，但每次评估前 reset 清空会话防判词自我锚定
+- **有界压缩投喂**：每次只投 `origin_query + rubrics + 最近 eval_step 轮 + 产物指针`，不投全量历史
+- **completion 由 Scorer 算出**（确定性聚合），不信任模型自报的 completion 值
+- **文件隔离**：执行前删除 oracle/rubrics（防 agent 作弊），执行后还原
 
 ## 变量替换
 
