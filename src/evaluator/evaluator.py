@@ -253,6 +253,11 @@ class EvaluationResult(BaseModel):
         default_factory=list, description="逐条 rubric 质检结果(0/1);无冻结 rubric 时为空"
     )
     reason: str = Field("", description="总体理由")
+    task_declared_complete: bool = Field(
+        True,
+        description="前置检测:actor 本轮是否声明/呈现已交付姿态(判姿态不判对错)。"
+                    "默认 True → 缺省即按现状回流,向后兼容;False=执行中,本轮反馈不回流 simulator",
+    )
 
     # Scorer 注入(非模型输出;默认空,evaluate_turn 中据 rubric_checks 算出后覆盖)
     bucket_scores: dict = Field(default_factory=dict, description="分桶得分(Scorer 算出)")
@@ -274,6 +279,14 @@ DEFAULT_EVAL_PROMPT = """你是一个独立、严格的任务评估专家(Evalua
 - **`tool_calls` 为空 MUST NOT 据以推断 agent"未调用工具 / 硬编码 / 造假"**——它常因采集缺口(服务端自主 agent 的工具步骤未被采到)而为空,应与 `evidence_incomplete` 同等对待。判"声称与证据矛盾"必须以可确证反证(磁盘真相 / oracle 冲突)为据,绝不能仅凭"无 tool_calls 记录"。
 - 标注为"证据不完整(evidence_incomplete)/核验受阻"的项,MUST NOT 当作负面证据判 agent 未达成(避免冤枉 harness 掉线)。
 - 每条关键判断都要在 citations 里引用轨迹中的**具体语句、工具返回或文件内容**作为依据。
+
+前置检测(评估的第一步,只判姿态、不判对错):
+- 先判断执行 agent 在**最新一轮**处于哪种姿态,填入 `task_declared_complete`:
+  - 执行中(false):明确表示尚未做完("接下来/我先/正在/下一步/稍后")、只给了阶段性进展、
+    在向用户提问以继续、或只覆盖了任务的一部分。
+  - 已交付(true):给出针对 Origin Query 的完整答复或最终产物且无"还要继续"的信号,或明确声明任务已完成。
+- 判定纪律:本步**只看姿态/意图,绝不判对错**——答复内容看着对或不对都不影响它;是否真正达标由 rubric 逐条核验单独决定。
+- "松进严出":仅当存在**明确的"执行中"信号**时才判 false;其余一切情况(含看起来完整的最终答复、以及模棱两可)一律判 true——宁可多评一次,绝不漏评真正的终轮。
 
 工作区纪律(评估期间 MUST 严守):
 - **禁止新增/创建任何文件**——核验时不得在你的工作区生成临时文件、脚本或任何中间产物。

@@ -11,6 +11,10 @@
 【最近 {window} 轮证据】
 {recent_evidence}{generated_files_section}{rubric_section}
 
+【前置检测输出】
+先据最新一轮姿态设置 task_declared_complete：执行中(尚未交付)→ false；已交付或模棱两可 → true。
+只判姿态、不判对错；仅在有明确"执行中"信号时才判 false，其余一律 true。
+
 <!-- @section generated_files -->
 【产物文件指针 (review_subdir={review_subdir})】
 {generated_file_lines}

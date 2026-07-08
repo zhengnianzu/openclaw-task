@@ -155,6 +155,65 @@ def test_config_parsing():
 
 
 # ============================================================================
+# Test 2b: 前置检测门控 process_turn(执行中不回流,已交付回流)
+# ============================================================================
+
+def test_feedback_gating():
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+
+    import src.executor as executor
+
+    print("=" * 60)
+    print("Test 2b: 前置检测门控 process_turn")
+    print("=" * 60)
+
+    # 向后兼容:模型漏填字段时默认 True(照常回流)
+    ev_default = EvaluationResult(completion=0.5, inclination="uncertain")
+    assert ev_default.task_declared_complete is True, "默认应为 True(向后兼容)"
+    print("  默认 task_declared_complete=True ✓")
+
+    def _run(ev_returned: EvaluationResult):
+        """驱动一次 process_turn,返回其 evaluator_feedback。"""
+        fake_cfg = SimpleNamespace(
+            eval_step=1, agent_name="evaluator",
+            rubric_items=lambda: [],
+        )
+        fake_eval = SimpleNamespace(
+            config=fake_cfg,
+            to_simulator=True,
+            evaluate_turn=AsyncMock(return_value=ev_returned),
+            format_feedback=lambda ev: "FEEDBACK",
+        )
+        traj = SimpleNamespace(turns=[], evaluations=[])
+        query = SimpleNamespace(agent_name="tester")
+        with patch.object(executor, "build_turn_record", return_value=SimpleNamespace(turn=1)), \
+             patch.object(executor, "capture_file_evidence", new=AsyncMock(return_value=None)):
+            return asyncio.run(executor.process_turn(
+                client=None, query=query, turn=1, current_query="q",
+                result=SimpleNamespace(content="a"), evidence_incomplete=False,
+                trajectory=traj, evaluator=fake_eval, agent=None, before_history=None,
+            )), traj
+
+    # 执行中 → 不回流(返回 None),但评估仍落盘到 trajectory.evaluations
+    ev_incomplete = EvaluationResult(completion=0.0, inclination="reject", task_declared_complete=False)
+    fb, traj = _run(ev_incomplete)
+    assert fb is None, f"执行中应不回流,实际: {fb!r}"
+    assert len(traj.evaluations) == 1, "评估仍应落盘(门控只作用于回流)"
+    print("  执行中 task_declared_complete=False → 不回流(None)且仍落盘 ✓")
+
+    # 已交付 → 正常回流
+    ev_complete = EvaluationResult(completion=0.8, inclination="accept", task_declared_complete=True)
+    fb, traj = _run(ev_complete)
+    assert fb == "FEEDBACK", f"已交付应回流,实际: {fb!r}"
+    assert len(traj.evaluations) == 1
+    print("  已交付 task_declared_complete=True → 正常回流 ✓")
+
+    print("\n✅ 前置检测门控测试通过\n")
+
+
+# ============================================================================
 # Test 3: 调 API 测试端到端评估
 # ============================================================================
 
@@ -265,16 +324,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="测试 Evaluator")
     parser.add_argument("--proxy-config", default=DEFAULT_PROXY_CONFIG,
                         help=f"user_proxy_model.json 路径（默认: {DEFAULT_PROXY_CONFIG}）")
-    parser.add_argument("--mode", default="all", choices=["all", "scorer", "config", "api"],
-                        help="测试模式: all/scorer/config/api")
+    parser.add_argument("--mode", default="all", choices=["all", "scorer", "config", "gating", "api"],
+                        help="测试模式: all/scorer/config/gating/api")
     args = parser.parse_args()
 
-    modes = [args.mode] if args.mode != "all" else ["scorer", "config", "api"]
+    modes = [args.mode] if args.mode != "all" else ["scorer", "config", "gating", "api"]
 
     if "scorer" in modes:
         test_scorer()
     if "config" in modes:
         test_config_parsing()
+    if "gating" in modes:
+        test_feedback_gating()
     if "api" in modes:
         test_api_evaluation(args.proxy_config)
 
