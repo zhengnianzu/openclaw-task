@@ -492,16 +492,9 @@ class OpenclawAgentManager:
     async def setup_agent(self, agent_config) -> None:
         agent_name = agent_config.name
         override = self.agent_overrides.get(agent_name)
-        if override:
-            warn_agent_model_conflict(agent_name, agent_config.model, override)
-        if agent_config.model:
-            logger.info("设置 Agent: %s | model=%s", agent_name, agent_config.model)
-        else:
-            logger.info("设置 Agent: %s", agent_name)
+        logger.info("设置 Agent: %s", agent_name)
 
-        # 预设Agent:evaluator
         existing_ids = {a.agent_id for a in await self.client.list_agents()}
-
         if agent_name not in existing_ids:
             workspace = self.workspace_manager.get_agent_workspace(agent_name)
             await self.client.create_agent(
@@ -514,12 +507,9 @@ class OpenclawAgentManager:
             logger.info("创建新 Agent: %s,等待 gateway 重启就绪...", agent_name)
             await self._wait_gateway_ready()
 
-        # 钉死模型:agents.create 不下发模型,改用 agents.update 下发(网关侧
-        # baseUrl/apiKey 整份回写被拒,只能网关侧 `config.models.providers.*` 配)。
-        # override.resolved_model(provider/model) 优先;否则用 agent_config.model。
-        model = (override.resolved_model if override and override.model else agent_config.model)
-        if model:
-            await self._pin_model(agent_name, model, has_endpoint_info=bool(override))
+        # 命中 override 才 pin;否则走 openclaw.json 默认配置
+        if override and override.model:
+            await self._pin_model(agent_name, override.resolved_model, has_endpoint_info=True)
 
     async def _pin_model(
         self,

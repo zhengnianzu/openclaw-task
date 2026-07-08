@@ -40,6 +40,7 @@ class ClaudecodeError(RuntimeError):
     """Claude Code SDK 调用失败 (含底层 ClaudeSDKError / 超时 / 空响应)。"""
 
 
+
 # ============================================================================
 # 数据结构
 # ============================================================================
@@ -169,42 +170,29 @@ class ClaudecodeAgent:
         if self._sdk is None:
             return
         sdk = self._sdk
-        # 先清引用,避免万一 disconnect 半截抛错后重复进入
         self._sdk = None
-        async def _disconnect_isolated() -> None:
-            try:
-                await sdk.disconnect()
-            except BaseException as e:
-                # 在隔离 task 内部静默吞;调用方拿 task.exception() 也行
-                logger.debug(
-                    "ClaudeSDKClient.disconnect 异常 (隔离 task 内,忽略): %s: %s",
-                    type(e).__name__, e,
-                )
+        await self._force_kill_subprocess(sdk)
 
-        task = asyncio.create_task(
-            _disconnect_isolated(),
-            name=f"claudecode-disconnect-{self.agent_name}-{self.session_name}",
-        )
+    async def _force_kill_subprocess(self, sdk: ClaudeSDKClient) -> None:
+        """SIGKILL CLI 子进程,3s 内等回收,否则交给 OS。"""
         try:
-            # 给隔离 task 一个合理的超时,避免 shutdown 阶段被卡死
-            await asyncio.wait_for(task, timeout=10.0)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "ClaudeSDKClient.disconnect 超时 (agent=%s session=%s),放弃等待 — "
-                "子进程由 OS 兜底回收",
-                self.agent_name, self.session_name,
-            )
-            task.cancel()
-            # 给 cancel 一个 tick 让它生效,但不再 await(避免再次撞 scope)
+            transport = getattr(sdk, "_transport", None)
+            proc = getattr(transport, "_process", None) if transport else None
+            if proc is None or getattr(proc, "returncode", None) is not None:
+                return
             try:
-                await asyncio.sleep(0)
-            except BaseException:
-                pass
-        except BaseException as e:
-            logger.debug(
-                "等待 disconnect task 异常 (忽略): %s: %s",
-                type(e).__name__, e,
-            )
+                proc.kill()
+            except ProcessLookupError:
+                return
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "kill 兜底:proc.wait 仍未返回 (agent=%s),交给 OS",
+                    self.agent_name,
+                )
+        except BaseException as e:  # noqa: BLE001
+            logger.debug("kill 异常 (忽略): %s: %s", type(e).__name__, e)
 
     async def execute(
         self,
@@ -349,7 +337,7 @@ class ClaudecodeClient:
         await self.close()
 
     async def close(self) -> None:
-        # 逐个关闭 agent,不让单个 close 抛出的异常打断其他 agent 的清理
+        """逐个关闭所有 agent(单个失败不打断其他)。"""
         for ag in list(self._agents.values()):
             try:
                 await ag.close()
@@ -357,22 +345,10 @@ class ClaudecodeClient:
                 raise
             except BaseException as e:
                 logger.debug(
-                    "Agent.close 异常 (shutdown 噪音,忽略): agent=%s session=%s %s: %s",
+                    "Agent.close 异常 (忽略): agent=%s session=%s %s: %s",
                     ag.agent_name, ag.session_name, type(e).__name__, e,
                 )
         self._agents.clear()
-
-        # ─── 给 SDK 内部的 subprocess transport 一次同步清理机会 ────────
-        # claude_agent_sdk 起的 anyio subprocess 在 disconnect 后,底层
-        # asyncio.BaseSubprocessTransport 还要靠 __del__ 关闭 stdin/stdout pipe;
-        # 如果不给 loop 一个机会跑完这些 call_soon 回调,等 asyncio.run() 关掉
-        # loop 之后再 GC 到 transport,__del__ 里会抛 "Event loop is closed"。
-        # 这里主动 yield 几次,让残留 call_soon 立刻被消费掉。
-        try:
-            for _ in range(3):
-                await asyncio.sleep(0)
-        except BaseException:
-            pass
 
     def register_agent_defaults(
         self,

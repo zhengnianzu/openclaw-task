@@ -143,7 +143,7 @@ class HarnessAutomation:
         if self.harness_type == "hermes":
             from src.hermes_client import HermesWorkspaceManager
             self.workspace_manager = HermesWorkspaceManager("~/.hermes")
-        elif self.harness_type == "claudecode":
+        elif self.harness_type == "claude-code":
             from src.claudecode_client import ClaudecodeWorkspaceManager
             self.workspace_manager = ClaudecodeWorkspaceManager("~/.claude/workspace")
         else:
