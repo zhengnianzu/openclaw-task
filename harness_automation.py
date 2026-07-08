@@ -158,7 +158,7 @@ class HarnessAutomation:
 
         if self.harness_type == "hermes":
             return await self._run_hermes()
-        elif self.harness_type == "claudecode":
+        elif self.harness_type == "claude-code":
             return await self._run_claudecode()
         else:
             return await self._run_openclaw()
