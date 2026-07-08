@@ -244,7 +244,10 @@ class RubricCheck(BaseModel):
 
 class EvaluationResult(BaseModel):
     """evaluator 的结构化裁决。completion 由 Scorer 算出(非模型自报)。"""
-    completion: float = Field(..., description="任务完成度 0~1(非百分制);最终由 Scorer 覆盖")
+    completion: Optional[float] = Field(
+        None,
+        description="任务完成度 0~1(非百分制);None=未评估(执行中/无 rubric);已交付时由 Scorer 覆盖",
+    )
     inclination: str = Field(..., description="整体倾向:accept(可放行)/reject(应继续)/uncertain")
     improvements: list[str] = Field(default_factory=list, description="改进点")
     violations: list[str] = Field(default_factory=list, description="不符合要求项")
@@ -435,10 +438,12 @@ class Evaluator:
             self._log(trajectory, current_turn, None, error=str(e), window=window, prompt_chars=prompt_chars)
             return None
 
-        # 确定性归一:无冻结 rubric 时强制清空 rubric_checks,兜住模型自拟准则的幻觉。
+        # 确定性归一:无冻结 rubric、或本轮执行中(未交付)时,不评分——强制清空 rubric_checks
+        # 且 completion=None(未评估,区别于"评估后判 0")。兜住模型自拟准则/未交付仍评分的幻觉。
         # 仅归一、不判负/不重试,且置于落盘之前以保证评估日志干净。
-        if not rubric:
+        if not rubric or not result.task_declared_complete:
             result.rubric_checks = []
+            result.completion = None
         else:
             # 二值化聚合:从逐条 0/1 判定算出 completion(覆盖模型自报值)。
             # checks 按 rubric_id 关联;模型漏填 id 时按顺序回填,缺失项由 Scorer 视为 0。
@@ -485,7 +490,8 @@ class Evaluator:
         未满足项/改进点/引证,**故意不渲染** `ev.rubric_checks`——逐条 rubric
         结果(含准则原文)只进评估日志,不回流 simulator。
         """
-        lines = [f"完成度: {ev.completion} ｜ 倾向: {ev.inclination}"]
+        completion_str = "未评估" if ev.completion is None else str(ev.completion)
+        lines = [f"完成度: {completion_str} ｜ 倾向: {ev.inclination}"]
         if ev.violations:
             lines.append("不符合要求项:\n- " + "\n- ".join(ev.violations))
         if ev.improvements:

@@ -214,6 +214,67 @@ def test_feedback_gating():
 
 
 # ============================================================================
+# Test 2c: 未完成时跳过 rubric 评分(completion=None)
+# ============================================================================
+
+def test_skip_scoring():
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from src.evaluator.evaluator import Evaluator, EvaluateConfig
+    from src.evaluator.trajectory import Trajectory, TurnRecord
+
+    print("=" * 60)
+    print("Test 2c: 未完成时跳过 rubric 评分")
+    print("=" * 60)
+
+    cfg = EvaluateConfig(agent_name="evaluator", to_simulator=True)
+    cfg.structured_rubrics = MOCK_RUBRICS  # R1 gate, R2/R3 final
+    cfg.resolve_runtime()
+
+    traj = Trajectory(query="Q", agent_name="tester", turns=[])
+    turn = TurnRecord(turn=1, user_input="Q", agent_content="...")
+    traj.turns.append(turn)
+
+    def make_eval(reply_json: str) -> Evaluator:
+        fake_agent = SimpleNamespace(
+            session_key="k",
+            execute=AsyncMock(return_value=SimpleNamespace(content=reply_json)),
+        )
+        client = SimpleNamespace(gateway=None)  # 短路 reset/push_review
+        return Evaluator(cfg, client, run_id="t", session_name="s",
+                         get_agent_fn=lambda a, s: fake_agent)
+
+    # 执行中:模型即使填了 rubric_checks,也应被清空、completion=None(不调 Scorer)
+    reply_incomplete = json.dumps({
+        "completion": 0.0, "inclination": "reject", "task_declared_complete": False,
+        "rubric_checks": [{"rubric_id": "R1", "criterion": "x", "passed": 1}],
+    })
+    res = asyncio.run(make_eval(reply_incomplete).evaluate_turn(traj, turn, rubric=MOCK_RUBRICS, window=1))
+    assert res is not None
+    assert res.completion is None, f"执行中 completion 应为 None,实际 {res.completion!r}"
+    assert res.rubric_checks == [], f"执行中 rubric_checks 应清空,实际 {res.rubric_checks}"
+    print("  执行中 task_declared_complete=False → completion=None, rubric_checks=[] ✓")
+
+    # 已交付:全过 → Scorer 正常算分(float 1.0)
+    reply_complete = json.dumps({
+        "completion": 0.0, "inclination": "accept", "task_declared_complete": True,
+        "rubric_checks": [
+            {"rubric_id": "R1", "criterion": "x", "passed": 1},
+            {"rubric_id": "R2", "criterion": "y", "passed": 1},
+            {"rubric_id": "R3", "criterion": "z", "passed": 1},
+        ],
+    })
+    res = asyncio.run(make_eval(reply_complete).evaluate_turn(traj, turn, rubric=MOCK_RUBRICS, window=1))
+    assert isinstance(res.completion, float), f"已交付 completion 应为 float,实际 {res.completion!r}"
+    assert res.completion == 1.0, f"全过应为 1.0,实际 {res.completion}"
+    print(f"  已交付 task_declared_complete=True → completion={res.completion} (float) ✓")
+
+    print("\n✅ 跳过评分测试通过\n")
+
+
+# ============================================================================
 # Test 3: 调 API 测试端到端评估
 # ============================================================================
 
@@ -324,11 +385,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="测试 Evaluator")
     parser.add_argument("--proxy-config", default=DEFAULT_PROXY_CONFIG,
                         help=f"user_proxy_model.json 路径（默认: {DEFAULT_PROXY_CONFIG}）")
-    parser.add_argument("--mode", default="all", choices=["all", "scorer", "config", "gating", "api"],
-                        help="测试模式: all/scorer/config/gating/api")
+    parser.add_argument("--mode", default="all", choices=["all", "scorer", "config", "gating", "skip", "api"],
+                        help="测试模式: all/scorer/config/gating/skip/api")
     args = parser.parse_args()
 
-    modes = [args.mode] if args.mode != "all" else ["scorer", "config", "gating", "api"]
+    modes = [args.mode] if args.mode != "all" else ["scorer", "config", "gating", "skip", "api"]
 
     if "scorer" in modes:
         test_scorer()
@@ -336,6 +397,8 @@ if __name__ == "__main__":
         test_config_parsing()
     if "gating" in modes:
         test_feedback_gating()
+    if "skip" in modes:
+        test_skip_scoring()
     if "api" in modes:
         test_api_evaluation(args.proxy_config)
 
