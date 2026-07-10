@@ -304,12 +304,34 @@ class HermesAgent:
                 "agent=%s 应用 simulator_config 覆盖: model=%r base_url=%r",
                 self.agent_name, ov.model, ov.base_url,
             )
+
+        # 显式绑定 SessionDB 到 profile 目录
+        if self.hermes_home is not None:
+            try:
+                sys.path.insert(0, _hermes_agent_root())
+                from hermes_state import SessionDB
+                ctor_kwargs["session_db"] = SessionDB(
+                    db_path=self.hermes_home / "state.db",
+                )
+            except Exception as e:
+                logger.warning(
+                    "SessionDB 构造失败 (agent=%s, state.db 不落盘): %s",
+                    self.agent_name, e,
+                )
+
         try:
             self._agent = AIAgent(**ctor_kwargs)
         except Exception as e:
             raise HermesError(
                 f"AIAgent 初始化失败 (检查 ~/.hermes/config.yaml 的 model 段): {e}"
             ) from e
+
+        # per-session JSON snapshot
+        try:
+            self._agent._session_json_enabled = True
+        except Exception as e:
+            logger.debug("启用 session snapshot 失败 (忽略): %s", e)
+
         logger.debug(
             "AIAgent created for agent=%s session=%s hermes_home=%s "
             "(model=%r provider=%r base_url=%r)",
@@ -518,11 +540,6 @@ class HermesWorkspaceManager(BaseWorkspaceManager):
         self._ensured: set = set()
 
     def get_agent_workspace(self, agent_name: str) -> Path:
-        if agent_name == "main":
-            workspace = self.base_dir
-            self._ensured.add("main")
-            return workspace
-
         profiles = _import_hermes_profiles()
         canon = profiles.normalize_profile_name(agent_name)
         if canon == "default":
