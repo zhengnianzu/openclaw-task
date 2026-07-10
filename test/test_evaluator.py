@@ -32,6 +32,7 @@ from src.evaluator.evaluator import (
     RubricCheck,
     Scorer,
     ScoringSpec,
+    _model_facing_schema,
     _parse_json_as,
 )
 
@@ -275,6 +276,46 @@ def test_skip_scoring():
 
 
 # ============================================================================
+# Test 2d: 发给模型的 schema 将 completion 列为必填,但解析层仍宽容
+# ============================================================================
+
+def test_completion_schema():
+    print("=" * 60)
+    print("Test 2d: completion 必填(model-facing) + 解析宽容")
+    print("=" * 60)
+
+    # 发给模型的 schema:completion 进 required
+    schema = _model_facing_schema()
+    assert "completion" in schema.get("required", []), \
+        f"completion 应在 model-facing schema 的 required 中,实际 {schema.get('required')}"
+    print("  model-facing schema.required 含 completion ✓")
+
+    # 但不污染 Pydantic 模型本身的 schema(EvaluationResult 仍以 inclination 为唯一必填)
+    base_required = EvaluationResult.model_json_schema().get("required", [])
+    assert "completion" not in base_required, \
+        f"EvaluationResult 模型本身不应把 completion 列为必填,实际 {base_required}"
+    print("  EvaluationResult 模型本身仍不强制 completion(仅 model-facing 加) ✓")
+
+    # 解析层宽容:模型漏吐 completion 时,降级为 None、不抛异常
+    reply_missing = json.dumps({
+        "inclination": "reject",
+        "task_declared_complete": True,
+        "rubric_checks": [{"rubric_id": "R1", "criterion": "x", "passed": 1}],
+    })
+    parsed = _parse_json_as(reply_missing, EvaluationResult)
+    assert parsed.completion is None, f"漏吐时应降级为 None,实际 {parsed.completion!r}"
+    print("  模型漏吐 completion → 解析降级 None,不抛异常 ✓")
+
+    # 字段说明不含权威归属元话术(不应把"由 Scorer 覆盖"发给模型)
+    desc = EvaluationResult.model_fields["completion"].description or ""
+    assert "Scorer" not in desc and "覆盖" not in desc, \
+        f"completion 字段说明不应含权威归属元话术,实际: {desc}"
+    print("  completion 字段说明为纯输出指令(无'由 Scorer 覆盖'话术) ✓")
+
+    print("\n✅ completion schema 测试通过\n")
+
+
+# ============================================================================
 # Test 3: 调 API 测试端到端评估
 # ============================================================================
 
@@ -385,11 +426,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="测试 Evaluator")
     parser.add_argument("--proxy-config", default=DEFAULT_PROXY_CONFIG,
                         help=f"user_proxy_model.json 路径（默认: {DEFAULT_PROXY_CONFIG}）")
-    parser.add_argument("--mode", default="all", choices=["all", "scorer", "config", "gating", "skip", "api"],
-                        help="测试模式: all/scorer/config/gating/skip/api")
+    parser.add_argument("--mode", default="all", choices=["all", "scorer", "config", "gating", "skip", "schema", "api"],
+                        help="测试模式: all/scorer/config/gating/skip/schema/api")
     args = parser.parse_args()
 
-    modes = [args.mode] if args.mode != "all" else ["scorer", "config", "gating", "skip", "api"]
+    modes = [args.mode] if args.mode != "all" else ["scorer", "config", "gating", "skip", "schema", "api"]
 
     if "scorer" in modes:
         test_scorer()
@@ -399,6 +440,8 @@ if __name__ == "__main__":
         test_feedback_gating()
     if "skip" in modes:
         test_skip_scoring()
+    if "schema" in modes:
+        test_completion_schema()
     if "api" in modes:
         test_api_evaluation(args.proxy_config)
 

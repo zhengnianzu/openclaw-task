@@ -246,7 +246,7 @@ class EvaluationResult(BaseModel):
     """evaluator 的结构化裁决。completion 由 Scorer 算出(非模型自报)。"""
     completion: Optional[float] = Field(
         None,
-        description="任务完成度 0~1(非百分制);None=未评估(执行中/无 rubric);已交付时由 Scorer 覆盖",
+        description="任务完成度,取值 0~1(非百分制)。MUST 输出该字段:做了 rubric 逐条校验则填 0~1 的数值,未做(执行中/无 rubric)则填 null;任何情况不得省略。",
     )
     inclination: str = Field(..., description="整体倾向:accept(可放行)/reject(应继续)/uncertain")
     improvements: list[str] = Field(default_factory=list, description="改进点")
@@ -265,6 +265,20 @@ class EvaluationResult(BaseModel):
     # Scorer 注入(非模型输出;默认空,evaluate_turn 中据 rubric_checks 算出后覆盖)
     bucket_scores: dict = Field(default_factory=dict, description="分桶得分(Scorer 算出)")
     gate_status: dict = Field(default_factory=dict, description="各 gate 项 0/1 状态(Scorer 算出)")
+
+
+def _model_facing_schema() -> dict:
+    """构造发给模型的 EvaluationResult JSON schema。
+
+    把 completion 补入 required,确保模型每次都吐该字段(呈现契约:做校验→数字、
+    未做→null;字段恒在)。仅改 model-facing schema,不动 EvaluationResult 模型本身——
+    模型偶发漏吐时解析仍宽容降级为 None(见 evaluate_turn 与 _parse_json_as),不抛异常。
+    """
+    schema = EvaluationResult.model_json_schema()
+    required = schema.setdefault("required", [])
+    if "completion" not in required:
+        required.append("completion")
+    return schema
 
 
 # 内置默认评估提示词(evaluator 的角色/铁律/工作区纪律)。写死在此处;
@@ -426,10 +440,10 @@ class Evaluator:
         prompt_chars = len(prompt)  # token 代理量,供 eval_step 实验对比开销
 
         try:
-            # 直接复用各 client 的 agent.execute:追加 schema 后缀 → 解析 JSON
+            # 直接复用各 client 的 agent.execute:追加 schema 后缀 → 解析 JSON。
             schema_suffix = (
                 f"\n\nRespond with valid JSON matching this schema:\n"
-                f"```json\n{json.dumps(EvaluationResult.model_json_schema(), indent=2)}\n```"
+                f"```json\n{json.dumps(_model_facing_schema(), indent=2)}\n```"
             )
             resp = await eval_agent.execute(prompt + schema_suffix)
             result = _parse_json_as(resp.content, EvaluationResult)

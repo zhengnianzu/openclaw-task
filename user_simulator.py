@@ -47,6 +47,9 @@ class User_simulator:
         self._user_profile = user_profile
         self._user_directory = user_directory
         self._current_origin_query = origin_query
+        # 当前时间:__init__ 取一次并缓存,整场会话复用(见 design D5)。
+        # 供 simulator 判定/追问涉及时间相对语义(最近/今年/本周等)时以此为"现在"。
+        self._current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.model = model
         self.messages: list[dict] = []  # 记录对话历史，用于拼入 system prompt
         self.client = OpenAI(
@@ -66,6 +69,7 @@ class User_simulator:
             .replace("{origin_query}", origin_query)
             .replace("{user_profile}", self._user_profile)
             .replace("{user_directory}", self._user_directory)
+            .replace("{current_time}", self._current_time)
             .replace("{conversation_history}", conversation_history)
             .replace("{evaluator_feedback}", evaluator_feedback or "（本轮无第三方评估）")
         )
