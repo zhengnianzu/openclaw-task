@@ -505,14 +505,26 @@ class Evaluator:
     # ------------------------------------------------------------------ #
 
     async def _reset_session(self, eval_agent: Any) -> None:
-        """评估前清空 evaluator 会话(防判词锚定)。失败则降级继续(不阻断任务)。"""
+        """评估前清空 evaluator 会话(防判词锚定)。失败则降级继续(不阻断任务)。
+
+        - gateway harness(openclaw):调 gateway.sessions_reset 重置服务端会话。
+        - 非 gateway harness(hermes/claudecode/openwebui):回退到 agent 自身的
+          reset()(清空本地历史 / 重连子进程),保证每轮 evaluator 都是全新上下文。
+        """
         gateway = getattr(self.client, "gateway", None)
-        if gateway is None:
+        if gateway is not None:
+            try:
+                await gateway.sessions_reset(eval_agent.session_key)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("evaluator 会话 reset 失败(降级继续): %s", e)
             return
-        try:
-            await gateway.sessions_reset(eval_agent.session_key)
-        except Exception as e:  # noqa: BLE001
-            logger.debug("evaluator 会话 reset 失败(降级继续): %s", e)
+
+        agent_reset = getattr(eval_agent, "reset", None)
+        if agent_reset is not None:
+            try:
+                await agent_reset()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("evaluator agent.reset 失败(降级继续): %s", e)
 
     async def _push_review_files(self, turn: TurnRecord) -> None:
         gateway = getattr(self.client, "gateway", None)

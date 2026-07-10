@@ -2,6 +2,8 @@
 一个强大的、配置驱动的自动化系统，用于编排和执行 AI Agent 任务。支持多 Agent 协作、工作空间管理、结果传递等功能。目前支持框架如下：
 - OpenClaw
 - Hermes
+- ClaudeCode
+- Open WebUI
 
 ## OpenClaw 
 > 基于 openclaw-sdk 的配置驱动任务编排框架
@@ -17,6 +19,13 @@
 > 基于 `claude_agent_sdk` 的进程内 harness — 直接复用官方 `ClaudeSDKClient` / `ClaudeAgentOptions` / `query()`等。
 | `from claude_agent_sdk import ClaudeSDKClient` | 需要 `claude` CLI 已安装 (`claude --version`) |
 详见 `src/claudecode_client.py`。
+
+## Open WebUI
+> 通过 open-webui 的 OpenAI 兼容接口 (`POST /api/chat/completions`, `Authorization: Bearer sk-...`) 驱动被测模型。
+| HTTP → `httpx` | 需要 open-webui 服务已运行、已接模型并生成了 API key |
+连接参数 (`base_url` / `api_key` / `model`) 从 `simulator_config` 中被测 agent 的条目取,
+或回退环境变量 `OPENWEBUI_BASE_URL` / `OPENWEBUI_API_KEY` / `OPENWEBUI_MODEL`;多轮历史由客户端本地累积。
+详见 `src/openwebui_client.py`。
 
 ## 特性
 
@@ -126,6 +135,7 @@ python hermes_automation.py   --config configs/config_simple.json
 | **OpenClaw** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
 | **Hermes** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
 | **ClaudeCode** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
+| **Open WebUI** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
 
 ### 运行方式
 
@@ -144,6 +154,11 @@ python harness_automation.py --harness hermes --config configs/config_simple_eva
 python harness_automation.py --harness claudecode --config configs/config_simple.json
 python harness_automation.py --harness claudecode --config configs/config_user.json
 python harness_automation.py --harness claudecode --config configs/config_simple_eval.json
+
+# Open WebUI — 需先启动 open-webui 服务并在 user_proxy_model.json 里给被测 agent 配 base_url/api_key/model
+python harness_automation.py --harness openwebui --config configs/config_openwebui.json
+python harness_automation.py --harness openwebui --config configs/config_user.json
+python harness_automation.py --harness openwebui --config configs/config_simple_eval.json
 ```
 
 ### 三种配置模式
@@ -161,6 +176,7 @@ python harness_automation.py --harness claudecode --config configs/config_simple
 | **OpenClaw** | 网关 `agents_update` | `provider/model`（如 `api-proxy-deepseek/deepseek-v4-flash`） | 必填 |
 | **Hermes** | `AIAgent` 构造参数 | 裸模型名（如 `deepseek-v4-flash`） | 不需要 |
 | **ClaudeCode** | 环境变量 `ANTHROPIC_MODEL` | 裸模型名 | 不需要 |
+| **Open WebUI** | HTTP body `model` 字段 | 裸模型名(open-webui 里注册的模型 id) | 不需要 |
 
 `user_proxy_model.json` 统一调配各 agent 的模型。OpenClaw 场景需要配 `provider` 字段拼接 `provider/model`，其他 harness 忽略该字段：
 

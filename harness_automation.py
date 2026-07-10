@@ -146,6 +146,9 @@ class HarnessAutomation:
         elif self.harness_type == "claude-code":
             from src.claudecode_client import ClaudecodeWorkspaceManager
             self.workspace_manager = ClaudecodeWorkspaceManager("~/.claude/workspace")
+        elif self.harness_type == "openwebui":
+            from src.openwebui_client import OpenwebuiWorkspaceManager
+            self.workspace_manager = OpenwebuiWorkspaceManager("~/.openwebui/workspace")
         else:
             from src.openclaw_client import OpenclawWorkspaceManager
             self.workspace_manager = OpenclawWorkspaceManager("~/.openclaw/workspace")
@@ -160,6 +163,8 @@ class HarnessAutomation:
             return await self._run_hermes()
         elif self.harness_type == "claude-code":
             return await self._run_claudecode()
+        elif self.harness_type == "openwebui":
+            return await self._run_openwebui()
         else:
             return await self._run_openclaw()
 
@@ -299,6 +304,53 @@ class HarnessAutomation:
             )
             return results
 
+    async def _run_openwebui(self) -> Dict[str, Any]:
+        from src.openwebui_client import (
+            build_openwebui_client,
+            OpenwebuiAgentManager,
+            make_openwebui_execute_with_retry,
+            make_openwebui_get_agent,
+        )
+        from src.executor import execute_queries
+
+        legacy_oc = {}
+        if self.config.gateway_ws_url:
+            legacy_oc["gateway_ws_url"] = self.config.gateway_ws_url
+        if self.config.gateway_timeout is not None:
+            legacy_oc["gateway_timeout"] = self.config.gateway_timeout
+        if self.config.api_key:
+            legacy_oc["api_key"] = "<redacted>"
+        if legacy_oc:
+            logger.info(
+                "[跨框架兼容] 接受到 openclaw 风格字段 %s; openwebui 已全部忽略",
+                legacy_oc,
+            )
+
+        async with await build_openwebui_client() as client:
+            self.client = client
+
+            await self._setup_workspaces()
+
+            agent_manager = OpenwebuiAgentManager(client, self.workspace_manager, agent_overrides=self.agent_overrides)
+            for agent_config in self.config.agents:
+                await agent_manager.setup_agent(agent_config)
+
+            simulator_factory = lambda: create_simulator(self.config, self.simulator_model_cfg)
+            agent_system_prompts = {
+                a.name: a.system_prompt for a in self.config.agents if a.system_prompt
+            }
+            results = await execute_queries(
+                queries=self.config.queries,
+                client=client,
+                get_agent_fn=make_openwebui_get_agent(client, workspace_manager=self.workspace_manager),
+                execute_with_retry_fn=make_openwebui_execute_with_retry(client, workspace_manager=self.workspace_manager),
+                simulator_factory=simulator_factory,
+                agent_system_prompts=agent_system_prompts,
+                max_turn=self.config.user_max_turn,
+                run_id=_RUN_ID,
+            )
+            return results
+
     async def _setup_workspaces(self) -> None:
         """设置工作空间"""
         logger.info("设置工作空间...")
@@ -390,7 +442,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--harness",
         default=None,
-        help="harness类型(不指定则使用配置文件中的 harness_type,缺省为 openclaw)"
+        help="harness类型: openclaw / hermes / claudecode / openwebui(不指定则使用配置文件中的 harness_type,缺省为 openclaw)"
     )
 
     args = parser.parse_args()

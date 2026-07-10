@@ -70,7 +70,8 @@ class AgentConfigItem(BaseModel):
     name: str = Field(..., description="Agent 名称")
     config: List[str] = Field(default_factory=list, description="配置文件列表,如 USER.md, SOUL.md")
     skills: List[str] = Field(default_factory=list, description="所需技能列表")
-    system_prompt: Optional[str] = Field(None, description="系统提示词")
+    system_prompt: Optional[str] = Field(None, description="系统提示词(字面文本;优先于 system_prompt_file)")
+    system_prompt_file: Optional[str] = Field(None, description="系统提示词文件路径;system_prompt 为空时读取其内容。支持 ~ 展开,相对路径以 cwd 为基准")
     model: Optional[str] = Field(None, description="使用的模型")
 
 
@@ -138,7 +139,7 @@ class QueryItem(BaseModel):
 
 class AutomationConfig(BaseModel):
     """完整的自动化配置"""
-    harness_type: str = Field("openclaw", description="harness 类型: openclaw 或 hermes")
+    harness_type: str = Field("openclaw", description="harness 类型: openclaw / hermes / claudecode / openwebui")
 
     system: SystemConfig = Field(default_factory=SystemConfig)
     input_dir: InputDirConfig = Field(default_factory=InputDirConfig)
@@ -246,6 +247,26 @@ def _resolve_evaluate_refs(config: "AutomationConfig", user_dir: Optional[Path])
         ev.resolve_runtime()  # 合成 scoring_spec
 
 
+def _resolve_system_prompt_files(config: "AutomationConfig") -> None:
+    """把 agents[].system_prompt_file 读入 system_prompt。
+
+    字面 system_prompt 优先(已设则不覆盖,文件仅作默认);否则读取文件内容。
+    路径支持 ~ 展开,相对路径以 cwd 为基准;文件不存在则显式报错(不静默退空)。
+    """
+    for agent in config.agents:
+        spf = agent.system_prompt_file
+        if not spf or agent.system_prompt:
+            continue
+        p = Path(spf).expanduser()
+        if not p.is_file():
+            raise FileNotFoundError(
+                f"agent '{agent.name}' 的 system_prompt_file 不存在: {p}"
+            )
+        agent.system_prompt = p.read_text(encoding="utf-8")
+        logger.info("agent '%s' system_prompt 取自文件: %s (%d 字)",
+                    agent.name, p, len(agent.system_prompt))
+
+
 class ConfigLoader:
     """配置文件加载器"""
 
@@ -270,6 +291,7 @@ class ConfigLoader:
             data = json.loads(content)
         
         config = AutomationConfig(**data)
+        _resolve_system_prompt_files(config)
         user_dir_path = Path(config.input_dir.user_dir.path) if config.input_dir.user_dir else None
         _resolve_evaluate_refs(config, user_dir_path)
         return config
@@ -277,6 +299,7 @@ class ConfigLoader:
     @staticmethod
     def load_from_dict(data: Dict[str, Any]) -> AutomationConfig:
         config = AutomationConfig(**data)
+        _resolve_system_prompt_files(config)
         user_dir_path = Path(config.input_dir.user_dir.path) if config.input_dir.user_dir else None
         _resolve_evaluate_refs(config, user_dir_path)
         return config

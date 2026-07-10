@@ -1,0 +1,50 @@
+{
+  "harness_type": "openwebui",
+  "system": {
+    "platform": ["windows"],
+    "python": "3.12",
+    "tools": []
+  },
+  "input_dir": {
+    "skill_dir": {},
+    "user_dir": {
+      "path": "configs"
+    }
+  },
+  "agents": [
+    {
+      "name": "main",
+      "config": [],
+      "skills": [],
+      "system_prompt_file": "configs/system_prompt_openwebui.txt"
+    },
+    {
+      "name": "evaluator",
+      "config": [],
+      "skills": [],
+      "system_prompt": null,
+      "model": "api-proxy-deepseek/deepseek-v4-pro"
+    }
+  ],
+  "queries": [
+    {
+      "agent_name": "main",
+      "text": "请解释什么是快速排序算法，给出时间复杂度分析，并用Python写一个实现。",
+      "session_name": "eval_test",
+      "timeout": 600,
+      "use_simulator": true,
+      "evaluate": {
+        "agent_name": "evaluator",
+        "eval_step": 1,
+        "to_simulator": true,
+        "rubrics_ref": "simple_eval_rubrics.json#/rubrics",
+        "scoring_ref": "simple_eval_rubrics.json#/scoring"
+      }
+    }
+  ],
+  "gateway_ws_url": "ws://127.0.0.1:18789/gateway",
+  "gateway_timeout": 600,
+  "workspace_base": "~/.openclaw/workspace",
+  "simulator_config": "configs/user_proxy_model.json",
+  "user_max_turn": 4
+}

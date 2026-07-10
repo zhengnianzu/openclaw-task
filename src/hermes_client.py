@@ -341,6 +341,13 @@ class HermesAgent:
         )
         return self._agent
 
+    async def reset(self) -> None:
+        """清空本地会话历史,使下一次 execute 从全新上下文开始。
+
+        供 evaluator 每轮防判词锚定用(hermes 会话历史全在 self._history)。
+        """
+        self._history = []
+
     async def execute(
         self,
         query: str,

@@ -193,6 +193,14 @@ class ClaudecodeAgent:
         except BaseException as e:  # noqa: BLE001
             logger.debug("kill 异常 (忽略): %s: %s", type(e).__name__, e)
 
+    async def reset(self) -> None:
+        """重置会话:断开当前 SDK 子进程,使下一次 execute 重连出全新会话。
+
+        供 evaluator 每轮防判词锚定用。claudecode 的会话状态由 CLI 子进程持有,
+        close() 后 _ensure_connected 会拉起一个不带 --resume 的新子进程 → 干净上下文。
+        """
+        await self.close()
+
     async def execute(
         self,
         query: str,
