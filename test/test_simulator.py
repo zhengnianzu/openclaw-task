@@ -54,6 +54,42 @@ def test_single_turn(simulator: User_simulator, agent_message: str) -> str:
     return reply
 
 
+def test_render_offline():
+    """离线单测（不调 API）：_render 注入当前时间且占位符被替换。"""
+    import re
+
+    print("=" * 60)
+    print("离线单测: _render 当前时间注入")
+    print("=" * 60)
+
+    simulator = User_simulator(
+        origin_query="测试任务",
+        user_profile="{}",
+        api_key="dummy",  # 不发起请求,仅构造实例
+    )
+
+    # __init__ 缓存了当前时间(YYYY-mm-dd HH:MM:SS)
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", simulator._current_time), \
+        f"当前时间格式异常: {simulator._current_time!r}"
+    print(f"  __init__ 缓存当前时间 = {simulator._current_time} ✓")
+
+    rendered = simulator._render("测试任务", "（暂无对话历史）", "")
+    assert simulator._current_time in rendered, "渲染结果应包含当前时间串"
+    print("  _render 输出含当前时间串 ✓")
+
+    # 无残留占位符(所有 {xxx} 已替换)
+    leftover = re.findall(r"\{[a-z_]+\}", rendered)
+    assert not leftover, f"仍有未替换的占位符: {leftover}"
+    print("  无残留占位符({current_time} 等已替换) ✓")
+
+    # 同一实例多次 _render,时间不变(方案甲:__init__ 缓存复用)
+    rendered2 = simulator._render("测试任务", "（暂无对话历史）", "")
+    assert simulator._current_time in rendered2, "复用时间应稳定"
+    print("  会话内复用同一时间(不每轮现取) ✓")
+
+    print("\n✅ 离线 _render 测试通过\n")
+
+
 def run_test(proxy_config_path: str, profile_path: str, origin_query: str, rounds: int):
     print("=" * 60)
     print("User_simulator 测试")
@@ -107,11 +143,16 @@ if __name__ == "__main__":
                         help="Origin query（默认内置测试任务）")
     parser.add_argument("--rounds", type=int, default=3,
                         help="模拟对话轮数（默认: 3）")
+    parser.add_argument("--mode", default="api", choices=["api", "offline"],
+                        help="测试模式: api(调用 API 多轮) / offline(仅测 _render,不联网)")
     args = parser.parse_args()
 
-    run_test(
-        proxy_config_path=args.proxy_config,
-        profile_path=args.profile,
-        origin_query=args.query,
-        rounds=args.rounds,
-    )
+    if args.mode == "offline":
+        test_render_offline()
+    else:
+        run_test(
+            proxy_config_path=args.proxy_config,
+            profile_path=args.profile,
+            origin_query=args.query,
+            rounds=args.rounds,
+        )
