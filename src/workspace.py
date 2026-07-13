@@ -48,17 +48,17 @@ class BaseWorkspaceManager(ABC):
         skill_base_dir: Optional[str],
         agent_skills: List[str],
         agent_dir: Optional[str] = None,
-        user_dir: Optional[str] = None,
+        content_root: Optional[str] = None,
     ) -> None:
         workspace = self.get_agent_workspace(agent_name)
 
         logger.info("workspace: %s", workspace)
         if skill_base_dir and agent_skills:
             logger.info("skills_dst: %s", workspace / "skills")
-        if user_dir:
+        if content_root:
             logger.info(
-                "user_dir -> workspace: %s -> %s",
-                Path(user_dir).expanduser(),
+                "content_root -> workspace: %s -> %s",
+                Path(content_root).expanduser(),
                 workspace,
             )
 
@@ -80,20 +80,13 @@ class BaseWorkspaceManager(ABC):
                 else:
                     logger.warning("技能目录不存在: %s", src)
 
-        if user_dir:
-            user_path = Path(user_dir).expanduser()
-            logger.debug("check user_path: %s", user_path)
-            if user_path.exists() and user_path.is_dir():
-                content_root = user_path / user_path.name
-
-                if not content_root.exists() or not content_root.is_dir():
-                    logger.warning(
-                        "user_dir content root does not exist or is not a directory: %s",
-                        content_root,
-                    )
-                    return
-
-                for item in content_root.iterdir():
+        if content_root:
+            # content_root 已由上游(UserDirConfig.content_root)解析好,
+            # 此处直接把其下内容复制进 workspace,不再自行推导同名子目录。
+            root_path = Path(content_root).expanduser()
+            logger.debug("check content_root: %s", root_path)
+            if root_path.exists() and root_path.is_dir():
+                for item in root_path.iterdir():
                     item_dst = workspace / item.name
                     if item_dst.exists():
                         if item_dst.is_dir():
@@ -104,9 +97,9 @@ class BaseWorkspaceManager(ABC):
                         shutil.copytree(item, item_dst)
                     else:
                         shutil.copy2(item, item_dst)
-                logger.info("复制用户目录: %s -> %s", content_root, workspace)
+                logger.info("复制用户目录: %s -> %s", root_path, workspace)
             else:
-                logger.warning("用户目录不存在或不是目录: %s", user_path)
+                logger.warning("用户内容目录不存在或不是目录: %s", root_path)
 
     def setup_from_map(self, map_file: str, base_dir: Optional[str] = None) -> None:
         """根据 map.json 按映射逐条复制文件/目录"""

@@ -304,23 +304,23 @@ class HarnessAutomation:
         logger.info("设置工作空间...")
 
         user_dir_config = self.config.input_dir.user_dir
-        user_dir_path: Optional[str] = None
+        content_root_path: Optional[str] = None
 
         if user_dir_config:
-            user_path = Path(user_dir_config.path).expanduser()
-            content_root = user_path / user_path.name
+            # content_root 唯一来源:UserDirConfig.content_root(user_workspace 三档语义)。
+            content_root = user_dir_config.content_root
 
             if not content_root.exists() or not content_root.is_dir():
                 assert not user_dir_config.map_file, (
                     "input_dir.user_dir.map_file must be omitted when "
-                    "user_path / user_path.name does not exist"
+                    "content_root does not exist"
                 )
             elif user_dir_config.map_file:
                 map_path = self._resolve_map_file(user_dir_config.path, user_dir_config.map_file)
                 data_dir = str(content_root)
                 self.workspace_manager.setup_from_map(map_path, base_dir=data_dir)
             else:
-                user_dir_path = user_dir_config.path
+                content_root_path = str(content_root)
 
         for agent_config in self.config.agents:
             self.workspace_manager.setup_agent_files(
@@ -329,7 +329,7 @@ class HarnessAutomation:
                 skill_base_dir=self.config.input_dir.skill_dir,
                 agent_skills=agent_config.skills,
                 agent_dir=self.config.input_dir.agent_dir,
-                user_dir=user_dir_path,
+                content_root=content_root_path,
             )
 
     @staticmethod

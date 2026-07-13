@@ -33,8 +33,28 @@ class SystemConfig(BaseModel):
 class UserDirConfig(BaseModel):
     """用户目录配置"""
     path: str = Field(..., description="用户数据目录路径")
+    user_workspace: Optional[str] = Field(
+        None,
+        description=(
+            "workspace 内容所在子目录名(仅子目录名,不支持相对多级/绝对路径)。"
+            "三档语义:未设置(None)→回退同名目录 path/<basename> 保持兼容;"
+            "具体名如 'ws'→path/ws;空字符串 ''→path 本身(拍平嵌套)"
+        ),
+    )
     map_file: Optional[str] = Field(None, description="映射文件名(相对于 path),如 'MAP_Linux',自动补 .json 后缀")
     profile_file: Optional[str] = Field(None, description="用户画像 JSON 文件名(相对于 path),如 'profile_analyzed.json'")
+
+    @property
+    def content_root(self) -> Path:
+        """workspace 内容来源目录。是「同名目录」硬编码约定的唯一收敛点。
+
+        用 `is None` 区分「未设置」与空字符串:空串是有意义的一档(拍平到 path),
+        真值判断(如 `or`)会把 '' 误并入未设置分支。
+        Path(base) / '' == Path(base),空串天然得到 content_root == path。
+        """
+        base = Path(self.path).expanduser()
+        sub = base.name if self.user_workspace is None else self.user_workspace
+        return base / sub
 
 
 class InputDirConfig(BaseModel):

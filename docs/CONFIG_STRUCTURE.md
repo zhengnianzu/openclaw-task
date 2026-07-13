@@ -42,6 +42,32 @@ C:\Users\nianzu\.openclaw\
 - `agent_dir`：包含各个 agent 的源文件，结构为 `agent_dir/<agent_name>/SOUL.md`
 - `user_dir`：包含要分析的 PDF 文件等数据
 
+#### user_dir 对象形式与 `user_workspace`
+
+`user_dir` 除字符串外还可写成对象，支持以下字段：
+
+```json
+{
+  "input_dir": {
+    "user_dir": {
+      "path": "C:\\Users\\nianzu\\Music\\openclaw_task\\task1-read-article",
+      "user_workspace": "ws"        // 可选：内容所在子目录名
+    }
+  }
+}
+```
+
+真正被复制进 workspace 的内容取自 **content_root**，由 `user_workspace` 决定（仅接受子目录名，不支持相对多级/绝对路径）：
+
+| `user_workspace` | content_root | 说明 |
+|---|---|---|
+| 不写（缺省） | `path/<与 path 同名的子目录>` | 旧行为，向后兼容 |
+| `"ws"`（子目录名） | `path/ws` | 显式指定，避免冗长同名层 |
+| `""`（空字符串） | `path` 本身 | 内容直接在 path 根下，拍平嵌套 |
+
+> 注意：`user_workspace: ""`（空串）与「不写」语义不同——空串表示 content_root 就是 `path`。
+> 另：`evaluate` 的 `oracle_ref` / `rubrics_ref` / `scoring_ref` 始终相对 `user_dir.path`（父层）解析，不受 `user_workspace` 影响。
+
 ### agents 配置
 
 ```json
@@ -192,7 +218,8 @@ python run_paper_analysis.py
 
 ### 2. user_dir 包含要复制到工作空间的数据文件
 
-所有文件会被复制到 agent 的工作空间，agent 可以直接访问。
+content_root 下的所有文件会被复制到 agent 的工作空间，agent 可以直接访问。
+默认 content_root 为 `path/<同名子目录>`；可用 `user_workspace` 覆盖（见上文「user_dir 对象形式」）。
 
 ### 3. 不需要在配置中指定 workspace
 
