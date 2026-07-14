@@ -161,7 +161,9 @@ async def process_turn(
             "inclination": ev.inclination,
             "rubric_checks": [rc.model_dump() for rc in ev.rubric_checks],
         })
-    if evaluator.to_simulator and ev is not None:
+    # 前置检测门控:执行中(task_declared_complete=false)本轮不回流反馈给 simulator
+    # (走已有空反馈降级路径);评估自身仍照常执行并已落盘,仅门控"是否回流"这一步。
+    if evaluator.to_simulator and ev is not None and ev.task_declared_complete:
         return evaluator.format_feedback(ev)
     return None
 

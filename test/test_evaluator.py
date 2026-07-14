@@ -32,6 +32,7 @@ from src.evaluator.evaluator import (
     RubricCheck,
     Scorer,
     ScoringSpec,
+    _model_facing_schema,
     _parse_json_as,
 )
 
@@ -155,6 +156,166 @@ def test_config_parsing():
 
 
 # ============================================================================
+# Test 2b: 前置检测门控 process_turn(执行中不回流,已交付回流)
+# ============================================================================
+
+def test_feedback_gating():
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+
+    import src.executor as executor
+
+    print("=" * 60)
+    print("Test 2b: 前置检测门控 process_turn")
+    print("=" * 60)
+
+    # 向后兼容:模型漏填字段时默认 True(照常回流)
+    ev_default = EvaluationResult(completion=0.5, inclination="uncertain")
+    assert ev_default.task_declared_complete is True, "默认应为 True(向后兼容)"
+    print("  默认 task_declared_complete=True ✓")
+
+    def _run(ev_returned: EvaluationResult):
+        """驱动一次 process_turn,返回其 evaluator_feedback。"""
+        fake_cfg = SimpleNamespace(
+            eval_step=1, agent_name="evaluator",
+            rubric_items=lambda: [],
+        )
+        fake_eval = SimpleNamespace(
+            config=fake_cfg,
+            to_simulator=True,
+            evaluate_turn=AsyncMock(return_value=ev_returned),
+            format_feedback=lambda ev: "FEEDBACK",
+        )
+        traj = SimpleNamespace(turns=[], evaluations=[])
+        query = SimpleNamespace(agent_name="tester")
+        with patch.object(executor, "build_turn_record", return_value=SimpleNamespace(turn=1)), \
+             patch.object(executor, "capture_file_evidence", new=AsyncMock(return_value=None)):
+            return asyncio.run(executor.process_turn(
+                client=None, query=query, turn=1, current_query="q",
+                result=SimpleNamespace(content="a"), evidence_incomplete=False,
+                trajectory=traj, evaluator=fake_eval, agent=None, before_history=None,
+            )), traj
+
+    # 执行中 → 不回流(返回 None),但评估仍落盘到 trajectory.evaluations
+    ev_incomplete = EvaluationResult(completion=0.0, inclination="reject", task_declared_complete=False)
+    fb, traj = _run(ev_incomplete)
+    assert fb is None, f"执行中应不回流,实际: {fb!r}"
+    assert len(traj.evaluations) == 1, "评估仍应落盘(门控只作用于回流)"
+    print("  执行中 task_declared_complete=False → 不回流(None)且仍落盘 ✓")
+
+    # 已交付 → 正常回流
+    ev_complete = EvaluationResult(completion=0.8, inclination="accept", task_declared_complete=True)
+    fb, traj = _run(ev_complete)
+    assert fb == "FEEDBACK", f"已交付应回流,实际: {fb!r}"
+    assert len(traj.evaluations) == 1
+    print("  已交付 task_declared_complete=True → 正常回流 ✓")
+
+    print("\n✅ 前置检测门控测试通过\n")
+
+
+# ============================================================================
+# Test 2c: 未完成时跳过 rubric 评分(completion=None)
+# ============================================================================
+
+def test_skip_scoring():
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from src.evaluator.evaluator import Evaluator, EvaluateConfig
+    from src.evaluator.trajectory import Trajectory, TurnRecord
+
+    print("=" * 60)
+    print("Test 2c: 未完成时跳过 rubric 评分")
+    print("=" * 60)
+
+    cfg = EvaluateConfig(agent_name="evaluator", to_simulator=True)
+    cfg.structured_rubrics = MOCK_RUBRICS  # R1 gate, R2/R3 final
+    cfg.resolve_runtime()
+
+    traj = Trajectory(query="Q", agent_name="tester", turns=[])
+    turn = TurnRecord(turn=1, user_input="Q", agent_content="...")
+    traj.turns.append(turn)
+
+    def make_eval(reply_json: str) -> Evaluator:
+        fake_agent = SimpleNamespace(
+            session_key="k",
+            execute=AsyncMock(return_value=SimpleNamespace(content=reply_json)),
+        )
+        client = SimpleNamespace(gateway=None)  # 短路 reset/push_review
+        return Evaluator(cfg, client, run_id="t", session_name="s",
+                         get_agent_fn=lambda a, s: fake_agent)
+
+    # 执行中:模型即使填了 rubric_checks,也应被清空、completion=None(不调 Scorer)
+    reply_incomplete = json.dumps({
+        "completion": 0.0, "inclination": "reject", "task_declared_complete": False,
+        "rubric_checks": [{"rubric_id": "R1", "criterion": "x", "passed": 1}],
+    })
+    res = asyncio.run(make_eval(reply_incomplete).evaluate_turn(traj, turn, rubric=MOCK_RUBRICS, window=1))
+    assert res is not None
+    assert res.completion is None, f"执行中 completion 应为 None,实际 {res.completion!r}"
+    assert res.rubric_checks == [], f"执行中 rubric_checks 应清空,实际 {res.rubric_checks}"
+    print("  执行中 task_declared_complete=False → completion=None, rubric_checks=[] ✓")
+
+    # 已交付:全过 → Scorer 正常算分(float 1.0)
+    reply_complete = json.dumps({
+        "completion": 0.0, "inclination": "accept", "task_declared_complete": True,
+        "rubric_checks": [
+            {"rubric_id": "R1", "criterion": "x", "passed": 1},
+            {"rubric_id": "R2", "criterion": "y", "passed": 1},
+            {"rubric_id": "R3", "criterion": "z", "passed": 1},
+        ],
+    })
+    res = asyncio.run(make_eval(reply_complete).evaluate_turn(traj, turn, rubric=MOCK_RUBRICS, window=1))
+    assert isinstance(res.completion, float), f"已交付 completion 应为 float,实际 {res.completion!r}"
+    assert res.completion == 1.0, f"全过应为 1.0,实际 {res.completion}"
+    print(f"  已交付 task_declared_complete=True → completion={res.completion} (float) ✓")
+
+    print("\n✅ 跳过评分测试通过\n")
+
+
+# ============================================================================
+# Test 2d: 发给模型的 schema 将 completion 列为必填,但解析层仍宽容
+# ============================================================================
+
+def test_completion_schema():
+    print("=" * 60)
+    print("Test 2d: completion 必填(model-facing) + 解析宽容")
+    print("=" * 60)
+
+    # 发给模型的 schema:completion 进 required
+    schema = _model_facing_schema()
+    assert "completion" in schema.get("required", []), \
+        f"completion 应在 model-facing schema 的 required 中,实际 {schema.get('required')}"
+    print("  model-facing schema.required 含 completion ✓")
+
+    # 但不污染 Pydantic 模型本身的 schema(EvaluationResult 仍以 inclination 为唯一必填)
+    base_required = EvaluationResult.model_json_schema().get("required", [])
+    assert "completion" not in base_required, \
+        f"EvaluationResult 模型本身不应把 completion 列为必填,实际 {base_required}"
+    print("  EvaluationResult 模型本身仍不强制 completion(仅 model-facing 加) ✓")
+
+    # 解析层宽容:模型漏吐 completion 时,降级为 None、不抛异常
+    reply_missing = json.dumps({
+        "inclination": "reject",
+        "task_declared_complete": True,
+        "rubric_checks": [{"rubric_id": "R1", "criterion": "x", "passed": 1}],
+    })
+    parsed = _parse_json_as(reply_missing, EvaluationResult)
+    assert parsed.completion is None, f"漏吐时应降级为 None,实际 {parsed.completion!r}"
+    print("  模型漏吐 completion → 解析降级 None,不抛异常 ✓")
+
+    # 字段说明不含权威归属元话术(不应把"由 Scorer 覆盖"发给模型)
+    desc = EvaluationResult.model_fields["completion"].description or ""
+    assert "Scorer" not in desc and "覆盖" not in desc, \
+        f"completion 字段说明不应含权威归属元话术,实际: {desc}"
+    print("  completion 字段说明为纯输出指令(无'由 Scorer 覆盖'话术) ✓")
+
+    print("\n✅ completion schema 测试通过\n")
+
+
+# ============================================================================
 # Test 3: 调 API 测试端到端评估
 # ============================================================================
 
@@ -265,16 +426,22 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="测试 Evaluator")
     parser.add_argument("--proxy-config", default=DEFAULT_PROXY_CONFIG,
                         help=f"user_proxy_model.json 路径（默认: {DEFAULT_PROXY_CONFIG}）")
-    parser.add_argument("--mode", default="all", choices=["all", "scorer", "config", "api"],
-                        help="测试模式: all/scorer/config/api")
+    parser.add_argument("--mode", default="all", choices=["all", "scorer", "config", "gating", "skip", "schema", "api"],
+                        help="测试模式: all/scorer/config/gating/skip/schema/api")
     args = parser.parse_args()
 
-    modes = [args.mode] if args.mode != "all" else ["scorer", "config", "api"]
+    modes = [args.mode] if args.mode != "all" else ["scorer", "config", "gating", "skip", "schema", "api"]
 
     if "scorer" in modes:
         test_scorer()
     if "config" in modes:
         test_config_parsing()
+    if "gating" in modes:
+        test_feedback_gating()
+    if "skip" in modes:
+        test_skip_scoring()
+    if "schema" in modes:
+        test_completion_schema()
     if "api" in modes:
         test_api_evaluation(args.proxy_config)
 

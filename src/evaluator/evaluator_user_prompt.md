@@ -11,6 +11,17 @@
 【最近 {window} 轮证据】
 {recent_evidence}{generated_files_section}{rubric_section}
 
+【前置检测输出】
+先据最新一轮姿态设置 task_declared_complete：执行中(尚未交付)→ false；已交付或模棱两可 → true。
+只判姿态、不判对错；仅在有明确"执行中"信号时才判 false，其余一律 true。
+若 task_declared_complete=false（执行中）：rubric_checks 返回空数组 []，不做逐条评分；
+仅当 task_declared_complete=true（已交付）时，才按下方【验收 Rubric】逐条判 0/1。
+
+【completion 输出（必填）】
+任何情况下都 MUST 输出 completion 字段，不得省略：
+- 做了 rubric 逐条校验（rubric_checks 非空）→ completion 填 0~1 的完成度估计数值；
+- 未做逐条校验（执行中、或本 query 无验收 Rubric）→ completion 填 null。
+
 <!-- @section generated_files -->
 【产物文件指针 (review_subdir={review_subdir})】
 {generated_file_lines}
