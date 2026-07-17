@@ -286,6 +286,15 @@ async def execute_queries(
             user_reply = query_simulator.chat(agent_reply, evaluator_feedback=evaluator_feedback)
             logger.debug("[S%d] %s", turn, user_reply)
 
+            # 空 user_reply 绝不能原样作为下一轮 current_query 下发给网关
+            # (网关拒空消息 → message or attachment required → 误判连接异常空转)。
+            # simulator 层已保证重试仍空时返回【Task_Failed】,此处为纵深防御:
+            # 任何来源的空回复都判失败(simulator 未正常产出=故障),不下发、保留轨迹落盘。
+            if not (user_reply or "").strip():
+                logger.error("simulator 回复为空(Turn %d);判为失败,不下发空消息", turn)
+                trajectory.outcome = "failed"
+                break
+
             if "【Task_Done】" in user_reply:
                 logger.info("任务完成(Turn %d)", turn)
                 trajectory.outcome = "done"

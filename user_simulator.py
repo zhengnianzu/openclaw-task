@@ -110,29 +110,67 @@ class User_simulator:
             {"role": "user", "content": query},
         ]
 
+        # 返回值健壮性: reasoning 类模型经 OpenAI 兼容接口时,token 可能全进
+        # reasoning 通道、主 content 为空。取值兜底顺序:主 content → reasoning 字段;
+        # 仍空则重试;重试(3 次)仍空则判为 simulator 自身失败,返回【Task_Failed】,
+        # chat() 永不返回空串。(连续吐不出内容=simulator 坏了,判失败比判完成诚实,
+        # 避免虚高成功率、掩盖故障。)
         last_exc = None
+        response = None
+        reply = ""
         for attempt in range(3):
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=full_messages,
                 )
-                break
             except Exception as e:
                 last_exc = e
                 logging.warning(f"API call failed (attempt {attempt + 1}/3): {e}")
+                continue
+
+            reply = self._extract_reply(response)
+            if reply:
+                break
+            logging.warning(
+                f"simulator 返回空内容 (attempt {attempt + 1}/3): "
+                "主 content 与 reasoning 通道均为空,重试"
+            )
         else:
-            raise last_exc
-        
-        reply = response.choices[0].message.content
+            if last_exc is not None and response is None:
+                raise last_exc
+            logging.warning("simulator 重试 3 次仍为空,判为 simulator 失败,返回 Task_Failed")
+            reply = "【Task_Failed】"
 
         # 记录本轮对话到历史（user=agent说的，assistant=simulator回复）
         self.messages.append({"role": "user", "content": query})
         self.messages.append({"role": "assistant", "content": reply})
 
-        self._log_api_call(full_messages, reply, response.usage)
+        usage = getattr(response, "usage", None) if response is not None else None
+        self._log_api_call(full_messages, reply, usage)
 
         return reply
+
+    @staticmethod
+    def _extract_reply(response) -> str:
+        """从模型响应取回复文本,主 content 为空则回退 reasoning 文本通道。
+
+        reasoning 类模型经 OpenAI 兼容接口时,最终文本可能落在
+        message.reasoning_content / message.reasoning 等非标准字段。宽松读取,
+        字段缺失一律视为空,不抛错。返回去除首尾空白后的文本(可能为空串)。
+        """
+        try:
+            message = response.choices[0].message
+        except (AttributeError, IndexError, TypeError):
+            return ""
+
+        def _read(field: str) -> str:
+            val = getattr(message, field, None)
+            if val is None and isinstance(message, dict):
+                val = message.get(field)
+            return val.strip() if isinstance(val, str) else ""
+
+        return _read("content") or _read("reasoning_content") or _read("reasoning")
 
     def reset(self):
         """清空对话历史，开始新一轮对话。"""

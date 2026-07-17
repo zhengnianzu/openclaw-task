@@ -691,6 +691,12 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                     "Agent returned empty content and chat.history had no new assistant reply"
                 )
             except (GatewayError, asyncio.TimeoutError) as e:
+                # 确定性非法请求(如空消息体 → 网关 "message or attachment required")
+                # 不是连接异常:重试/history_fallback 都救不了,反而空转约一小时。
+                # 立即上抛,不进 fallback、不消耗连接类重试。文案源自 openclaw 网关。
+                if "message or attachment required" in str(e).lower():
+                    logger.error("网关拒绝非法请求(非连接问题),快速失败不重试: %s", e)
+                    raise
                 logger.warning(
                     "gateway 连接异常 (第 %d/%d 次): %s，先查 history 看旧 run 是否已完成",
                     attempt, max_attempts, e,
