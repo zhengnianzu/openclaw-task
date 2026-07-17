@@ -112,7 +112,9 @@ class User_simulator:
 
         # 返回值健壮性: reasoning 类模型经 OpenAI 兼容接口时,token 可能全进
         # reasoning 通道、主 content 为空。取值兜底顺序:主 content → reasoning 字段;
-        # 仍空则重试;重试仍空则返回显式收尾标记,chat() 永不返回空串。
+        # 仍空则重试;重试(3 次)仍空则判为 simulator 自身失败,返回【Task_Failed】,
+        # chat() 永不返回空串。(连续吐不出内容=simulator 坏了,判失败比判完成诚实,
+        # 避免虚高成功率、掩盖故障。)
         last_exc = None
         response = None
         reply = ""
@@ -137,8 +139,8 @@ class User_simulator:
         else:
             if last_exc is not None and response is None:
                 raise last_exc
-            logging.warning("simulator 重试后仍为空,兜底为 Task_Done 收尾标记")
-            reply = "【Task_Done】"
+            logging.warning("simulator 重试 3 次仍为空,判为 simulator 失败,返回 Task_Failed")
+            reply = "【Task_Failed】"
 
         # 记录本轮对话到历史（user=agent说的，assistant=simulator回复）
         self.messages.append({"role": "user", "content": query})

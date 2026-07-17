@@ -288,11 +288,11 @@ async def execute_queries(
 
             # 空 user_reply 绝不能原样作为下一轮 current_query 下发给网关
             # (网关拒空消息 → message or attachment required → 误判连接异常空转)。
-            # 与上方 agent 空回复防护对称:视作收尾,保留已采集轨迹正常落盘。
+            # simulator 层已保证重试仍空时返回【Task_Failed】,此处为纵深防御:
+            # 任何来源的空回复都判失败(simulator 未正常产出=故障),不下发、保留轨迹落盘。
             if not (user_reply or "").strip():
-                logger.warning("simulator 回复为空(Turn %d);视作收尾,不下发空消息", turn)
-                trajectory.outcome = "done"
-                success = True
+                logger.error("simulator 回复为空(Turn %d);判为失败,不下发空消息", turn)
+                trajectory.outcome = "failed"
                 break
 
             if "【Task_Done】" in user_reply:
