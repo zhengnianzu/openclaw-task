@@ -131,17 +131,17 @@ class ClaudecodeAgent:
             # 显式告诉 SDK:让 claude CLI 子进程去读 settings.json。
             "setting_sources": ["user", "project"],
         }
-        if self._system_prompt:
-            kwargs["system_prompt"] = self._system_prompt
+        kwargs["system_prompt"] = {
+            "type": "preset",
+            "preset": "claude_code",
+            "append": self._system_prompt or ""
+        }
         if self._model:
             kwargs["model"] = self._model
         if self._cwd is not None:
             kwargs["cwd"] = str(self._cwd)
         if self._env:
-            # claude CLI 子进程环境变量;ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN/
-            # ANTHROPIC_MODEL 用于按 agent 隔离模型端点。
             kwargs["env"] = dict(self._env)
-        # 让上层可以塞 allowed_tools / disallowed_tools / mcp_servers 等
         kwargs.update(self._extra_options)
         return ClaudeAgentOptions(**kwargs)
 
@@ -459,39 +459,24 @@ class ClaudecodeWorkspaceManager(BaseWorkspaceManager):
     def _copy_agent_configs(
         self,
         workspace: Path,
-        agent_name: str,
         config_files: List[str],
         agent_dir: str,
     ) -> None:
-        agent_source_root = Path(agent_dir).expanduser()
-        per_agent_dir = agent_source_root / agent_name
-
-        if not agent_source_root.exists():
-            logger.warning("Agent 源目录不存在: %s", agent_source_root)
-            return
-
-        merged_sections: List[str] = []
-
-        for config_file in config_files:
-            src = per_agent_dir / config_file
-            if not src.exists():
-                legacy = agent_source_root / config_file
-                if legacy.exists():
-                    logger.warning(
-                        "未找到 %s,回退到旧布局 %s — 建议把文件放到 <agent_dir>/<agent_name>/ 下",
-                        src, legacy,
-                    )
-                    src = legacy
+        agent_source = Path(agent_dir).expanduser()
+        if agent_source.exists():
+            for config_file in config_files:
+                src = agent_source / config_file
+                if src.exists():
+                    dst = workspace / config_file
+                    copy_path(src, dst)
+                    logger.info("复制 Agent 配置: %s -> %s", config_file, dst)
+                    dst_main = self.base_dir / config_file
+                    copy_path(src, dst_main)
+                    logger.info("复制 Agent 配置: %s -> %s", config_file, dst_main)
                 else:
-                    logger.warning(
-                        "Agent 配置文件不存在: %s (也不在旧布局 %s)",
-                        src, legacy,
-                    )
-                    continue
-
-            dst = workspace / config_file
-            copy_path(src, dst)
-            logger.info("复制 Agent 配置: %s -> %s", src, dst)
+                    logger.warning("Agent 配置文件不存在: %s", src)
+        else:
+            logger.warning("Agent 源目录不存在: %s", agent_source)
 
 # ============================================================================
 # ClaudecodeAgentManager

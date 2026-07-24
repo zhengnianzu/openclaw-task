@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional
 from user_simulator import User_simulator
 
 from src.config import AutomationConfig, ConfigLoader, load_agent_model_configs
+from scripts.task_status import run_stats
 
 import time as _time
 _RUN_ID = _time.strftime("%Y%m%dT%H%M%S")
@@ -348,6 +349,7 @@ async def main(
     config_file: Optional[str] = None,
     config_dict: Optional[Dict] = None,
     harness_type: Optional[str] = None,
+    traj_stats_result: Optional[str] = None
 ) -> None:
     """主入口函数"""
     setup_logger(config_file)
@@ -367,6 +369,11 @@ async def main(
     results = await automation.run()
 
     logger.info("所有任务执行完成!")
+
+    # 执行后处理：任务统计分析脚本
+    run_stats(config_file=config_file, traj_stats_result=traj_stats_result, harness_type=config.harness_type)
+    logger.info("任务统计已写入: %s", traj_stats_result)
+
     return results
 
 
@@ -392,8 +399,12 @@ if __name__ == "__main__":
         default=None,
         help="harness类型(不指定则使用配置文件中的 harness_type,缺省为 openclaw)"
     )
+    parser.add_argument(
+        "--traj_stats_result",
+        default="logs/traj_stats_result.json",
+        help="轨迹质量统计路径"
+    )
 
     args = parser.parse_args()
 
-    asyncio.run(main(config_file=args.config, harness_type=args.harness))
-
+    asyncio.run(main(config_file=args.config, harness_type=args.harness, traj_stats_result=args.traj_stats_result))
