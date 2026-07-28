@@ -1,0 +1,34 @@
+{
+  "harness_type": "openclaw",
+  "system": {
+    "platform": ["linux"],
+    "python": "3.11",
+    "tools": []
+  },
+  "input_dir": {
+    "skill_dir": {},
+    "user_dir": {
+      "path": "/data/tasks/task1-read-article",
+      "user_workspace": "ws"
+    }
+  },
+  "agents": [
+    {
+      "name": "main",
+      "config": [],
+      "skills": [],
+      "system_prompt": "You are a helpful AI assistant."
+    }
+  ],
+  "queries": [
+    {
+      "agent_name": "main",
+      "text": "Summarize the documents in my workspace.",
+      "session_name": "main",
+      "timeout": 1800
+    }
+  ],
+  "gateway_ws_url": "ws://127.0.0.1:18789/gateway",
+  "gateway_timeout": 600,
+  "workspace_base": "~/.openclaw/workspace"
+}

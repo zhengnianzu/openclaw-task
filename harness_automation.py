@@ -1,0 +1,410 @@
+"""
+统一自动化任务执行系统 (Harness Automation)
+
+通过配置文件中的 harness_type 字段切换 openclaw / hermes 两种 harness 实现。
+共享部分: Simulator 工厂、main/CLI 入口。
+特有部分: WorkspaceManager / AgentManager 由 src/ 下的模块提供。
+统一查询执行器: src.executor.execute_queries (回调注入差异)。
+配置模型: src.config (AutomationConfig / ConfigLoader 等)。
+"""
+
+import asyncio
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from user_simulator import User_simulator
+
+from src.config import AutomationConfig, ConfigLoader, load_agent_model_configs
+from scripts.task_status import run_stats
+
+import time as _time
+_RUN_ID = _time.strftime("%Y%m%dT%H%M%S")
+
+PROJECT_ROOT = Path(__file__).parent.resolve()
+
+
+# ============================================================================
+# Logger
+# ============================================================================
+
+def setup_logger(config_file: Optional[str] = None) -> logging.Logger:
+    logger = logging.getLogger("harness_automation")
+    logger.setLevel(logging.DEBUG)
+
+    if logger.handlers:
+        return logger
+
+    log_dir = Path(__file__).parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+
+    if config_file:
+        log_name = Path(config_file).stem + ".log"
+    else:
+        log_name = "harness_automation.log"
+
+    fh = logging.FileHandler(log_dir / log_name, encoding="utf-8", mode="w")
+    fh.setLevel(logging.DEBUG)
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    fh.setFormatter(fmt)
+    ch.setFormatter(fmt)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger
+
+
+logger = logging.getLogger("harness_automation")
+
+
+# ============================================================================
+# Simulator 工厂函数
+# ============================================================================
+
+def create_simulator(
+    config: AutomationConfig,
+    simulator_model_cfg=None,
+) -> Optional[User_simulator]:
+    """根据配置创建 User_simulator 实例,无配置则返回 None。
+
+    simulator_model_cfg: AgentModelConfig(model/api_key/base_url),
+    由 HarnessAutomation 从 simulator_config JSON 顶层解析后传入;
+    未提供则回退到 SIMULATOR_MODEL / SIMULATOR_OPENAI_* 环境变量。
+    """
+
+    user_profile = config.user_profile
+    user_dir_cfg = config.input_dir.user_dir
+    if user_dir_cfg:
+        profile_filename = user_dir_cfg.profile_file or "user_profile.json"
+        profile_path = Path(user_dir_cfg.path) / profile_filename
+        if profile_path.exists():
+            profile_data = json.loads(profile_path.read_text(encoding="utf-8"))
+            user_profile = json.dumps(profile_data, ensure_ascii=False, indent=2)
+        elif user_dir_cfg.profile_file:
+            logger.warning("profile_file 不存在: %s,回退到 config.user_profile", profile_path)
+
+    if simulator_model_cfg is None and not config.simulator_config:
+        logger.info("simulator_config 未配置,将跳过多轮对话(仅执行单轮)")
+        return None
+
+    # 从 AgentModelConfig 取三元组;缺项回退环境变量
+    cfg_model    = simulator_model_cfg.model    if simulator_model_cfg else None
+    cfg_api_key  = simulator_model_cfg.api_key  if simulator_model_cfg else None
+    cfg_base_url = simulator_model_cfg.base_url if simulator_model_cfg else None
+
+    model    = cfg_model    or os.environ.get("SIMULATOR_MODEL", "gpt-4o")
+    api_key  = cfg_api_key  or os.environ.get("SIMULATOR_OPENAI_API_KEY")
+    base_url = cfg_base_url or os.environ.get("SIMULATOR_OPENAI_BASE_URL")
+    proxy    = os.environ.get("SIMULATOR_PROXY")
+
+    user_directory = ""
+    if user_dir_cfg:
+        root = Path(user_dir_cfg.path)
+        if root.exists():
+            lines = []
+            for p in sorted(root.rglob("*")):
+                depth = len(p.relative_to(root).parts) - 1
+                indent = "    " * depth
+                lines.append(f"{indent}{'└── ' if p.is_file() else ''}{p.name}{'/' if p.is_dir() else ''}")
+            user_directory = "\n".join(lines)
+
+    return User_simulator(
+        origin_query="",
+        user_profile=user_profile,
+        user_directory=user_directory,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        proxy=proxy,
+    )
+
+
+# ============================================================================
+# 主执行器
+# ============================================================================
+
+class HarnessAutomation:
+    """统一自动化任务执行主类,根据 harness_type 选择实现"""
+
+    def __init__(self, config: AutomationConfig):
+        self.config = config
+        self.harness_type = config.harness_type
+        # 从 simulator_config JSON 一次加载全部:{"user_simulator": AgentModelConfig, "<agent>": ...}
+        all_cfgs = load_agent_model_configs(config.simulator_config)
+        # user_simulator 段单独取出给 create_simulator 用;剩下的按 agent_name 传给 harness
+        self.simulator_model_cfg = all_cfgs.pop("user_simulator", None)
+        self.agent_overrides = all_cfgs
+
+        if self.harness_type == "hermes":
+            from src.hermes_client import HermesWorkspaceManager
+            self.workspace_manager = HermesWorkspaceManager("~/.hermes")
+        elif self.harness_type == "claude-code":
+            from src.claudecode_client import ClaudecodeWorkspaceManager
+            self.workspace_manager = ClaudecodeWorkspaceManager("~/.claude/workspace")
+        else:
+            from src.openclaw_client import OpenclawWorkspaceManager
+            self.workspace_manager = OpenclawWorkspaceManager("~/.openclaw/workspace")
+
+    async def run(self) -> Dict[str, Any]:
+        """运行自动化流程"""
+        logger.info("=" * 60)
+        logger.info("自动化任务系统 (harness_type=%s)", self.harness_type)
+        logger.info("=" * 60)
+
+        if self.harness_type == "hermes":
+            return await self._run_hermes()
+        elif self.harness_type == "claude-code":
+            return await self._run_claudecode()
+        else:
+            return await self._run_openclaw()
+
+    async def _run_openclaw(self) -> Dict[str, Any]:
+        from src.openclaw_client import (
+            build_openclaw_client,
+            OpenclawAgentManager,
+            make_openclaw_execute_with_retry,
+            openclaw_check_readyz,
+        )
+        from src.executor import execute_queries
+
+        reconnect_config = {
+            "gateway_ws_url": self.config.gateway_ws_url,
+            "api_key": self.config.api_key,
+            "gateway_timeout": self.config.gateway_timeout,
+        }
+        logger.debug("reconnect_config: %s", reconnect_config)
+
+        async with await build_openclaw_client(**reconnect_config) as client:
+            self.client = client
+
+            await self._setup_workspaces()
+
+            agent_manager = OpenclawAgentManager(client, self.workspace_manager, agent_overrides=self.agent_overrides)
+            for agent_config in self.config.agents:
+                await agent_manager.setup_agent(agent_config)
+
+            simulator_factory = lambda: create_simulator(self.config, self.simulator_model_cfg)
+            agent_system_prompts = {
+                a.name: a.system_prompt for a in self.config.agents if a.system_prompt
+            }
+            results = await execute_queries(
+                queries=self.config.queries,
+                client=client,
+                get_agent_fn=lambda name, session: client.get_agent(name, session),
+                execute_with_retry_fn=make_openclaw_execute_with_retry(client),
+                simulator_factory=simulator_factory,
+                max_turn=self.config.user_max_turn,
+                agent_system_prompts=agent_system_prompts,
+                run_id=_RUN_ID,
+                pre_query_hook=lambda: openclaw_check_readyz(client),
+            )
+            return results
+
+    async def _run_hermes(self) -> Dict[str, Any]:
+        from src.hermes_client import (
+            build_hermes_client,
+            HermesAgentManager,
+            make_hermes_execute_with_retry,
+            make_hermes_get_agent,
+        )
+        from src.executor import execute_queries
+
+        legacy_oc = {}
+        if self.config.gateway_ws_url:
+            legacy_oc["gateway_ws_url"] = self.config.gateway_ws_url
+        if self.config.gateway_timeout is not None:
+            legacy_oc["gateway_timeout"] = self.config.gateway_timeout
+        if self.config.api_key:
+            legacy_oc["api_key"] = "<redacted>"
+        if legacy_oc:
+            logger.info(
+                "[跨框架兼容] 接受到 openclaw 风格字段 %s; hermes 已全部忽略",
+                legacy_oc,
+            )
+
+        async with await build_hermes_client() as client:
+            self.client = client
+
+            await self._setup_workspaces()
+
+            agent_manager = HermesAgentManager(client, self.workspace_manager, agent_overrides=self.agent_overrides)
+            for agent_config in self.config.agents:
+                await agent_manager.setup_agent(agent_config)
+
+            simulator_factory = lambda: create_simulator(self.config, self.simulator_model_cfg)
+            agent_system_prompts = {
+                a.name: a.system_prompt for a in self.config.agents if a.system_prompt
+            }
+            results = await execute_queries(
+                queries=self.config.queries,
+                client=client,
+                get_agent_fn=make_hermes_get_agent(client, workspace_manager=self.workspace_manager, agent_overrides=self.agent_overrides),
+                execute_with_retry_fn=make_hermes_execute_with_retry(client, workspace_manager=self.workspace_manager),
+                simulator_factory=simulator_factory,
+                agent_system_prompts=agent_system_prompts,
+                max_turn=self.config.user_max_turn,
+                run_id=_RUN_ID,
+            )
+            return results
+
+    async def _run_claudecode(self) -> Dict[str, Any]:
+        from src.claudecode_client import (
+            build_claudecode_client,
+            ClaudecodeAgentManager,
+            make_claudecode_execute_with_retry,
+            make_claudecode_get_agent,
+        )
+        from src.executor import execute_queries
+
+        legacy_oc = {}
+        if self.config.gateway_ws_url:
+            legacy_oc["gateway_ws_url"] = self.config.gateway_ws_url
+        if self.config.gateway_timeout is not None:
+            legacy_oc["gateway_timeout"] = self.config.gateway_timeout
+        if self.config.api_key:
+            legacy_oc["api_key"] = "<redacted>"
+        if legacy_oc:
+            logger.info(
+                "[跨框架兼容] 接受到 openclaw 风格字段 %s; claudecode 已全部忽略",
+                legacy_oc,
+            )
+
+        async with await build_claudecode_client() as client:
+            self.client = client
+
+            await self._setup_workspaces()
+
+            agent_manager = ClaudecodeAgentManager(client, self.workspace_manager, agent_overrides=self.agent_overrides)
+            for agent_config in self.config.agents:
+                await agent_manager.setup_agent(agent_config)
+
+            simulator_factory = lambda: create_simulator(self.config, self.simulator_model_cfg)
+            agent_system_prompts = {
+                a.name: a.system_prompt for a in self.config.agents if a.system_prompt
+            }
+            results = await execute_queries(
+                queries=self.config.queries,
+                client=client,
+                get_agent_fn=make_claudecode_get_agent(client, workspace_manager=self.workspace_manager),
+                execute_with_retry_fn=make_claudecode_execute_with_retry(client, workspace_manager=self.workspace_manager),
+                simulator_factory=simulator_factory,
+                agent_system_prompts=agent_system_prompts,
+                max_turn=self.config.user_max_turn,
+                run_id=_RUN_ID,
+            )
+            return results
+
+    async def _setup_workspaces(self) -> None:
+        """设置工作空间"""
+        logger.info("设置工作空间...")
+
+        user_dir_config = self.config.input_dir.user_dir
+        content_root_path: Optional[str] = None
+
+        if user_dir_config:
+            # content_root 唯一来源:UserDirConfig.content_root(user_workspace 三档语义)。
+            content_root = user_dir_config.content_root
+
+            if not content_root.exists() or not content_root.is_dir():
+                assert not user_dir_config.map_file, (
+                    "input_dir.user_dir.map_file must be omitted when "
+                    "content_root does not exist"
+                )
+            elif user_dir_config.map_file:
+                map_path = self._resolve_map_file(user_dir_config.path, user_dir_config.map_file)
+                data_dir = str(content_root)
+                self.workspace_manager.setup_from_map(map_path, base_dir=data_dir)
+            else:
+                content_root_path = str(content_root)
+
+        for agent_config in self.config.agents:
+            self.workspace_manager.setup_agent_files(
+                agent_name=agent_config.name,
+                config_files=agent_config.config,
+                skill_base_dir=self.config.input_dir.skill_dir,
+                agent_skills=agent_config.skills,
+                agent_dir=self.config.input_dir.agent_dir,
+                content_root=content_root_path,
+            )
+
+    @staticmethod
+    def _resolve_map_file(base_path: str, map_file: str) -> str:
+        p = Path(base_path) / map_file
+        if not p.suffix:
+            p = p.with_suffix('.json')
+        return str(p)
+
+
+# ============================================================================
+# 主入口函数
+# ============================================================================
+
+async def main(
+    config_file: Optional[str] = None,
+    config_dict: Optional[Dict] = None,
+    harness_type: Optional[str] = None,
+    traj_stats_result: Optional[str] = None
+) -> None:
+    """主入口函数"""
+    setup_logger(config_file)
+
+    if config_file:
+        config = ConfigLoader.load_from_file(config_file)
+    elif config_dict:
+        config = ConfigLoader.load_from_dict(config_dict)
+    else:
+        raise ValueError("必须提供 config_file 或 config_dict")
+
+    # CLI 覆盖:显式传入的 harness_type 优先于配置文件
+    if harness_type:
+        config.harness_type = harness_type
+
+    automation = HarnessAutomation(config)
+    results = await automation.run()
+
+    logger.info("所有任务执行完成!")
+
+    # 执行后处理：任务统计分析脚本
+    run_stats(config_file=config_file, traj_stats_result=traj_stats_result, harness_type=config.harness_type)
+    logger.info("任务统计已写入: %s", traj_stats_result)
+
+    return results
+
+
+# ============================================================================
+# 命令行入口
+# ============================================================================
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="自动化任务执行系统")
+    parser.add_argument(
+        "--config",
+        help="配置文件路径 (JSON/YAML)"
+    )
+    parser.add_argument(
+        "--workspace",
+        default="~/.openclaw/workspace",
+        help="工作空间基础目录"
+    )
+    parser.add_argument(
+        "--harness",
+        default=None,
+        help="harness类型(不指定则使用配置文件中的 harness_type,缺省为 openclaw)"
+    )
+    parser.add_argument(
+        "--traj_stats_result",
+        default="logs/traj_stats_result.json",
+        help="轨迹质量统计路径"
+    )
+
+    args = parser.parse_args()
+
+    asyncio.run(main(config_file=args.config, harness_type=args.harness, traj_stats_result=args.traj_stats_result))

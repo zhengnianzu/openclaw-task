@@ -1,0 +1,41 @@
+{
+  "system": {
+    "platform": ["windows"],
+    "python": "3.11",
+    "tools": []
+  },
+  "input_dir": {
+    "skill_dir": {},
+    "user_dir": null
+  },
+  "agents": [
+    {
+      "name": "main3",
+      "config": [],
+      "skills": []
+    }
+  ],
+  "queries": [
+    {
+      "agent_name": "main3",
+      "text": "中国的经济中心是哪里",
+      "session_name": "test",
+      "timeout": 600
+    },
+    {
+      "agent_name": "main3",
+      "text": "这个城市的人口是多少?",
+      "session_name": "eval",
+      "timeout": 600
+    },
+    {
+      "agent_name": "main3",
+      "text": "这个城市的人口是多少?",
+      "session_name": "test",
+      "timeout": 600
+    }
+  ],
+  "gateway_ws_url": "ws://127.0.0.1:18789",
+  "gateway_timeout": 600,
+  "workspace_base": "~/.openclaw/workspace"
+}

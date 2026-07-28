@@ -1,0 +1,34 @@
+{
+  "system": {
+    "platform": [
+      "linux"
+    ],
+    "python": "3.12",
+    "tools": []
+  },
+  "input_dir": {
+    "skill_dir": "skills",
+    "agent_dir": "agents"
+  },
+  "agents": [
+    {
+      "name": "main",
+      "config": [],
+      "skills": [],
+      "system_prompt": null
+    }
+  ],
+  "queries": [
+    {
+      "agent_name": "main",
+      "text": "模拟20个受访者的受教育年限、工龄和月薪。帮我算下这三项各自的均值和样本标准差，再看看两两之间（学历跟月薪、工龄跟月薪、学历跟工龄）的相关性，哪对显著哪对不显著。结果我要写进毕业论文的，得准。",
+      "use_simulator": false,
+      "session_name": "query1",
+      "timeout": 3600
+    }
+  ],
+  "gateway_ws_url": "ws://127.0.0.1:18789/gateway",
+  "api_key": null,
+  "workspace_base": "~/.openclaw/workspace",
+  "simulator_config": "configs/user_proxy_model.json"
+}
