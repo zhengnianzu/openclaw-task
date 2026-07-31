@@ -9,7 +9,7 @@
 {origin_query}
 
 【最近 {window} 轮证据】
-{recent_evidence}{generated_files_section}{rubric_section}
+{recent_evidence}{all_tool_calls_section}{generated_files_section}{rubric_section}
 
 【前置检测输出】
 先据最新一轮姿态设置 task_declared_complete：执行中(尚未交付)→ false；已交付或模棱两可 → true。
@@ -21,6 +21,13 @@
 任何情况下都 MUST 输出 completion 字段，不得省略：
 - 做了 rubric 逐条校验（rubric_checks 非空）→ completion 填 0~1 的完成度估计数值；
 - 未做逐条校验（执行中、或本 query 无验收 Rubric）→ completion 填 null。
+
+<!-- @section all_tool_calls -->
+【全程工具调用汇总（跨所有轮次，output 已截断）】
+说明：本清单覆盖整段对话的全部工具调用。若某条 rubric 只要求"曾经调用过某工具"
+（如搜索类任务须调用搜索工具），只要下方任一轮出现该工具即视为满足，
+不得因最近 {window} 轮窗口内未见而判负。
+{all_tool_calls}
 
 <!-- @section generated_files -->
 【产物文件指针 (review_subdir={review_subdir})】

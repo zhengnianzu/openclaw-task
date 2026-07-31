@@ -47,9 +47,9 @@ class User_simulator:
         self._user_profile = user_profile
         self._user_directory = user_directory
         self._current_origin_query = origin_query
-        # 当前时间:__init__ 取一次并缓存,整场会话复用(见 design D5)。
-        # 供 simulator 判定/追问涉及时间相对语义(最近/今年/本周等)时以此为"现在"。
-        self._current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 当前时间不再于 __init__ 缓存:多轮对话里 user 发起每一轮回复的真实时刻不同,
+        # 缓存初始化时刻会让"最近/今年/本周"等相对语义永远停在会话开始那一刻。
+        # 改为 chat() 每次调用时现算(_now_str),保证时间随真实调用时刻推进。
         self.model = model
         self.messages: list[dict] = []  # 记录对话历史，用于拼入 system prompt
         self.client = OpenAI(
@@ -57,6 +57,11 @@ class User_simulator:
             base_url=base_url,
             http_client=httpx.Client(verify=False, proxy=proxy),
         )
+
+    @staticmethod
+    def _now_str() -> str:
+        """当前时刻字符串,每次调用现算——供相对时间语义(最近/今年/本周等)锚定真实"现在"。"""
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def _render(
         self,
@@ -69,7 +74,7 @@ class User_simulator:
             .replace("{origin_query}", origin_query)
             .replace("{user_profile}", self._user_profile)
             .replace("{user_directory}", self._user_directory)
-            .replace("{current_time}", self._current_time)
+            .replace("{current_time}", self._now_str())
             .replace("{conversation_history}", conversation_history)
             .replace("{evaluator_feedback}", evaluator_feedback or "（本轮无第三方评估）")
         )

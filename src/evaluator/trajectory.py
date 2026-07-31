@@ -22,6 +22,20 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger("openclaw_automation")
 
+# 工具返回值(output)入库截断上限(字符)。采集时即截,使落盘轨迹 == 喂给 evaluator 的内容
+# (可直接查轨迹核对 evaluator 实际所见);同时避免"全历史 tool_call"投喂时上下文超长。
+# assistant 的完整原始轨迹另由网关 chat_history 留存,此处截断不损失可追溯性。
+TOOL_OUTPUT_MAX_CHARS = 100
+
+
+def _truncate_output(output: Optional[str]) -> Optional[str]:
+    """把工具 output 截断到 TOOL_OUTPUT_MAX_CHARS;超长时附极简省略标记以示截断。"""
+    if output is None:
+        return None
+    if len(output) <= TOOL_OUTPUT_MAX_CHARS:
+        return output
+    return output[:TOOL_OUTPUT_MAX_CHARS] + f"…[+{len(output) - TOOL_OUTPUT_MAX_CHARS}字]"
+
 # OpenClaw 新建 agent 时铺设的脚手架文件;发现工作区新产物时排除这些,
 # 以便把 agent 本轮真正"创建"的文件 surface 给 evaluator。
 SCAFFOLDING_FILES = {
@@ -106,6 +120,24 @@ class Trajectory(BaseModel):
         if not turns:
             return "（暂无轮次）"
         return "\n\n".join(_render_turn_compact(t) for t in turns)
+
+    def render_all_tool_calls(self) -> str:
+        """渲染**全程**工具调用汇总(跨所有轮次,不受评审窗口限制)。
+
+        供 evaluator 判定"曾经调用过某工具"这类跨轮 rubric:某工具可能在更早轮次
+        已调用,若只看最近 window 轮会漏判为负(bug: evaluator 仅看最近 X 轮 tool_call)。
+        output 已在采集时截断至 TOOL_OUTPUT_MAX_CHARS,此处直接内联不再二次截断。
+        """
+        lines: list[str] = []
+        for t in self.turns:
+            for tc in t.tool_calls:
+                out = tc.output or ""
+                lines.append(
+                    f"- [Turn {t.turn}] {tc.tool}(input={_fmt_input(tc.input, 300)}) -> {out}"
+                )
+        if not lines:
+            return "（全程无工具调用记录）"
+        return "\n".join(lines)
 
     def generated_file_pointers(self) -> list[dict]:
         """累积全部产物的指针 {filename, workspace_path}(去重按 name,后出现覆盖)。
@@ -263,7 +295,9 @@ def extract_tool_calls(messages: list[dict[str, Any]]) -> list[ToolCallEvidence]
                 output = _block_text(res.get("content"))
                 if res.get("isError"):
                     output = f"[error] {output}"
-            calls.append(ToolCallEvidence(tool=name, input=input_val, output=output))
+            calls.append(
+                ToolCallEvidence(tool=name, input=input_val, output=_truncate_output(output))
+            )
     return calls
 
 
@@ -285,7 +319,7 @@ def build_turn_record(
             ToolCallEvidence(
                 tool=tc.tool,
                 input=_normalize_input(tc.input),
-                output=tc.output,
+                output=_truncate_output(tc.output),
                 duration_ms=getattr(tc, "duration_ms", None),
             )
             for tc in (getattr(result, "tool_calls", None) or [])

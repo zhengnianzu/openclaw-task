@@ -103,12 +103,23 @@ def create_simulator(
     base_url = cfg_base_url or os.environ.get("SIMULATOR_OPENAI_BASE_URL")
     proxy    = os.environ.get("SIMULATOR_PROXY")
 
+    # 参与"文件隔离"的评审文件(oracle/rubrics/scoring)绝不能出现在注入 simulator 的目录树里,
+    # 否则 simulator 会把 oracle.json 等路径透给 agent → 答案泄露(bug: file-leak)。
+    # 收集所有 query 中 isolate_eval_files=True 的 evaluate.file_vault 绝对路径,从目录树剔除。
+    isolated_paths: set[str] = set()
+    for q in config.queries:
+        ev = getattr(q, "evaluate", None)
+        if ev is not None and getattr(ev, "isolate_eval_files", False):
+            isolated_paths.update(ev.file_vault.keys())
+
     user_directory = ""
     if user_dir_cfg:
         root = Path(user_dir_cfg.path)
         if root.exists():
             lines = []
             for p in sorted(root.rglob("*")):
+                if str(p.resolve()) in isolated_paths:
+                    continue  # 隔离文件不入目录树
                 depth = len(p.relative_to(root).parts) - 1
                 indent = "    " * depth
                 lines.append(f"{indent}{'└── ' if p.is_file() else ''}{p.name}{'/' if p.is_dir() else ''}")

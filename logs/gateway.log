@@ -1,0 +1,11 @@
+2026-07-29T11:59:44.656Z [canvas] host mounted at http://127.0.0.1:18789/__openclaw__/canvas/ (root /root/.openclaw/canvas)
+2026-07-29T11:59:44.712Z [heartbeat] started
+2026-07-29T11:59:44.714Z [health-monitor] started (interval: 300s, grace: 60s)
+2026-07-29T11:59:44.717Z [gateway] agent model: anthropic/claude-opus-4-7-thinking
+2026-07-29T11:59:44.718Z [gateway] listening on ws://127.0.0.1:18789, ws://[::1]:18789 (PID 20)
+2026-07-29T11:59:44.719Z [gateway] log file: /tmp/openclaw/openclaw-2026-07-29.log
+2026-07-29T11:59:44.762Z [browser/server] Browser control listening on http://127.0.0.1:18791/ (auth=token)
+2026-07-29T11:59:45.094Z [gateway] update available (latest): v2026.7.1-2 (current v2026.2.26). Run: openclaw update
+2026-07-29T12:01:29.304Z [gateway] signal SIGTERM received
+2026-07-29T12:01:29.305Z [gateway] received SIGTERM; shutting down
+2026-07-29T12:01:29.312Z [gmail-watcher] gmail watcher stopped

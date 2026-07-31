@@ -36,6 +36,13 @@ EXECUTION_HISTORY_FALLBACK_LIMIT = 50
 EXECUTION_HISTORY_FALLBACK_MAX_POLLS = 40
 EXECUTION_HISTORY_FALLBACK_POLL_INTERVAL_SECONDS = 30.0
 
+# 工具调用采集专用的 chat_history 拉取上限,与"取最后一条回复"的兜底(=50)解耦。
+# 服务端自主 agent 一轮就可能产生几十条 toolCall/toolResult 消息,50 条会把本轮
+# 最早的工具调用挤掉、静默漏采(bug: tool-call-miss)。这里放大到足以容纳整段会话,
+# 保证逐轮增量切片(_new_messages_since)拿得到本轮全部工具消息。
+# 注:若 gateway.chat_history 后续支持 since/offset 游标分页,应改为分页全量拉取。
+EXECUTION_TOOLCALL_CAPTURE_LIMIT = 1000
+
 
 def _replace_variables(text: str, results: Dict[str, Any]) -> str:
     pattern = r'\{result_(\w+)\}'
@@ -57,13 +64,16 @@ async def _safe_chat_history(agent) -> List[dict[str, Any]]:
 
     仅 OpenClaw client 提供 `gateway.chat_history`;Hermes/Claudecode 无 gateway,
     直接返回空(其 ExecutionResult 自带完整历史,不需要此 fallback)。
+
+    采集专用大 limit(EXECUTION_TOOLCALL_CAPTURE_LIMIT),确保一轮的所有 toolCall/
+    toolResult 都被拉到,不被 50 条兜底上限截断(bug: tool-call-miss)。
     """
     gateway = getattr(getattr(agent, "_client", None), "gateway", None)
     if gateway is None:
         return []
     try:
         return await gateway.chat_history(
-            agent.session_key, limit=EXECUTION_HISTORY_FALLBACK_LIMIT
+            agent.session_key, limit=EXECUTION_TOOLCALL_CAPTURE_LIMIT
         )
     except Exception as e:  # noqa: BLE001
         logger.debug("chat_history 采集失败: %s", e)
