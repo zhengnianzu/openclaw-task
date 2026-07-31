@@ -26,6 +26,8 @@ def copy_path(src: Path, dst: Path):
 class BaseWorkspaceManager(ABC):
     """Agent 工作空间管理基类"""
 
+    skills_subdir = Path("skills")
+
     @abstractmethod
     def get_agent_workspace(self, agent_name: str) -> Path:
         """获取 Agent 工作空间路径"""
@@ -54,7 +56,7 @@ class BaseWorkspaceManager(ABC):
 
         logger.info("workspace: %s", workspace)
         if skill_base_dir and agent_skills:
-            logger.info("skills_dst: %s", workspace / "skills")
+            logger.info("skills_dst: %s", workspace / self.skills_subdir)
         if content_root:
             logger.info(
                 "content_root -> workspace: %s -> %s",
@@ -66,8 +68,8 @@ class BaseWorkspaceManager(ABC):
             self._copy_agent_configs(workspace, config_files, agent_dir)
 
         if skill_base_dir and agent_skills:
-            skills_dst = workspace / "skills"
-            skills_dst.mkdir(exist_ok=True)
+            skills_dst = workspace / self.skills_subdir
+            skills_dst.mkdir(parents=True, exist_ok=True)
             for skill_path in agent_skills:
                 skill_name = Path(skill_path).name
                 src = Path(skill_base_dir) / skill_path

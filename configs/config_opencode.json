@@ -1,0 +1,29 @@
+{
+  "harness_type": "opencode",
+  "system": {
+    "platform": ["windows", "linux"],
+    "python": "3.11",
+    "tools": []
+  },
+  "input_dir": {
+    "skill_dir": null,
+    "user_dir": null
+  },
+  "agents": [
+    {
+      "name": "main",
+      "config": [],
+      "skills": [],
+      "system_prompt": "你是一个有帮助的 AI 助手，请清晰、简洁地回答问题。"
+    }
+  ],
+  "queries": [
+    {
+      "agent_name": "main",
+      "text": "法国的首都是哪里？",
+      "session_name": "main",
+      "timeout": 300,
+      "use_simulator": false
+    }
+  ]
+}
