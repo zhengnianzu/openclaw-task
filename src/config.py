@@ -98,7 +98,6 @@ class AgentModelConfig(BaseModel):
     """按 agent_name 外挂的模型配置。字段名与 user_proxy_model.json 一致。
     命中的 agent 配置(hermes profile / claude settings / openclaw 网关 provider)。
     """
-    model_config = {"extra": "ignore"}
     model: Optional[str] = None
     provider: Optional[str] = None
     api_key: Optional[str] = None

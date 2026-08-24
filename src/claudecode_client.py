@@ -11,7 +11,9 @@ Claude Code (claude_agent_sdk) 进程内客户端封装
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -32,6 +34,29 @@ from src.config import AgentModelConfig, warn_agent_model_conflict
 logger = logging.getLogger("harness_automation")
 # SDK 对 `claude` CLI 子进程的 stdout 做了 单条 JSON 消息 1 MiB 上限
 _claude_code_max_buffer_size = 32 * 1024 * 1024  # 32 MiB
+
+# Claude Code CLI 的用户级配置
+_CC_USER_SETTINGS_PATH = Path("~/.claude/settings.json").expanduser()
+
+
+def _read_cc_small_fast_model() -> Optional[str]:
+    """从 ~/.claude/settings.json 读 env.ANTHROPIC_SMALL_FAST_MODEL,读不到返回 None。
+
+    仅在 setup_agent 有 override 且 override.model 存在时调用。文件/JSON/字段任何
+    一环缺失都返回 None,交由上层降级到 override.model。
+    """
+    override_path = os.environ.get("CLAUDE_SETTINGS_PATH")
+    path = Path(override_path).expanduser() if override_path else _CC_USER_SETTINGS_PATH
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("读取 %s 失败,SMALL_FAST_MODEL 回落 override: %s", path, e)
+        return None
+    env = data.get("env") if isinstance(data, dict) else None
+    val = env.get("ANTHROPIC_SMALL_FAST_MODEL") if isinstance(env, dict) else None
+    return val if isinstance(val, str) and val.strip() else None
 
 # ============================================================================
 # 异常类型
@@ -522,6 +547,11 @@ class ClaudecodeAgentManager:
             if override.model:
                 effective_model = override.model
                 env["ANTHROPIC_MODEL"] = override.model
+                # (与 main agent 走 CLI 继承的配置源一致);读不到再降级 override.model。
+                env.setdefault(
+                    "ANTHROPIC_SMALL_FAST_MODEL",
+                    _read_cc_small_fast_model() or override.model,
+                )
             if override.base_url:
                 env["ANTHROPIC_BASE_URL"] = override.base_url
             if override.api_key:
