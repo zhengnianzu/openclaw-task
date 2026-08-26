@@ -193,7 +193,7 @@ async def execute_queries(
 
         options = None
         if query.timeout:
-            options = _make_options(query.timeout)
+            options = _make_options(query.timeout, client)
 
         base_session = query.session_name or "main"
         session_name = f"{base_session}_{run_id}"
@@ -354,39 +354,43 @@ async def execute_queries(
     return results
 
 
-def _make_options(timeout: int):
-    """构造 ExecutionOptions — 延迟导入避免循环依赖。"""
-    # (module, attr) 优先级序列;openclaw_sdk 在前,带 3600 上限绕过
-    candidates = [
-        ("openclaw_sdk", "ExecutionOptions"),
-        ("src.hermes_client", "ExecutionOptions"),
-        ("src.claudecode_client", "ExecutionOptions"),
-        ("src.openjiuwen_client", "ExecutionOptions"),
-        ("src.opencode_client", "ExecutionOptions"),
-        ("src.codex_client", "ExecutionOptions"),
-    ]
-    for mod_path, cls_name in candidates:
+def _make_options(timeout: int, client: Any):
+    """构造 ExecutionOptions — 按 client 所属模块路由,延迟导入避免循环依赖。
+
+    openclaw_sdk.ExecutionOptions 有 pydantic 约束 le=3600,需要绕过并打印一次提示;
+    其余 harness 是简单 dataclass,直接构造即可。
+    """
+    client_module = type(client).__module__ or ""
+
+    # openclaw_sdk: pydantic 约束 le=3600,需绕过 + 打印提示
+    if client_module.startswith("openclaw_sdk") or client_module.startswith("src.openclaw_client"):
+        from openclaw_sdk import ExecutionOptions as OpenclawOptions
+        opts = OpenclawOptions()
         try:
-            mod = __import__(mod_path, fromlist=[cls_name])
-            Cls = getattr(mod, cls_name)
-        except ImportError:
-            continue
+            object.__setattr__(opts, "timeout_seconds", int(timeout))
+        except Exception:
+            from pydantic import Field
+            class _Unbounded(OpenclawOptions):
+                timeout_seconds: int = Field(default=300, ge=1)
+            opts = _Unbounded(timeout_seconds=int(timeout))
+        if timeout > 3600:
+            logger.info("openclaw: 已绕过 SDK 3600 上限,向网关下发单次超时 %ds", timeout)
+        return opts
 
-        # openclaw_sdk: pydantic 约束 le=3600,需绕过
-        if mod_path == "openclaw_sdk":
-            opts = Cls()
-            try:
-                object.__setattr__(opts, "timeout_seconds", int(timeout))
-            except Exception:
-                from pydantic import Field
-                class _Unbounded(Cls):
-                    timeout_seconds: int = Field(default=300, ge=1)
-                opts = _Unbounded(timeout_seconds=int(timeout))
-            if timeout > 3600:
-                logger.info("openclaw: 已绕过 SDK 3600 上限,向网关下发单次超时 %ds", timeout)
-            return opts
-
-        # 其余 harness:简单 dataclass,直接构造
-        return Cls(timeout_seconds=timeout)
-
-    return None
+    # 其余 harness:模块 → ExecutionOptions 直接映射
+    harness_options = {
+        "src.hermes_client":     ("src.hermes_client",     "ExecutionOptions"),
+        "src.claudecode_client": ("src.claudecode_client", "ExecutionOptions"),
+        "src.openjiuwen_client": ("src.openjiuwen_client", "ExecutionOptions"),
+        "src.opencode_client":   ("src.opencode_client",   "ExecutionOptions"),
+        "src.codex_client":      ("src.codex_client",      "ExecutionOptions"),
+        "src.pi_client":         ("src.pi_client",      "ExecutionOptions"),
+    }
+    entry = harness_options.get(client_module)
+    if entry is None:
+        logger.warning("_make_options: 未识别的 client 模块 %s,不下发 timeout", client_module)
+        return None
+    mod_path, cls_name = entry
+    mod = __import__(mod_path, fromlist=[cls_name])
+    Cls = getattr(mod, cls_name)
+    return Cls(timeout_seconds=int(timeout))

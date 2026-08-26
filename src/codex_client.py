@@ -102,7 +102,7 @@ class CodexAgent:
 
         # thread_start 不接受业务 session_name。下方把它加入 cwd，只负责隔离
         # 各会话的文件；对话上下文仍由 CodexClient 缓存并复用本 _thread 保留。
-        session_cwd = self._defaults.cwd / ".sessions" / session_dir_name
+        session_cwd = self._defaults.cwd / ".sessions" / self.session_name
         session_cwd.mkdir(parents=True, exist_ok=True)
         # Agent workspace 是会话模板。复制时排除 .sessions，避免递归复制其他会话。
         for source in self._defaults.cwd.iterdir():
@@ -183,6 +183,10 @@ class CodexAgent:
                 await self._interrupt_turn(turn)
             raise
         except Exception as exc:
+            # 与 timeout/cancel 保持一致:本地失败后显式通知 server 停止 turn,
+            # 避免 network drop / JSON 解析等异常时 server 端 turn 还在跑。
+            if turn is not None:
+                await self._interrupt_turn(turn)
             return ExecutionResult(
                 success=False,
                 stop_reason="error",
@@ -235,7 +239,11 @@ class CodexClient:
         try:
             await sdk.__aenter__()
         except Exception:
-            await sdk.close()
+            # 半启动状态下 close() 自身也可能抛
+            try:
+                await sdk.close()
+            except Exception as close_exc:
+                logger.warning("CodexClient 启动失败后 close 又出错: %s", close_exc)
             raise
         self._sdk = sdk
         logger.info("Codex SDK 已启动: CODEX_HOME=%s", self.codex_home)
@@ -295,7 +303,12 @@ class CodexWorkspaceManager(BaseWorkspaceManager):
         self.skills_subdir = Path(".agents/skills")
 
     def get_agent_workspace(self, agent_name: str) -> Path:
-        workspace = self.base_dir / agent_name
+        if agent_name == "main":
+            workspace = self.base_dir
+        else:
+            parent = self.base_dir.parent
+            base_name = self.base_dir.name
+            workspace = parent / f"{base_name}-{agent_name}"
         workspace.mkdir(parents=True, exist_ok=True)
         (workspace / self.skills_subdir).mkdir(parents=True, exist_ok=True)
         return workspace

@@ -9,7 +9,7 @@ OpenCode CLI 子进程客户端封装。
 并续接 sessionID,与 openclaw_client.py 的 gateway 重连模式对齐。
 
 公开 API(与 hermes/claudecode 等 harness 对齐,供 harness_automation 统一装配):
-  OpenCodeClient / OpenCodeAgent / ExecutionResult / ExecutionOptions / OpenCodeError
+  OpenCodeClient / OpenCodeAgent / ExecutionResult / ExecutionOptions / OpenCodeHarnessError
   build_opencode_client()
   OpenCodeWorkspaceManager / OpenCodeAgentManager
   make_opencode_execute_with_retry / make_opencode_get_agent
@@ -38,7 +38,7 @@ EXECUTION_RETRY_WAIT_SECONDS = 60
 _ERROR_TEXT_LIMIT = 4000
 
 
-class OpenCodeError(RuntimeError):
+class OpenCodeHarnessError(RuntimeError):
     """OpenCode CLI 调用失败。"""
 
 
@@ -444,14 +444,9 @@ class OpenCodeClient:
         return self._agents[key]
 
 
-async def build_opencode_client() -> OpenCodeClient:
-    """OpenCodeClient 工厂:定位 opencode 二进制后构造客户端。"""
-    binary = "/usr/local/node24/bin/opencode"
-    if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
-        raise OpenCodeError("未找到 OpenCode CLI；请先安装并确认 `opencode --version` 可用。")
-    logger.info(
-        "OpenCode 客户端就绪；模型与凭证由 opencode.json 管理。")
-    return OpenCodeClient(command=binary)
+async def build_opencode_client(command: str = "opencode") -> OpenCodeClient:
+    """镜像预装配置env：定位 opencode 二进制后构造客户端。"""
+    return OpenCodeClient(command)
 
 
 class OpenCodeWorkspaceManager(BaseWorkspaceManager):
@@ -549,7 +544,7 @@ def make_opencode_execute_with_retry(client: OpenCodeClient):
             try:
                 result = await agent.execute(query_text, options=options)
                 if result is None:
-                    raise OpenCodeError("OpenCode returned None")
+                    raise OpenCodeHarnessError("OpenCode returned None")
                 if result.success and result.content:
                     evidence_incomplete = (
                         result.stop_reason or "complete"
@@ -561,8 +556,8 @@ def make_opencode_execute_with_retry(client: OpenCodeClient):
                     )
                 else:
                     message = "OpenCode returned empty content"
-                raise OpenCodeError(message)
-            except (OpenCodeError, asyncio.TimeoutError) as exc:
+                raise OpenCodeHarnessError(message)
+            except (OpenCodeHarnessError, asyncio.TimeoutError) as exc:
                 last_exc = exc
                 if attempt >= EXECUTION_MAX_ATTEMPTS:
                     raise
@@ -576,7 +571,7 @@ def make_opencode_execute_with_retry(client: OpenCodeClient):
                 await asyncio.sleep(EXECUTION_RETRY_WAIT_SECONDS)
         if last_exc is not None:
             raise last_exc
-        raise OpenCodeError("OpenCode: unknown error after retries")
+        raise OpenCodeHarnessError("OpenCode: unknown error after retries")
 
     return execute_with_retry
 

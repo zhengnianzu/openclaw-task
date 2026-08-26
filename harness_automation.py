@@ -8,6 +8,7 @@
 - openjiuwen
 - opencode
 - codex
+- pi agent
 共享部分: Simulator 工厂、main/CLI 入口。
 特有部分: WorkspaceManager / AgentManager 由 src/ 下的模块提供。
 统一查询执行器: src.executor.execute_queries (回调注入差异)。
@@ -173,6 +174,9 @@ class HarnessAutomation:
         elif self.harness_type == "codex":
             from src.codex_client import CodexWorkspaceManager
             self.workspace_manager = CodexWorkspaceManager("~/.codex/workspace")
+        elif self.harness_type == "pi":
+            from src.pi_client import PiWorkspaceManager
+            self.workspace_manager = PiWorkspaceManager("~/.pi/workspace")
         else:
             from src.openclaw_client import OpenclawWorkspaceManager
             self.workspace_manager = OpenclawWorkspaceManager("~/.openclaw/workspace")
@@ -193,6 +197,8 @@ class HarnessAutomation:
             return await self._run_openjiuwen()
         elif self.harness_type == "codex":
             return await self._run_codex()
+        elif self.harness_type == "pi":
+            return await self._run_pi()
         else:
             return await self._run_openclaw()
 
@@ -410,6 +416,47 @@ class HarnessAutomation:
                 run_id=_RUN_ID,
             )
             return results
+    
+    async def _run_pi(self) -> Dict[str, Any]:
+        from src.pi_client import (
+            PiAgentManager,
+            build_pi_client,
+            make_pi_execute_with_retry,
+            make_pi_get_agent,
+        )
+        from src.executor import execute_queries
+
+        # Pi CLI、models.json/settings.json 由部署流程预先准备。
+        async with await build_pi_client() as client:
+            self.client = client
+            await self._setup_workspaces()
+
+            agent_manager = PiAgentManager(
+                client,
+                self.workspace_manager,
+                agent_overrides=self.agent_overrides,
+            )
+            for agent_config in self.config.agents:
+                await agent_manager.setup_agent(agent_config)
+
+            simulator_factory = lambda: create_simulator(
+                self.config, self.simulator_model_cfg
+            )
+            agent_system_prompts = {
+                a.name: a.system_prompt
+                for a in self.config.agents
+                if a.system_prompt
+            }
+            return await execute_queries(
+                queries=self.config.queries,
+                client=client,
+                get_agent_fn=make_pi_get_agent(client),
+                execute_with_retry_fn=make_pi_execute_with_retry(client),
+                simulator_factory=simulator_factory,
+                agent_system_prompts=agent_system_prompts,
+                max_turn=self.config.user_max_turn,
+                run_id=_RUN_ID,
+            )
           
     async def _setup_workspaces(self) -> None:
         """设置工作空间"""
