@@ -10,6 +10,7 @@
 - JiuwenClaw
 - OpenCode
 - Codex
+- Grok Build
 
 ## OpenClaw 
 > 基于 openclaw-sdk 的配置驱动任务编排框架
@@ -43,7 +44,18 @@
 
 Codex 直接读取部署前准备好的 `~/.codex/config.toml`。Agent 可通过
 `agents[].model` 的 `provider/model` 写法选择服务；同名 `simulator_config`
-配置优先。详见[Codex SDK 集成说明](docs/CODEX_SDK_INTEGRATION_ASSESSMENT.md)。
+配置优先。详见[Codex SDK 集成说明](docs/CODEX_SDK_INTEGRATION.md)。
+
+## Grok Build
+> 基于官方 Grok Build CLI 的 headless JSON 模式。每个
+> `(agent_name, session_name)` 维护一个原生 `sessionId`，后续轮次通过
+> `--resume` 续接；模板下按 session 隔离实际 `cwd`，skills 使用
+> `.agents/skills`。
+
+Grok 读取部署前准备好的 `$GROK_HOME/config.toml` 和认证信息。`agents[].model`
+填写 Grok 模型 alias；harness 不写 endpoint 或密钥。执行目录默认为
+`~/.grok-harness/workspace`，与 `$GROK_HOME` 分离。详见
+[Grok Build 集成说明](docs/GROK_BUILD_INTEGRATION.md)。
 
 ## 特性
 
@@ -66,6 +78,9 @@ pip install -r requirements.txt # OpenClaw 2026.6.6 (8c802aa)  \ Hermes Agent v0
 npm i -g opencode-ai # 1.18.18
 npm install -g @openai/codex # codex-cli 0.147.0
 npm install -g --ignore-scripts @earendil-works/pi-coding-agent # 0.84.2
+# Grok Build 1.0.5: macOS/Linux/Git Bash 使用官方 install.sh；
+# Windows PowerShell 先设置 $env:GROK_VERSION="1.0.5"，再执行：
+# irm https://x.ai/cli/install.ps1 | iex
 ```
 
 ### 2. 确保 OpenClaw 运行
@@ -111,13 +126,18 @@ curl http://127.0.0.1:18789/health
 
 ```bash
 # 同一份 config.json,多harness兼容
-python python harness_automation.py --config configs/config_simple.json --harness openclaw/hermes/claude-code/openjiuwen/opencode...
+python harness_automation.py --config configs/config_simple.json --harness openclaw
+# 其他可选：hermes / claude-code / openjiuwen / opencode / codex / grok
 ```
+
+Grok client 会自动追加 `--always-approve`，无需额外配置环境变量；详细用法见
+集成文档。
 
 ## 文档
 | 文档 | 说明 |
 |---|---|
 | [OPENCODE_INTEGRATION.md](OPENCODE_INTEGRATION.md) | OpenCode 接入方式、opencode.json、workspace、skill、session |
+| [GROK_BUILD_INTEGRATION.md](docs/GROK_BUILD_INTEGRATION.md) | Grok headless、session、模型配置、workspace 与验收 |
 | [CONFIG_STRUCTURE.md](CONFIG_STRUCTURE.md) | 配置结构说明 |
 | [QUICKSTART.md](QUICKSTART.md) | 快速开始 |
 | [DESIGN.md](DESIGN.md) | 架构与设计 |
