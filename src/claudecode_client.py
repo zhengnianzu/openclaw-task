@@ -200,6 +200,12 @@ class ClaudecodeAgent:
             "permission_mode": self._permission_mode,
             # 显式告诉 SDK:让 claude CLI 子进程去读 settings.json。
             "setting_sources": ["user", "project"],
+            "mcp_servers": {
+                "playwright": {
+                    "command": "npx",
+                    "args": ["@playwright/mcp@latest", "--browser", "chromium"],
+                },
+            },
         }
         kwargs["system_prompt"] = {
             "type": "preset",
