@@ -1,6 +1,7 @@
 # openclaw harness
 openclaw-sdk==2.1.0
 aiohttp
+requests>=2.31
 
 # hermes harness
 pydantic>=2,<3
@@ -17,3 +18,6 @@ anthropic==0.86.0
 
 # codex
 openai-codex==0.144.4
+
+# DeepSeek Harness（官方 runtime 暂不提供 Windows/macOS x64 wheel）
+deepseek-harness-sdk==0.1.1rc1; platform_system == "Linux" or (platform_system == "Darwin" and platform_machine == "arm64")

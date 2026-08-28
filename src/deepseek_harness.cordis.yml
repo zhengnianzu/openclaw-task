@@ -1,0 +1,47 @@
+# OpenClaw Task 使用的 DeepSeek Harness JSON-RPC 组合。
+# stdout 专供 SDK 协议，不能挂载终端 UI 或 stdout logger。
+
+- id: sdk-jsonrpc-server
+  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
+
+- id: agent-core
+  name: '@deepseek-ai/dsh-agent-spine-demo'
+  config:
+    persona: !!js process.env.DSH_SYSTEM_PROMPT ?? ''
+    workspaceContext:
+      maxBytes: 65536
+    skills:
+      enabled: !!js process.env.DSH_HARNESS_TOOLS_ENABLED !== '0'
+    toolBash: !!js "process.env.DSH_HARNESS_TOOLS_ENABLED === '0' ? false : {}"
+    toolJobs: !!js "process.env.DSH_HARNESS_TOOLS_ENABLED === '0' ? false : {}"
+
+- id: llm-deepseek
+  name: '@deepseek-ai/dsh-llm-deepseek'
+
+- id: llm-multi-provider
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers: !!js JSON.parse(process.env.DSH_LLM_PI_AI_PROVIDERS ?? '{}')
+
+- id: sessions
+  name: '@deepseek-ai/dsh-session-persistence-jsonl'
+  config:
+    root: !!js process.env.DSH_SESSION_ROOT ?? './.sessions'
+
+- id: session-checkpoints
+  name: '@deepseek-ai/dsh-session-checkpoint-policy'
+
+- id: subprocess
+  name: '@deepseek-ai/dsh-subprocess-local'
+  disabled: !!js process.env.DSH_HARNESS_TOOLS_ENABLED === '0'
+
+- id: bash
+  name: '@deepseek-ai/dsh-bash-local'
+  disabled: !!js process.env.DSH_HARNESS_TOOLS_ENABLED === '0'
+  config:
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+
+- id: fs-local
+  name: '@deepseek-ai/dsh-fs-local'
+  config:
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()

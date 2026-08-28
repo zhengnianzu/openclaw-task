@@ -10,6 +10,7 @@
 - JiuwenClaw
 - OpenCode
 - Codex
+- DeepSeek Harness
 
 ## OpenClaw 
 > 基于 openclaw-sdk 的配置驱动任务编排框架
@@ -45,6 +46,17 @@ Codex 直接读取部署前准备好的 `~/.codex/config.toml`。Agent 可通过
 `agents[].model` 的 `provider/model` 写法选择服务；同名 `simulator_config`
 配置优先。详见[Codex SDK 集成说明](docs/CODEX_SDK_INTEGRATION_ASSESSMENT.md)。
 
+## DeepSeek Harness
+> 基于官方 `deepseek-harness-sdk` 和配套 JSON-RPC stdio runtime。每个
+> `(agent_name, session_name)` 维护一个长驻 runtime，复用多轮上下文；实际 cwd、
+> session 日志和 `.agents/skills` 相互隔离。
+
+DeepSeek 可从 `~/.deepseek-harness/config.yml` 读取多 provider、多模型和明文密钥，
+Agent 通过 `agents[].model` 的 `provider/model` 选择服务，不读取
+`simulator_config` 中的同名 Agent 配置；未提供该文件时回退到
+`DEEPSEEK_API_KEY`/`DEEPSEEK_BASE_URL`。官方 runtime 当前只支持 Linux x64/arm64
+与 macOS arm64。详见[DeepSeek Harness 集成说明](docs/DEEPSEEK_HARNESS_INTEGRATION.md)。
+
 ## 特性
 
 - ✅ **配置驱动** - 通过 JSON/YAML 配置定义所有任务
@@ -66,6 +78,7 @@ pip install -r requirements.txt # OpenClaw 2026.6.6 (8c802aa)  \ Hermes Agent v0
 npm i -g opencode-ai # 1.18.18
 npm install -g @openai/codex # codex-cli 0.147.0
 npm install -g --ignore-scripts @earendil-works/pi-coding-agent # 0.84.2
+# DeepSeek Harness 在受支持平台由 requirements.txt 安装 Python SDK/runtime
 ```
 
 ### 2. 确保 OpenClaw 运行
@@ -111,13 +124,14 @@ curl http://127.0.0.1:18789/health
 
 ```bash
 # 同一份 config.json,多harness兼容
-python python harness_automation.py --config configs/config_simple.json --harness openclaw/hermes/claude-code/openjiuwen/opencode...
+python harness_automation.py --config configs/config_simple.json --harness deepseek
 ```
 
 ## 文档
 | 文档 | 说明 |
 |---|---|
 | [OPENCODE_INTEGRATION.md](OPENCODE_INTEGRATION.md) | OpenCode 接入方式、opencode.json、workspace、skill、session |
+| [DEEPSEEK_HARNESS_INTEGRATION.md](docs/DEEPSEEK_HARNESS_INTEGRATION.md) | DeepSeek SDK、JSON-RPC session、平台限制与验收 |
 | [CONFIG_STRUCTURE.md](CONFIG_STRUCTURE.md) | 配置结构说明 |
 | [QUICKSTART.md](QUICKSTART.md) | 快速开始 |
 | [DESIGN.md](DESIGN.md) | 架构与设计 |
@@ -199,8 +213,11 @@ python python harness_automation.py --config configs/config_simple.json --harnes
 | **ClaudeCode** | 环境变量 `ANTHROPIC_MODEL` | 裸模型名 | 不需要 |
 | **OpenJiuwen** | `simulator_config[agent]`，其次 `~/.openjiuwen/openjiuwen.json` 的 `agents.<name>` 和 `default` | 裸模型名 | 可省略（默认 OpenAI）；原生 provider 需使用白名单名称 |
 | **OpenCode** | OpenCode 自身配置；可选 CLI `--model` 覆盖 | `provider/model` | 覆盖时必填 |
+| **DeepSeek Harness** | 官方 SDK 初始化参数 | `provider/model` | 可省略，默认 `deepseek-official` |
 
-`user_proxy_model.json` 统一调配各 agent 的模型。OpenClaw 场景需要配 `provider` 字段拼接 `provider/model`，其他 harness 忽略该字段：
+`user_proxy_model.json` 可调配其他后端的 Agent 模型。DeepSeek Harness 的 Agent
+路由完全来自 `~/.deepseek-harness/config.yml` 和 `agents[].model`，只使用该 JSON
+中的 `user_simulator` 段配置公共模拟用户。其余后端按上表处理：
 
 ```json
 {

@@ -173,6 +173,14 @@ class HarnessAutomation:
         elif self.harness_type == "codex":
             from src.codex_client import CodexWorkspaceManager
             self.workspace_manager = CodexWorkspaceManager("~/.codex/workspace")
+        elif self.harness_type == "deepseek":
+            from src.dsh_client import (
+                DeepSeekWorkspaceManager,
+                resolve_deepseek_workspace_root,
+            )
+            self.workspace_manager = DeepSeekWorkspaceManager(
+                str(resolve_deepseek_workspace_root())
+            )
         else:
             from src.openclaw_client import OpenclawWorkspaceManager
             self.workspace_manager = OpenclawWorkspaceManager("~/.openclaw/workspace")
@@ -193,6 +201,8 @@ class HarnessAutomation:
             return await self._run_openjiuwen()
         elif self.harness_type == "codex":
             return await self._run_codex()
+        elif self.harness_type == "deepseek":
+            return await self._run_deepseek()
         else:
             return await self._run_openclaw()
 
@@ -410,7 +420,46 @@ class HarnessAutomation:
                 run_id=_RUN_ID,
             )
             return results
-          
+
+    async def _run_deepseek(self) -> Dict[str, Any]:
+        from src.dsh_client import (
+            DeepSeekAgentManager,
+            build_deepseek_client,
+            execute_deepseek,
+        )
+        from src.executor import execute_queries
+
+        # SDK runtime 读取 DeepSeek 单文件配置；未提供时继承部署环境凭证。
+        async with await build_deepseek_client() as client:
+            self.client = client
+            agent_manager = DeepSeekAgentManager(
+                client,
+                self.workspace_manager,
+            )
+            await self._setup_workspaces()
+
+            for agent_config in self.config.agents:
+                await agent_manager.setup_agent(agent_config)
+
+            simulator_factory = lambda: create_simulator(
+                self.config, self.simulator_model_cfg
+            )
+            agent_system_prompts = {
+                a.name: a.system_prompt
+                for a in self.config.agents
+                if a.system_prompt
+            }
+            return await execute_queries(
+                queries=self.config.queries,
+                client=client,
+                get_agent_fn=client.get_agent,
+                execute_with_retry_fn=execute_deepseek,
+                simulator_factory=simulator_factory,
+                agent_system_prompts=agent_system_prompts,
+                max_turn=self.config.user_max_turn,
+                run_id=_RUN_ID,
+            )
+
     async def _setup_workspaces(self) -> None:
         """设置工作空间"""
         logger.info("设置工作空间...")
