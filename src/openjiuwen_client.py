@@ -122,7 +122,8 @@ class ExecutionResult:
     stop_reason: Optional[str] = "complete"
     error_message: Optional[str] = None
     usage: Optional[Dict[str, Any]] = None
-    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    # 本轮 ContextEngine 新增消息(经 pydantic model_dump 转成 OpenAI 原生 dict:
+    messages: Optional[List[Dict[str, Any]]] = field(default=None)
     files: List[Dict[str, Any]] = field(default_factory=list)
 
     def model_copy(self, *, update: Optional[Dict[str, Any]] = None) -> "ExecutionResult":
@@ -132,7 +133,7 @@ class ExecutionResult:
             "stop_reason": self.stop_reason,
             "error_message": self.error_message,
             "usage": self.usage,
-            "tool_calls": list(self.tool_calls),
+            "messages": self.messages,
             "files": list(self.files),
         }
         if update:
@@ -267,6 +268,37 @@ def _positive_timeout(options: Optional[ExecutionOptions]) -> Optional[float]:
     timeout = float(options.timeout_seconds)
     return timeout if timeout > 0 else None
 
+
+def _snapshot_context(deep_agent: Any, session_name: str) -> List[Any]:
+    """安全读取 DeepAgent 当前上下文消息;未初始化 / 无 session 时返回空列表。"""
+    getter = getattr(deep_agent, "get_current_context", None)
+    if not callable(getter):
+        return []
+    try:
+        msgs = getter(session_id=session_name)
+    except Exception as e:  # noqa: BLE001
+        # 首轮 invoke 前 context 未创建时 SDK 会抛错,视为空快照。
+        logger.debug("get_current_context 快照失败 (session=%s): %s", session_name, e)
+        return []
+    return list(msgs or [])
+
+
+def _dump_message(msg: Any) -> Optional[Dict[str, Any]]:
+    """把 ContextEngine 里的一条消息序列化成 OpenAI 兼容 dict。"""
+    if msg is None:
+        return None
+    if isinstance(msg, dict):
+        return msg
+    dump = getattr(msg, "model_dump", None)
+    if callable(dump):
+        try:
+            return dump()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("消息 model_dump 失败: %s", e)
+            return None
+    return None
+
+
 # ============================================================================
 # OpenjiuwenAgent — (agent_name, session_name) 会话句柄
 # ============================================================================
@@ -282,8 +314,29 @@ class OpenjiuwenAgent:
         self.session_id = session_name
         self.session_key = session_name
 
+    def _collect_new_messages(self, before: List[Any]) -> List[Dict[str, Any]]:
+        """比对 invoke 前后 ContextEngine 消息,序列化本轮新增消息为 OpenAI dict 列表。"""
+        try:
+            after = _snapshot_context(self._agent, self.session_name)
+            if len(after) <= len(before):
+                return []
+            new_msgs = after[len(before):]
+            dumped: List[Dict[str, Any]] = []
+            for m in new_msgs:
+                d = _dump_message(m)
+                if d is not None:
+                    dumped.append(d)
+            return dumped
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "抽取 messages 失败 (agent=%s session=%s): %s",
+                self.agent_name, self.session_name, e,
+            )
+            return []
+
     async def execute(self, query: str, options: Optional[ExecutionOptions] = None) -> ExecutionResult:
         timeout = _positive_timeout(options)
+        before_msgs = _snapshot_context(self._agent, self.session_name)
         try:
             invocation = self._agent.invoke(
                 {"query": query, "conversation_id": self.session_name}
@@ -298,6 +351,7 @@ class OpenjiuwenAgent:
                 success=False,
                 stop_reason="timeout",
                 error_message=f"DeepAgent invocation timed out after {timeout}s",
+                messages=self._collect_new_messages(before_msgs),
             )
         except Exception as e:  # noqa: BLE001
             logger.exception(
@@ -308,7 +362,10 @@ class OpenjiuwenAgent:
                 success=False,
                 stop_reason="error",
                 error_message=str(e),
+                messages=self._collect_new_messages(before_msgs),
             )
+
+        messages = self._collect_new_messages(before_msgs)
 
         if isinstance(response, dict):
             output = response.get("output", "")
@@ -320,6 +377,7 @@ class OpenjiuwenAgent:
             content=content,
             stop_reason="complete" if content else "error",
             error_message=None if content else "DeepAgent returned empty output",
+            messages=messages,
         )
 
 

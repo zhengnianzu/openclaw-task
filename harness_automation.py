@@ -9,6 +9,7 @@
 - opencode
 - codex
 - pi agent
+- grok
 共享部分: Simulator 工厂、main/CLI 入口。
 特有部分: WorkspaceManager / AgentManager 由 src/ 下的模块提供。
 统一查询执行器: src.executor.execute_queries (回调注入差异)。
@@ -177,6 +178,9 @@ class HarnessAutomation:
         elif self.harness_type == "pi":
             from src.pi_client import PiWorkspaceManager
             self.workspace_manager = PiWorkspaceManager("~/.pi/workspace")
+        elif self.harness_type == "grok":
+            from src.grok_client import GrokWorkspaceManager
+            self.workspace_manager = GrokWorkspaceManager("~/.grok/workspace")
         else:
             from src.openclaw_client import OpenclawWorkspaceManager
             self.workspace_manager = OpenclawWorkspaceManager("~/.openclaw/workspace")
@@ -199,6 +203,8 @@ class HarnessAutomation:
             return await self._run_codex()
         elif self.harness_type == "pi":
             return await self._run_pi()
+        elif self.harness_type == "grok":
+            return await self._run_grok()
         else:
             return await self._run_openclaw()
 
@@ -452,6 +458,46 @@ class HarnessAutomation:
                 client=client,
                 get_agent_fn=make_pi_get_agent(client),
                 execute_with_retry_fn=make_pi_execute_with_retry(client),
+                simulator_factory=simulator_factory,
+                agent_system_prompts=agent_system_prompts,
+                max_turn=self.config.user_max_turn,
+                run_id=_RUN_ID,
+            )
+
+    async def _run_grok(self) -> Dict[str, Any]:
+        from src.grok_client import (
+            GrokAgentManager,
+            build_grok_client,
+            make_grok_execute_with_retry,
+            make_grok_get_agent,
+        )
+        from src.executor import execute_queries
+
+        # 标准 $GROK_HOME/config.toml 由部署流程准备；harness 只调用 CLI。
+        async with await build_grok_client() as client:
+            self.client = client
+            agent_manager = GrokAgentManager(
+                client,
+                self.workspace_manager,
+                agent_overrides=self.agent_overrides,
+            )
+          
+            for agent_config in self.config.agents:
+                await agent_manager.setup_agent(agent_config)
+
+            simulator_factory = lambda: create_simulator(
+                self.config, self.simulator_model_cfg
+            )
+            agent_system_prompts = {
+                a.name: a.system_prompt
+                for a in self.config.agents
+                if a.system_prompt
+            }
+            return await execute_queries(
+                queries=self.config.queries,
+                client=client,
+                get_agent_fn=make_grok_get_agent(client),
+                execute_with_retry_fn=make_grok_execute_with_retry(client),
                 simulator_factory=simulator_factory,
                 agent_system_prompts=agent_system_prompts,
                 max_turn=self.config.user_max_turn,

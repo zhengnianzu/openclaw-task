@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import shutil
@@ -28,6 +29,16 @@ class CodexHarnessError(RuntimeError):
 
 
 @dataclass
+class ToolCall:
+    """一次 Codex 工具调用及其输入、输出和耗时。"""
+
+    tool: str
+    input: Any = ""
+    output: Optional[str] = None
+    duration_ms: Optional[int] = None
+
+
+@dataclass
 class ExecutionResult:
     success: bool = True
     content: str = ""
@@ -36,6 +47,7 @@ class ExecutionResult:
     usage: Optional[Dict[str, Any]] = field(default=None)
     session_id: Optional[str] = None
     model_provider: Optional[str] = None
+    tool_calls: List[ToolCall] = field(default_factory=list)
 
     def model_copy(
         self, *, update: Optional[Dict[str, Any]] = None
@@ -48,6 +60,7 @@ class ExecutionResult:
             "usage": self.usage,
             "session_id": self.session_id,
             "model_provider": self.model_provider,
+            "tool_calls": list(self.tool_calls),
         }
         if update:
             data.update(update)
@@ -76,6 +89,147 @@ def _usage_dict(usage: Any) -> Optional[Dict[str, Any]]:
         value = usage.model_dump(mode="json", exclude_none=True)
         return value if isinstance(value, dict) else None
     return None
+
+
+def _json_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _item_dict(item: Any) -> Dict[str, Any]:
+    """把 SDK 的 ThreadItem RootModel 解包为当前版本的 snake_case 字典。"""
+    item = getattr(item, "root", item)
+    if isinstance(item, dict):
+        return item
+    if hasattr(item, "model_dump"):
+        return item.model_dump(mode="json", exclude_none=True)
+    return {}
+
+
+def _extract_codex_tool_calls(result: Any) -> List[ToolCall]:
+    """只从当前 TurnResult.items 提取本轮已完成的工具调用。"""
+    calls: List[ToolCall] = []
+    for raw_item in getattr(result, "items", None) or []:
+        item = _item_dict(raw_item)
+        item_type = item.get("type")
+        duration_ms = item.get("duration_ms")
+
+        if item_type == "commandExecution":
+            calls.append(
+                ToolCall(
+                    tool=item_type,
+                    input={"command": item.get("command"), "cwd": item.get("cwd")},
+                    output=_json_text(
+                        {
+                            "status": item.get("status"),
+                            "exit_code": item.get("exit_code"),
+                            "output": item.get("aggregated_output"),
+                        }
+                    ),
+                    duration_ms=duration_ms,
+                )
+            )
+        elif item_type == "mcpToolCall":
+            tool_name = ".".join(
+                part for part in [item.get("server"), item.get("tool")] if part
+            )
+            result_data = item.get("result") or {}
+            calls.append(
+                ToolCall(
+                    tool=tool_name or item_type,
+                    input=item.get("arguments"),
+                    output=_json_text(
+                        {
+                            "status": item.get("status"),
+                            "content": result_data.get("content"),
+                            "structured_content": result_data.get("structured_content"),
+                            "error": (item.get("error") or {}).get("message"),
+                        }
+                    ),
+                    duration_ms=duration_ms,
+                )
+            )
+        elif item_type == "dynamicToolCall":
+            tool_name = item.get("tool") or item_type
+            if item.get("namespace"):
+                tool_name = f"{item['namespace']}.{tool_name}"
+            calls.append(
+                ToolCall(
+                    tool=tool_name,
+                    input=item.get("arguments"),
+                    output=_json_text(
+                        {
+                            "status": item.get("status"),
+                            "success": item.get("success"),
+                            "content": item.get("content_items"),
+                        }
+                    ),
+                    duration_ms=duration_ms,
+                )
+            )
+        elif item_type == "collabAgentToolCall":
+            calls.append(
+                ToolCall(
+                    tool=item.get("tool") or item_type,
+                    input={
+                        "prompt": item.get("prompt"),
+                        "model": item.get("model"),
+                        "receiver_thread_ids": item.get("receiver_thread_ids"),
+                    },
+                    output=_json_text(
+                        {
+                            "status": item.get("status"),
+                            "agents_states": item.get("agents_states"),
+                        }
+                    ),
+                )
+            )
+        elif item_type == "webSearch":
+            calls.append(
+                ToolCall(
+                    tool=item_type,
+                    input={"query": item.get("query"), "action": item.get("action")},
+                    output=_json_text({"results": item.get("results")}),
+                )
+            )
+        elif item_type == "fileChange":
+            calls.append(
+                ToolCall(
+                    tool=item_type,
+                    input={"changes": item.get("changes")},
+                    output=_json_text({"status": item.get("status")}),
+                )
+            )
+        elif item_type == "imageGeneration":
+            calls.append(
+                ToolCall(
+                    tool=item_type,
+                    input={"revised_prompt": item.get("revised_prompt")},
+                    output=_json_text(
+                        {
+                            "status": item.get("status"),
+                            "result": item.get("result"),
+                            "saved_path": item.get("saved_path"),
+                        }
+                    ),
+                )
+            )
+        elif item_type == "imageView":
+            calls.append(
+                ToolCall(tool=item_type, input={"path": item.get("path")})
+            )
+        elif item_type == "sleep":
+            calls.append(
+                ToolCall(
+                    tool=item_type,
+                    input={"duration_ms": item.get("duration_ms")},
+                    duration_ms=duration_ms,
+                )
+            )
+    return calls
 
 
 class CodexAgent:
@@ -200,6 +354,7 @@ class CodexAgent:
         status = getattr(result, "status", None)
         status_text = getattr(status, "value", None) or str(status or "complete")
         success = bool(content) and error is None
+        tool_calls = _extract_codex_tool_calls(result)
         return ExecutionResult(
             success=success,
             content=content,
@@ -210,6 +365,7 @@ class CodexAgent:
             usage=_usage_dict(getattr(result, "usage", None)),
             session_id=thread.id,
             model_provider=self._defaults.model_provider,
+            tool_calls=tool_calls,
         )
 
 

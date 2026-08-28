@@ -53,6 +53,17 @@ Pi CLI 和 `~/.pi/agent/models.json`、`settings.json` 由部署环境预先准�
 Agent 可通过 `agents[].model` 的 `provider/model` 写法选择服务；服务地址和明文密钥写在 `models.json`。详见
 [Pi RPC 集成说明](docs/PI_RPC_INTEGRATION_ASSESSMENT.md)。
 
+## Grok Build
+> 基于官方 Grok Build CLI 的 headless JSON 模式。每个
+> `(agent_name, session_name)` 维护一个原生 `sessionId`，后续轮次通过
+> `--resume` 续接；模板下按 session 隔离实际 `cwd`，skills 使用
+> `.agents/skills`。
+
+Grok 读取部署前准备好的 `$GROK_HOME/config.toml` 和认证信息。`agents[].model`
+填写 Grok 模型 alias；harness 不写 endpoint 或密钥。执行目录默认为
+`~/.grok-harness/workspace`，与 `$GROK_HOME` 分离。详见
+[Grok Build 集成说明](docs/GROK_BUILD_INTEGRATION.md)。
+
 
 ## 特性
 
@@ -71,10 +82,11 @@ Agent 可通过 `agents[].model` 的 `provider/model` 写法选择服务；服�
 
 ```bash
 # 一份 requirements.txt 涵盖两个后端 (openclaw + hermes)
-pip install -r requirements.txt # OpenClaw 2026.6.6 (8c802aa)  \ Hermes Agent v0.18.2 (2026.7.7.2) \ 2.1.22 (Claude Code)
+pip install -r requirements.txt # OpenClaw 2026.6.6 (8c802aa)  \ Hermes Agent v0.19.0 (2026.7.7.2) \ 2.1.22 (Claude Code)
 npm i -g opencode-ai # 1.18.18
 npm install -g @openai/codex # codex-cli 0.147.0
 npm install -g --ignore-scripts @earendil-works/pi-coding-agent # pi 0.84.3
+npm install -g @xai-official/grok # grok build 1.0.5
 ```
 
 ### 2. 确保 OpenClaw 运行
