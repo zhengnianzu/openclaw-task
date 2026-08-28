@@ -10,6 +10,7 @@
 - JiuwenClaw
 - OpenCode
 - Codex
+- Pi
 
 ## OpenClaw 
 > 基于 openclaw-sdk 的配置驱动任务编排框架
@@ -35,15 +36,34 @@
 | `opencode run --format json --dir <workspace>` | 需要 `opencode` CLI 已安装并已在 OpenCode 自身配置中设置可用服务 |
 详见 `src/opencode_client.py` 和 `configs/config_opencode.json`。模型、provider、endpoint 与凭证默认由 OpenCode 自身配置读取。
 
-
 ## Codex
 > 基于官方 `openai-codex` Python SDK。一个 run 维护一个 `AsyncCodex`
 > app-server，每个 `(agent_name, session_name)` 维护一个真实 thread；每个 Agent
 > 使用独立模板目录，thread 在该目录下按 session 隔离 `cwd`，项目级技能放在 `.agents/skills`。
 
 Codex 直接读取部署前准备好的 `~/.codex/config.toml`。Agent 可通过
-`agents[].model` 的 `provider/model` 写法选择服务；同名 `simulator_config`
-配置优先。详见[Codex SDK 集成说明](docs/CODEX_SDK_INTEGRATION_ASSESSMENT.md)。
+`agents[].model` 的 `provider/model` 写法选择服务；详见[Codex SDK 集成说明](docs/CODEX_SDK_INTEGRATION_ASSESSMENT.md)。
+
+## Pi
+> 基于 Pi CLI 官方 RPC 模式。每个 `(agent_name, session_name)` 维护一个
+> `pi --mode rpc --no-session` 子进程，通过 stdin/stdout JSONL 通信；每个 Agent
+> 使用独立模板目录，并在其下按 session 隔离实际 `cwd`。
+
+Pi CLI 和 `~/.pi/agent/models.json`、`settings.json` 由部署环境预先准备。
+Agent 可通过 `agents[].model` 的 `provider/model` 写法选择服务；服务地址和明文密钥写在 `models.json`。详见
+[Pi RPC 集成说明](docs/PI_RPC_INTEGRATION_ASSESSMENT.md)。
+
+## Grok Build
+> 基于官方 Grok Build CLI 的 headless JSON 模式。每个
+> `(agent_name, session_name)` 维护一个原生 `sessionId`，后续轮次通过
+> `--resume` 续接；模板下按 session 隔离实际 `cwd`，skills 使用
+> `.agents/skills`。
+
+Grok 读取部署前准备好的 `$GROK_HOME/config.toml` 和认证信息。`agents[].model`
+填写 Grok 模型 alias；harness 不写 endpoint 或密钥。执行目录默认为
+`~/.grok-harness/workspace`，与 `$GROK_HOME` 分离。详见
+[Grok Build 集成说明](docs/GROK_BUILD_INTEGRATION.md)。
+
 
 ## 特性
 
@@ -62,10 +82,11 @@ Codex 直接读取部署前准备好的 `~/.codex/config.toml`。Agent 可通过
 
 ```bash
 # 一份 requirements.txt 涵盖两个后端 (openclaw + hermes)
-pip install -r requirements.txt # OpenClaw 2026.6.6 (8c802aa)  \ Hermes Agent v0.18.2 (2026.7.7.2) \ 2.1.22 (Claude Code)
+pip install -r requirements.txt # OpenClaw 2026.6.6 (8c802aa)  \ Hermes Agent v0.19.0 (2026.7.7.2) \ 2.1.22 (Claude Code)
 npm i -g opencode-ai # 1.18.18
 npm install -g @openai/codex # codex-cli 0.147.0
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent # 0.84.2
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent # pi 0.84.3
+npm install -g @xai-official/grok # grok build 1.0.5
 ```
 
 ### 2. 确保 OpenClaw 运行

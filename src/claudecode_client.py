@@ -11,7 +11,10 @@ Claude Code (claude_agent_sdk) 进程内客户端封装
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -24,6 +27,9 @@ from claude_agent_sdk import (
     ResultMessage,
     SystemMessage,
     TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
 )
 
 from src.workspace import BaseWorkspaceManager, copy_path
@@ -32,6 +38,29 @@ from src.config import AgentModelConfig, warn_agent_model_conflict
 logger = logging.getLogger("harness_automation")
 # SDK 对 `claude` CLI 子进程的 stdout 做了 单条 JSON 消息 1 MiB 上限
 _claude_code_max_buffer_size = 32 * 1024 * 1024  # 32 MiB
+
+# Claude Code CLI 的用户级配置
+_CC_USER_SETTINGS_PATH = Path("~/.claude/settings.json").expanduser()
+
+
+def _read_cc_small_fast_model() -> Optional[str]:
+    """从 ~/.claude/settings.json 读 env.ANTHROPIC_SMALL_FAST_MODEL,读不到返回 None。
+
+    仅在 setup_agent 有 override 且 override.model 存在时调用。文件/JSON/字段任何
+    一环缺失都返回 None,交由上层降级到 override.model。
+    """
+    override_path = os.environ.get("CLAUDE_SETTINGS_PATH")
+    path = Path(override_path).expanduser() if override_path else _CC_USER_SETTINGS_PATH
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("读取 %s 失败,SMALL_FAST_MODEL 回落 override: %s", path, e)
+        return None
+    env = data.get("env") if isinstance(data, dict) else None
+    val = env.get("ANTHROPIC_SMALL_FAST_MODEL") if isinstance(env, dict) else None
+    return val if isinstance(val, str) and val.strip() else None
 
 # ============================================================================
 # 异常类型
@@ -46,6 +75,19 @@ class ClaudecodeError(RuntimeError):
 # ============================================================================
 
 @dataclass
+class ToolCall:
+    """一次 Claude Code 工具调用及其输入、输出和耗时。
+
+    与 pi_client / codex_client / grok_client 的 ToolCall 结构对齐,便于
+    executor.process_turn 直接从 ExecutionResult.tool_calls 走同一分支。
+    """
+    tool: str
+    input: Any = ""
+    output: Optional[str] = None
+    duration_ms: Optional[int] = None
+
+
+@dataclass
 class ExecutionResult:
     success: bool = True
     content: str = ""
@@ -54,6 +96,7 @@ class ExecutionResult:
     usage: Optional[Dict[str, Any]] = field(default=None)
     session_id: Optional[str] = None
     total_cost_usd: Optional[float] = None
+    tool_calls: List[ToolCall] = field(default_factory=list)
 
     def model_copy(self, *, update: Optional[Dict[str, Any]] = None) -> "ExecutionResult":
         data = {
@@ -64,6 +107,7 @@ class ExecutionResult:
             "usage": self.usage,
             "session_id": self.session_id,
             "total_cost_usd": self.total_cost_usd,
+            "tool_calls": list(self.tool_calls),
         }
         if update:
             data.update(update)
@@ -86,6 +130,31 @@ def _extract_assistant_text(msg: AssistantMessage) -> str:
         if isinstance(block, TextBlock):
             parts.append(block.text)
     return "".join(parts)
+
+
+def _tool_result_text(content: Any) -> Optional[str]:
+    """把 ToolResultBlock.content 归一成字符串:字符串直接返回,
+    list[dict] 抽 text 字段拼接,None 返回 None,其它 fallback json.dumps。"""
+    if content is None:
+        return None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                    continue
+                parts.append(json.dumps(item, ensure_ascii=False))
+            else:
+                parts.append(str(item))
+        return "".join(parts)
+    try:
+        return json.dumps(content, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(content)
 
 
 # ============================================================================
@@ -131,6 +200,12 @@ class ClaudecodeAgent:
             "permission_mode": self._permission_mode,
             # 显式告诉 SDK:让 claude CLI 子进程去读 settings.json。
             "setting_sources": ["user", "project"],
+            "mcp_servers": {
+                "playwright": {
+                    "command": "npx",
+                    "args": ["@playwright/mcp@latest", "--browser", "chromium"],
+                },
+            },
         }
         kwargs["system_prompt"] = {
             "type": "preset",
@@ -224,20 +299,58 @@ class ClaudecodeAgent:
                 last_result: Optional[ResultMessage] = None
                 last_assistant_error: Optional[str] = None
 
+                # 工具调用收集:AssistantMessage.ToolUseBlock 记入 pending,
+                # 随后 UserMessage.ToolResultBlock 按 tool_use_id 匹配封口;
+                # 顺序保持首次 use 的时序,便于逐轮证据回放。
+                tool_calls_order: List[str] = []
+                tool_calls_by_id: Dict[str, ToolCall] = {}
+                tool_started_at: Dict[str, float] = {}
+
                 async for msg in sdk.receive_response():
                     if isinstance(msg, AssistantMessage):
                         text_parts.append(_extract_assistant_text(msg))
                         if msg.error:
                             last_assistant_error = msg.error
+                        for block in msg.content:
+                            if isinstance(block, ToolUseBlock):
+                                if block.id in tool_calls_by_id:
+                                    continue
+                                tool_calls_by_id[block.id] = ToolCall(
+                                    tool=block.name,
+                                    input=block.input,
+                                )
+                                tool_calls_order.append(block.id)
+                                tool_started_at[block.id] = time.monotonic()
+                    elif isinstance(msg, UserMessage):
+                        # UserMessage.content 在含工具结果时是 list;子代理返回的用户消息才走这条
+                        if isinstance(msg.content, list):
+                            for block in msg.content:
+                                if not isinstance(block, ToolResultBlock):
+                                    continue
+                                tc = tool_calls_by_id.get(block.tool_use_id)
+                                if tc is None:
+                                    continue
+                                tc.output = _tool_result_text(block.content)
+                                if block.is_error:
+                                    tc.output = f"[error] {tc.output or ''}"
+                                started = tool_started_at.pop(block.tool_use_id, None)
+                                if started is not None:
+                                    tc.duration_ms = round(
+                                        (time.monotonic() - started) * 1000
+                                    )
                     elif isinstance(msg, ResultMessage):
                         last_result = msg
                     elif isinstance(msg, SystemMessage):
+                        # thinking_tokens 是 SDK 的流式思考进度心跳,单次 execute
+                        if msg.subtype == "thinking_tokens":
+                            continue
                         logger.debug(
                             "[claudecode system] %s %s",
                             msg.subtype, msg.data,
                         )
 
                 content = "".join(text_parts).strip()
+                tool_calls = [tool_calls_by_id[i] for i in tool_calls_order]
 
                 if last_result is None:
                     return ExecutionResult(
@@ -248,6 +361,7 @@ class ClaudecodeAgent:
                             last_assistant_error
                             or "ClaudeSDKClient 流提前结束,没有收到 ResultMessage"
                         ),
+                        tool_calls=tool_calls,
                     )
 
                 if last_result.is_error:
@@ -263,6 +377,7 @@ class ClaudecodeAgent:
                         usage=last_result.usage,
                         session_id=last_result.session_id,
                         total_cost_usd=last_result.total_cost_usd,
+                        tool_calls=tool_calls,
                     )
 
                 if not content and last_result.result:
@@ -275,6 +390,7 @@ class ClaudecodeAgent:
                     usage=last_result.usage,
                     session_id=last_result.session_id,
                     total_cost_usd=last_result.total_cost_usd,
+                    tool_calls=tool_calls,
                 )
 
             try:
@@ -522,6 +638,11 @@ class ClaudecodeAgentManager:
             if override.model:
                 effective_model = override.model
                 env["ANTHROPIC_MODEL"] = override.model
+                # (与 main agent 走 CLI 继承的配置源一致);读不到再降级 override.model。
+                env.setdefault(
+                    "ANTHROPIC_SMALL_FAST_MODEL",
+                    _read_cc_small_fast_model() or override.model,
+                )
             if override.base_url:
                 env["ANTHROPIC_BASE_URL"] = override.base_url
             if override.api_key:

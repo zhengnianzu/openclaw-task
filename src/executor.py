@@ -85,26 +85,37 @@ async def process_turn(
     if evaluator is None:
         return None
 
-    # 能力1:从 OC chat_history 解析本轮新增工具调用(SDK 的 ExecutionResult.tool_calls
-    # 对服务端自主 agent 恒空),再逐轮捕获带证据的轨迹(文件证据升级为磁盘真相 D5)。
+    # 能力1:从各 client 获取本轮工具调用证据,再逐轮捕获带证据的轨迹(文件证据升级为磁盘真相 D5)。
     # 即便本轮不评审也要捕获,否则评审点窗口取不到中间轮数据。
     # before_history 须由调用方在 execute 之前采集(本轮基线),after 在此处取以截取增量。
     turn_tool_calls: Optional[List[ToolCallEvidence]] = None
     if agent is not None:
         try:
-            gateway = getattr(getattr(agent, "_client", None), "gateway", None)
-            if gateway is None:
-                # Hermes/ClaudeCode:无 gateway,chat_history 恒空。工具证据只能从
-                # ExecutionResult.messages(run_conversation 返回的原生 OpenAI 消息)解析。
-                # _history 只存纯文本 user/assistant 对(无 tool_calls),故整份解析
-                # 天然只命中本轮工具调用,历史轮不贡献。
-                native_msgs = getattr(result, "messages", None) or []
-                turn_tool_calls = extract_tool_calls_openai(native_msgs)
+            # 优先级1: 直接从 ExecutionResult.tool_calls 获取
+            result_tool_calls = getattr(result, "tool_calls", None)
+            if result_tool_calls:
+                # Pi/Grok/Codex/CC: ExecutionResult.tool_calls 已填充,直接使用
+                turn_tool_calls = [
+                    ToolCallEvidence(
+                        tool=tc.tool,
+                        input=tc.input,
+                        output=tc.output,
+                        duration_ms=getattr(tc, "duration_ms", None),
+                    )
+                    for tc in result_tool_calls
+                ]
             else:
-                # OpenClaw:走网关 chat_history,按 timestamp 增量截取本轮新增消息。
-                after_history = await _safe_chat_history(agent)
-                new_msgs = _new_messages_since(before_history or [], after_history)
-                turn_tool_calls = extract_tool_calls(new_msgs)
+                # 优先级2: 从 chat_history 或 messages 解析
+                gateway = getattr(getattr(agent, "_client", None), "gateway", None)
+                if gateway is None:
+                    # Hermes/opencode/openjiuwen工具证据从messages(run_conversation 返回的原生 OpenAI 消息)解析。
+                    native_msgs = getattr(result, "messages", None) or []
+                    turn_tool_calls = extract_tool_calls_openai(native_msgs)
+                else:
+                    # OpenClaw:走网关 chat_history,按 timestamp 增量截取本轮新增消息。
+                    after_history = await _safe_chat_history(agent)
+                    new_msgs = _new_messages_since(before_history or [], after_history)
+                    turn_tool_calls = extract_tool_calls(new_msgs)
             # 兜底但从证据里救回了工具调用 → 不再算"证据不完整"
             if evidence_incomplete and turn_tool_calls:
                 evidence_incomplete = False
@@ -193,7 +204,7 @@ async def execute_queries(
 
         options = None
         if query.timeout:
-            options = _make_options(query.timeout)
+            options = _make_options(query.timeout, client)
 
         base_session = query.session_name or "main"
         session_name = f"{base_session}_{run_id}"
@@ -354,39 +365,44 @@ async def execute_queries(
     return results
 
 
-def _make_options(timeout: int):
-    """构造 ExecutionOptions — 延迟导入避免循环依赖。"""
-    # (module, attr) 优先级序列;openclaw_sdk 在前,带 3600 上限绕过
-    candidates = [
-        ("openclaw_sdk", "ExecutionOptions"),
-        ("src.hermes_client", "ExecutionOptions"),
-        ("src.claudecode_client", "ExecutionOptions"),
-        ("src.openjiuwen_client", "ExecutionOptions"),
-        ("src.opencode_client", "ExecutionOptions"),
-        ("src.codex_client", "ExecutionOptions"),
-    ]
-    for mod_path, cls_name in candidates:
+def _make_options(timeout: int, client: Any):
+    """构造 ExecutionOptions — 按 client 所属模块路由,延迟导入避免循环依赖。
+
+    openclaw_sdk.ExecutionOptions 有 pydantic 约束 le=3600,需要绕过并打印一次提示;
+    其余 harness 是简单 dataclass,直接构造即可。
+    """
+    client_module = type(client).__module__ or ""
+
+    # openclaw_sdk: pydantic 约束 le=3600,需绕过 + 打印提示
+    if client_module.startswith("openclaw_sdk") or client_module.startswith("src.openclaw_client"):
+        from openclaw_sdk import ExecutionOptions as OpenclawOptions
+        opts = OpenclawOptions()
         try:
-            mod = __import__(mod_path, fromlist=[cls_name])
-            Cls = getattr(mod, cls_name)
-        except ImportError:
-            continue
+            object.__setattr__(opts, "timeout_seconds", int(timeout))
+        except Exception:
+            from pydantic import Field
+            class _Unbounded(OpenclawOptions):
+                timeout_seconds: int = Field(default=300, ge=1)
+            opts = _Unbounded(timeout_seconds=int(timeout))
+        if timeout > 3600:
+            logger.info("openclaw: 已绕过 SDK 3600 上限,向网关下发单次超时 %ds", timeout)
+        return opts
 
-        # openclaw_sdk: pydantic 约束 le=3600,需绕过
-        if mod_path == "openclaw_sdk":
-            opts = Cls()
-            try:
-                object.__setattr__(opts, "timeout_seconds", int(timeout))
-            except Exception:
-                from pydantic import Field
-                class _Unbounded(Cls):
-                    timeout_seconds: int = Field(default=300, ge=1)
-                opts = _Unbounded(timeout_seconds=int(timeout))
-            if timeout > 3600:
-                logger.info("openclaw: 已绕过 SDK 3600 上限,向网关下发单次超时 %ds", timeout)
-            return opts
-
-        # 其余 harness:简单 dataclass,直接构造
-        return Cls(timeout_seconds=timeout)
-
-    return None
+    # 其余 harness:模块 → ExecutionOptions 直接映射
+    harness_options = {
+        "src.hermes_client":     ("src.hermes_client",     "ExecutionOptions"),
+        "src.claudecode_client": ("src.claudecode_client", "ExecutionOptions"),
+        "src.openjiuwen_client": ("src.openjiuwen_client", "ExecutionOptions"),
+        "src.opencode_client":   ("src.opencode_client",   "ExecutionOptions"),
+        "src.codex_client":      ("src.codex_client",      "ExecutionOptions"),
+        "src.pi_client":         ("src.pi_client",         "ExecutionOptions"),
+        "src.grok_client":       ("src.grok_client",         "ExecutionOptions"),
+    }
+    entry = harness_options.get(client_module)
+    if entry is None:
+        logger.warning("_make_options: 未识别的 client 模块 %s,不下发 timeout", client_module)
+        return None
+    mod_path, cls_name = entry
+    mod = __import__(mod_path, fromlist=[cls_name])
+    Cls = getattr(mod, cls_name)
+    return Cls(timeout_seconds=int(timeout))

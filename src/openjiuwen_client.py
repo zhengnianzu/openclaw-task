@@ -87,6 +87,12 @@ logger = logging.getLogger("harness_automation")
 EXECUTION_MAX_ATTEMPTS = 5
 EXECUTION_RETRY_WAIT_SECONDS = 60
 
+# openjiuwen SDK 单次 HTTP 请求默认 timeout=60s
+DEFAULT_LLM_TIMEOUT_SECONDS = 600
+
+# openjiuwen SDK create_deep_agent 支持透传这两个已在 openjiuwen.json.agent_defaults 里出现且 SDK 支持的字段。
+_AGENT_DEFAULT_KEYS = ("max_iterations", "language")
+
 # openjiuwen ProviderType 白名单;不在其中的 provider 一律回退 OpenAI
 # (OpenAIModelClient 走 /v1/chat/completions,兼容多数 OpenAI-Compatible 后端)。
 _KNOWN_PROVIDERS = {
@@ -116,7 +122,8 @@ class ExecutionResult:
     stop_reason: Optional[str] = "complete"
     error_message: Optional[str] = None
     usage: Optional[Dict[str, Any]] = None
-    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    # 本轮 ContextEngine 新增消息(经 pydantic model_dump 转成 OpenAI 原生 dict:
+    messages: Optional[List[Dict[str, Any]]] = field(default=None)
     files: List[Dict[str, Any]] = field(default_factory=list)
 
     def model_copy(self, *, update: Optional[Dict[str, Any]] = None) -> "ExecutionResult":
@@ -126,7 +133,7 @@ class ExecutionResult:
             "stop_reason": self.stop_reason,
             "error_message": self.error_message,
             "usage": self.usage,
-            "tool_calls": list(self.tool_calls),
+            "messages": self.messages,
             "files": list(self.files),
         }
         if update:
@@ -179,16 +186,41 @@ def _resolve_model_config(
     return None, "unresolved"
 
 
+def _resolve_timeout(agent_name: str, home: Dict[str, Any]) -> tuple[float, str]:
+    """单次 LLM HTTP 请求超时(秒)独立解析,与 AgentModelConfig / user_proxy_model.json 无关。
+
+    优先级 (由高到低):
+      1. openjiuwen.json#agents.<agent_name>.timeout
+      2. openjiuwen.json#default.timeout
+      3. DEFAULT_LLM_TIMEOUT_SECONDS 兜底
+    """
+    agents = home.get("agents") if isinstance(home.get("agents"), dict) else {}
+    scoped = agents.get(agent_name) if isinstance(agents, dict) else None
+    if isinstance(scoped, dict):
+        t = scoped.get("timeout")
+        if t is not None:
+            return t, f"{_OPENJIUWEN_CONFIG_FILENAME}#agents.{agent_name}.timeout"
+    default = home.get("default")
+    if isinstance(default, dict):
+        t = default.get("timeout")
+        if t is not None:
+            return t, f"{_OPENJIUWEN_CONFIG_FILENAME}#default.timeout"
+    return float(DEFAULT_LLM_TIMEOUT_SECONDS), "default(DEFAULT_LLM_TIMEOUT_SECONDS)"
+
+
 # ============================================================================
 # Model / SysOperation 构造
 # ============================================================================
 
-def build_model(config: AgentModelConfig) -> Model:
+def build_model(config: AgentModelConfig, *, timeout: Optional[float] = None) -> Model:
     """根据 AgentModelConfig 构造 openjiuwen Model。
 
     provider 不在白名单 / 含斜杠 / 是 URL → 回退 OpenAI;
     http:// 端点自动 verify_ssl=False(否则 SDK 要求 ssl_cert);
     model / base_url / api_key 缺一即报错。
+
+    ``timeout`` 走独立解析(见 _resolve_timeout),
+    调用方未传则统一用 DEFAULT_LLM_TIMEOUT_SECONDS 兜底(而非落回 SDK 的 60s)。
     """
     provider = (config.provider or "").strip() or "OpenAI"
     if provider not in _KNOWN_PROVIDERS or provider.startswith(("http://", "https://")):
@@ -210,10 +242,8 @@ def build_model(config: AgentModelConfig) -> Model:
         "api_key": api_key,
         "api_base": base_url,
         "verify_ssl": base_url.lower().startswith("https://"),
+        "timeout": float(timeout) if timeout and timeout > 0 else float(DEFAULT_LLM_TIMEOUT_SECONDS),
     }
-    timeout = getattr(config, "timeout", None)
-    if timeout is not None:
-        client_config["timeout"] = timeout
     return Model(
         model_client_config=ModelClientConfig(**client_config),
         model_config=ModelRequestConfig(model=model_name),
@@ -238,6 +268,37 @@ def _positive_timeout(options: Optional[ExecutionOptions]) -> Optional[float]:
     timeout = float(options.timeout_seconds)
     return timeout if timeout > 0 else None
 
+
+def _snapshot_context(deep_agent: Any, session_name: str) -> List[Any]:
+    """安全读取 DeepAgent 当前上下文消息;未初始化 / 无 session 时返回空列表。"""
+    getter = getattr(deep_agent, "get_current_context", None)
+    if not callable(getter):
+        return []
+    try:
+        msgs = getter(session_id=session_name)
+    except Exception as e:  # noqa: BLE001
+        # 首轮 invoke 前 context 未创建时 SDK 会抛错,视为空快照。
+        logger.debug("get_current_context 快照失败 (session=%s): %s", session_name, e)
+        return []
+    return list(msgs or [])
+
+
+def _dump_message(msg: Any) -> Optional[Dict[str, Any]]:
+    """把 ContextEngine 里的一条消息序列化成 OpenAI 兼容 dict。"""
+    if msg is None:
+        return None
+    if isinstance(msg, dict):
+        return msg
+    dump = getattr(msg, "model_dump", None)
+    if callable(dump):
+        try:
+            return dump()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("消息 model_dump 失败: %s", e)
+            return None
+    return None
+
+
 # ============================================================================
 # OpenjiuwenAgent — (agent_name, session_name) 会话句柄
 # ============================================================================
@@ -253,8 +314,29 @@ class OpenjiuwenAgent:
         self.session_id = session_name
         self.session_key = session_name
 
+    def _collect_new_messages(self, before: List[Any]) -> List[Dict[str, Any]]:
+        """比对 invoke 前后 ContextEngine 消息,序列化本轮新增消息为 OpenAI dict 列表。"""
+        try:
+            after = _snapshot_context(self._agent, self.session_name)
+            if len(after) <= len(before):
+                return []
+            new_msgs = after[len(before):]
+            dumped: List[Dict[str, Any]] = []
+            for m in new_msgs:
+                d = _dump_message(m)
+                if d is not None:
+                    dumped.append(d)
+            return dumped
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "抽取 messages 失败 (agent=%s session=%s): %s",
+                self.agent_name, self.session_name, e,
+            )
+            return []
+
     async def execute(self, query: str, options: Optional[ExecutionOptions] = None) -> ExecutionResult:
         timeout = _positive_timeout(options)
+        before_msgs = _snapshot_context(self._agent, self.session_name)
         try:
             invocation = self._agent.invoke(
                 {"query": query, "conversation_id": self.session_name}
@@ -269,6 +351,7 @@ class OpenjiuwenAgent:
                 success=False,
                 stop_reason="timeout",
                 error_message=f"DeepAgent invocation timed out after {timeout}s",
+                messages=self._collect_new_messages(before_msgs),
             )
         except Exception as e:  # noqa: BLE001
             logger.exception(
@@ -279,7 +362,10 @@ class OpenjiuwenAgent:
                 success=False,
                 stop_reason="error",
                 error_message=str(e),
+                messages=self._collect_new_messages(before_msgs),
             )
+
+        messages = self._collect_new_messages(before_msgs)
 
         if isinstance(response, dict):
             output = response.get("output", "")
@@ -291,6 +377,7 @@ class OpenjiuwenAgent:
             content=content,
             stop_reason="complete" if content else "error",
             error_message=None if content else "DeepAgent returned empty output",
+            messages=messages,
         )
 
 
@@ -351,13 +438,27 @@ class OpenjiuwenClient:
         self._system_prompts: Dict[str, Optional[str]] = {}
         self._agents: Dict[tuple, OpenjiuwenAgent] = {}
         self.gateway = None
+        # 提取 openjiuwen.json.agent_defaults 中 SDK 支持的字段(max_iterations / language),
+        # 过滤掉 _comment 等注释键与 SDK 不识别的键,避免 create_deep_agent 报 TypeError。
+        raw_defaults = self._home.get("agent_defaults") or {}
+        self._agent_defaults: Dict[str, Any] = {
+            k: raw_defaults[k]
+            for k in _AGENT_DEFAULT_KEYS
+            if k in raw_defaults and raw_defaults[k] is not None
+        }
         if self._home:
             logger.info(
-                "已加载全局配置: %s (default=%s, agents=%s)",
+                "已加载全局配置: %s (default=%s, agents=%s, agent_defaults=%s)",
                 _openjiuwen_home() / _OPENJIUWEN_CONFIG_FILENAME,
                 bool(self._home.get("default")),
                 sorted((self._home.get("agents") or {}).keys()),
+                self._agent_defaults or "{}",
             )
+
+    @property
+    def agent_defaults(self) -> Dict[str, Any]:
+        """openjiuwen.json.agent_defaults 里 SDK 认识的字段,供 AgentManager 透传。"""
+        return dict(self._agent_defaults)
 
     async def __aenter__(self) -> "OpenjiuwenClient":
         return self
@@ -389,6 +490,10 @@ class OpenjiuwenClient:
 
     def resolve_model(self, agent_name: str, override: Optional[AgentModelConfig]) -> tuple[Optional[AgentModelConfig], str]:
         return _resolve_model_config(agent_name, override, self._home)
+
+    def resolve_timeout(self, agent_name: str) -> tuple[float, str]:
+        """openjiuwen.json.agents.<name>.timeout > default.timeout > DEFAULT_LLM_TIMEOUT_SECONDS。"""
+        return _resolve_timeout(agent_name, self._home)
 
     def register_agent(self, agent_name: str, deep_agent: Any, system_prompt: Optional[str]) -> None:
         self._deep_agents[agent_name] = deep_agent
@@ -443,22 +548,29 @@ class OpenjiuwenAgentManager:
             )
         logger.info("agent=%s 模型来源=%s model=%s", agent_name, source, model_cfg.resolved_model)
 
+        # timeout 独立解析: openjiuwen.json.agents.<name>.timeout > default.timeout > 600s。
+        timeout, timeout_source = self.client.resolve_timeout(agent_name)
+        logger.info("agent=%s timeout 来源=%s timeout=%ss", agent_name, timeout_source, timeout)
+
         # workspace + skills 已由 _setup_workspaces 备好;这里取路径 + 绑沙箱 + 建 DeepAgent。
         workspace = self.workspace_manager.get_agent_workspace(agent_name)
         sys_operation = build_sys_operation(agent_name, workspace, self.restrict_to_work_dir)
 
+        # openjiuwen.json.agent_defaults(max_iterations / language)透传给 SDK,
+        extra_kwargs: Dict[str, Any] = dict(self.client.agent_defaults)
         deep_agent = create_deep_agent(
-            model=build_model(model_cfg),
+            model=build_model(model_cfg, timeout=timeout),
             system_prompt=agent_config.system_prompt,
             workspace=str(workspace),
             sys_operation=sys_operation,
             skills=agent_config.skills or None,
             restrict_to_work_dir=self.restrict_to_work_dir,
+            **extra_kwargs,
         )
         self.client.register_agent(agent_name, deep_agent, agent_config.system_prompt)
         logger.info(
-            "设置 Agent: %s | workspace=%s | skills=%s",
-            agent_name, workspace, agent_config.skills or [],
+            "设置 Agent: %s | workspace=%s | skills=%s | extra=%s",
+            agent_name, workspace, agent_config.skills or [], extra_kwargs or "{}",
         )
 
 
