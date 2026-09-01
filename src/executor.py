@@ -397,6 +397,7 @@ def _make_options(timeout: int, client: Any):
         "src.codex_client":      ("src.codex_client",      "ExecutionOptions"),
         "src.pi_client":         ("src.pi_client",         "ExecutionOptions"),
         "src.grok_client":       ("src.grok_client",         "ExecutionOptions"),
+        "src.dsh_client":        ("src.dsh_client",          "ExecutionOptions"),
     }
     entry = harness_options.get(client_module)
     if entry is None:
