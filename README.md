@@ -11,6 +11,7 @@
 - OpenCode
 - Codex
 - Pi
+- DeepSeek Harness (DSH)
 
 ## OpenClaw 
 > 基于 openclaw-sdk 的配置驱动任务编排框架
@@ -65,6 +66,17 @@ Grok 读取部署前准备好的 `$GROK_HOME/config.toml` 和认证信息。`age
 [Grok Build 集成说明](docs/GROK_BUILD_INTEGRATION.md)。
 
 
+## DeepSeek Harness
+> 基于官方 `deepseek-harness-sdk` 和配套 JSON-RPC stdio runtime。每个
+> `(agent_name, session_name)` 维护一个长驻 runtime，复用多轮上下文；实际 cwd、
+> session 日志和 `.agents/skills` 相互隔离。
+
+DeepSeek 可从 `~/.dsh/settings.yaml` 和 `~/.dsh/.credentials.yaml`读取多 provider、多模型和明文密钥，
+Agent 通过simulator_config读取同名 Agent 配置，再从默认配置中 `agents[].model` 的 `provider/model` 选择服务；未提供该文件时回退到
+`DEEPSEEK_API_KEY`/`DEEPSEEK_BASE_URL`。官方 runtime 当前只支持 Linux x64/arm64
+与 macOS arm64。详见[DeepSeek Harness 集成说明](docs/DEEPSEEK_HARNESS_INTEGRATION.md)。
+
+
 ## 特性
 
 - ✅ **配置驱动** - 通过 JSON/YAML 配置定义所有任务
@@ -82,11 +94,17 @@ Grok 读取部署前准备好的 `$GROK_HOME/config.toml` 和认证信息。`age
 
 ```bash
 # 一份 requirements.txt 涵盖两个后端 (openclaw + hermes)
-pip install -r requirements.txt # OpenClaw 2026.6.6 (8c802aa)  \ Hermes Agent v0.19.0 (2026.7.7.2) \ 2.1.22 (Claude Code)
+pip install -r requirements.txt 
+# OpenClaw 2026.6.6 (openclaw-sdk==2.1.0)  
+# Hermes Agent v0.18.2 (hermes-agent==0.18.2) 
+# Claude Code 2.1.22 (claude-agent-sdk==0.2.144)
+# openjiuwen 0.1.0 (openjiuwen==0.1.16)
+
+npm install -g @openai/codex # codex-cli 0.147.0 (SDK: openai-codex==0.147.0)
 npm i -g opencode-ai # 1.18.18
-npm install -g @openai/codex # codex-cli 0.147.0
 npm install -g --ignore-scripts @earendil-works/pi-coding-agent # pi 0.84.3
 npm install -g @xai-official/grok # grok build 1.0.5
+npx @deepseek-ai/dsh # dsh 0.1.1-rc.2 (deepseek-harness-sdk==0.1.1rc1)
 ```
 
 ### 2. 确保 OpenClaw 运行

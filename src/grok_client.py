@@ -589,27 +589,11 @@ class GrokAgentManager:
         )
 
 
-def make_grok_get_agent(client: GrokClient):
-    """创建符合统一执行器签名的 Agent 获取函数。"""
+async def execute_grok(agent: GrokAgent, query_text: str, options):
+    """执行一次查询并标记非正常结束结果。"""
 
-    def get_agent(agent_name: str, session_name: str) -> GrokAgent:
-        """获取指定逻辑会话。"""
-
-        return client.get_agent(agent_name, session_name)
-
-    return get_agent
-
-
-def make_grok_execute_with_retry(_client: GrokClient):
-    """创建统一执行回调，失败时不自动重放请求。"""
-
-    async def execute_with_retry(agent: GrokAgent, query_text: str, options):
-        """执行一次查询并标记非正常结束结果。"""
-
-        result = await agent.execute(query_text, options=options)
-        if result.success and result.content:
-            incomplete = (result.stop_reason or "end_turn") != "end_turn"
-            return result, incomplete
-        raise GrokHarnessError(result.error_message or "Grok 返回空结果")
-
-    return execute_with_retry
+    result = await agent.execute(query_text, options=options)
+    if result.success and result.content:
+        incomplete = (result.stop_reason or "end_turn") != "end_turn"
+        return result, incomplete
+    raise GrokHarnessError(result.error_message or "Grok 返回空结果")
