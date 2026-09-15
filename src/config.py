@@ -102,6 +102,7 @@ class AgentModelConfig(BaseModel):
     provider: Optional[str] = None
     api_key: Optional[str] = None
     base_url: Optional[str] = None
+    api: Optional[str] = None
 
     @property
     def resolved_model(self) -> Optional[str]:

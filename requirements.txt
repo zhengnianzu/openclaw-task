@@ -13,11 +13,14 @@ hermes-agent==0.18.2
 claude-agent-sdk==0.2.144
 
 # openjiuwen
-openjiuwen==0.1.16
-anthropic
+opentelemetry-sdk==1.44.0
+openjiuwen==0.1.17.post1
+anthropic==0.120.2
 
 # codex
 openai-codex==0.147.0
 
 # deepseek harness
 deepseek-harness-sdk==0.1.1rc1
+
+zstandard

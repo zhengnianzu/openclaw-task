@@ -25,9 +25,30 @@ from src.workspace import BaseWorkspaceManager, copy_path
 logger = logging.getLogger("harness_automation")
 
 
+def build_serper_env():
+    """
+    在沙箱中读取 SERPER_API_KEY 和 SERPER_API_URL 环境变量，
+    并写入 ~/.dsh/skills/serper/.env（覆盖写入，仅保留非空变量）。
+    """
+    skill_dir = Path.home() / ".dsh" / "skills" / "serper"
+    env_file = skill_dir / ".env"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    api_key = os.environ.get("SERPER_API_KEY", "")
+    api_url = os.environ.get("SERPER_API_URL", "")
+    lines = []
+    if api_key:
+        lines.append(f"SERPER_API_KEY={api_key}")
+    if api_url:
+        lines.append(f"SERPER_API_URL={api_url}")
+
+    with open(env_file, "w") as f:
+        f.write("\n".join(lines))
+        if lines:
+            f.write("\n")
+
+
 class DshHarnessError(RuntimeError):
     """DSH SDK、runtime 或返回结果不可用。"""
-
 
 # ============================================================================
 # 数据结构
