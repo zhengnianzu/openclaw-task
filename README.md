@@ -93,7 +93,7 @@ Agent 通过simulator_config读取同名 Agent 配置，再从默认配置中 `a
 ### 1. 安装依赖
 
 ```bash
-# 一份 requirements.txt 涵盖两个后端 (openclaw + hermes)
+# 一份 requirements.txt 涵盖多个后端
 pip install -r requirements.txt 
 # OpenClaw 2026.6.6 (openclaw-sdk==2.1.0)  
 # Hermes Agent v0.18.2 (hermes-agent==0.18.2) 
@@ -157,6 +157,7 @@ python python harness_automation.py --config configs/config_simple.json --harnes
 | 文档 | 说明 |
 |---|---|
 | [OPENCODE_INTEGRATION.md](OPENCODE_INTEGRATION.md) | OpenCode 接入方式、opencode.json、workspace、skill、session |
+| [TASK_STATUS_STATS.md](TASK_STATUS_STATS.md) | 任务轨迹统计 |
 | [CONFIG_STRUCTURE.md](CONFIG_STRUCTURE.md) | 配置结构说明 |
 | [QUICKSTART.md](QUICKSTART.md) | 快速开始 |
 | [DESIGN.md](DESIGN.md) | 架构与设计 |
