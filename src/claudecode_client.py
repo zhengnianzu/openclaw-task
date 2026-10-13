@@ -196,16 +196,26 @@ class ClaudecodeAgent:
         self._lock = asyncio.Lock()
 
     def _build_options(self) -> ClaudeAgentOptions:
+        mcp_servers: Dict[str, Any] = {}
+        if os.environ.get("MCP_PLAYWRIGHT", "off") == "on":
+            mcp_servers["playwright"] = {
+                "command": "npx",
+                "args": ["@playwright/mcp@latest", "--browser", "chromium"],
+            }
+        if os.environ.get("IMAGE_READING", "off") == "on":
+            image_reading_path = os.environ.get("IMAGE_READING_PATH")
+            if image_reading_path:
+                mcp_servers["image-reading"] = {
+                    "command": "node",
+                    "args": [image_reading_path],
+                }
+            else:
+                logger.warning("IMAGE_READING=on but IMAGE_READING_PATH not set; skipping")
         kwargs: Dict[str, Any] = {
             "permission_mode": self._permission_mode,
             # 显式告诉 SDK:让 claude CLI 子进程去读 settings.json。
             "setting_sources": ["user", "project"],
-            "mcp_servers": {
-                "playwright": {
-                    "command": "npx",
-                    "args": ["@playwright/mcp@latest", "--browser", "chromium"],
-                },
-            },
+            "mcp_servers": mcp_servers,
         }
         kwargs["system_prompt"] = {
             "type": "preset",

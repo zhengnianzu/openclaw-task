@@ -37,7 +37,7 @@ logger = logging.getLogger("harness_automation")
 # ---------------------------------------------------------------------------
 
 _HERMES_AGENT_ROOT_ENV = "HERMES_AGENT_ROOT"
-_HERMES_AGENT_ROOT_DEFAULT = "/home/ma-user/.hermes/hermes-agent"
+_HERMES_AGENT_ROOT_DEFAULT = Path("~/.hermes/hermes-agent").expanduser()
 _AIAgent_cls = None  # type: ignore[assignment]
 
 

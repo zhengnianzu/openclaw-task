@@ -137,6 +137,7 @@ class HomeConfig:
     max_iterations: Optional[int] = None
     language: str = DEFAULT_LANGUAGE
     paid_search: bool = True
+    stream: bool = False
     embedding: Dict[str, Any] = field(default_factory=dict)
     playwright_mcp_version: str = DEFAULT_MCP_VERSION
 
@@ -166,6 +167,7 @@ def load_home_config(path: Path = OPENJIUWEN_HOME_PATH) -> HomeConfig:
         max_iterations=default.get("max_iterations"),
         language=default.get("language") or DEFAULT_LANGUAGE,
         paid_search=bool(default.get("paid_search", True)),
+        stream=default.get("stream") is True,
         embedding=data.get("embedding"),
         playwright_mcp_version=(data.get("playwright_mcp") or {}).get("version") or DEFAULT_MCP_VERSION,
     )
@@ -394,20 +396,54 @@ class OpenjiuwenAgent:
             )
             return False
 
+    async def _consume_stream(
+        self, inputs: Dict[str, Any], timeout: Optional[float]
+    ) -> Dict[str, Any]:
+        """以流式请求方式驱动 DeepAgent,返回 answer 的 payload(即 invoke 的 output)。
+
+        走 deep_agent.stream() 是为了让底层 LLM 调用变成流式请求
+        (anthropic_model_client.stream(): stream=True,走 SSE 逐 token 到达),
+        而不是 invoke() 的一次性非流式请求。text 增量被丢弃,不对外打印;
+        只取 answer chunk 的 payload —— 与 invoke 路径返回结构一致。
+        """
+        answer: Optional[Dict[str, Any]] = None
+
+        async def _drain() -> None:
+            nonlocal answer
+            agen = self._agent.stream(inputs)
+            try:
+                async for chunk in agen:
+                    if getattr(chunk, "type", None) != "answer":
+                        continue
+                    payload = getattr(chunk, "payload", None)
+                    if isinstance(payload, dict):
+                        answer = payload
+            finally:
+                await agen.aclose()
+
+        if timeout is not None:
+            async with asyncio.timeout(timeout):
+                await _drain()
+        else:
+            await _drain()
+        return answer or {}
+
     async def execute(
         self, query: str, options: Optional[ExecutionOptions] = None
     ) -> ExecutionResult:
         timeout = _positive_timeout(options)
         before_msgs = _snapshot_context(self._agent, self.session_name)
+        inputs = {"query": query, "conversation_id": self.session_name}
         try:
-            invocation = self._agent.invoke(
-                {"query": query, "conversation_id": self.session_name}
-            )
-            response = (
-                await asyncio.wait_for(invocation, timeout)
-                if timeout is not None
-                else await invocation
-            )
+            if self._client.cfg.stream:
+                response = await self._consume_stream(inputs, timeout)
+            else:
+                invocation = self._agent.invoke(inputs)
+                response = (
+                    await asyncio.wait_for(invocation, timeout)
+                    if timeout is not None
+                    else await invocation
+                )
         except asyncio.TimeoutError:
             return ExecutionResult(
                 success=False,
@@ -527,7 +563,7 @@ class OpenjiuwenClient:
         if self.cfg.model or self.cfg.embedding:
             logger.info(
                 "已加载全局配置: %s (model=%s, timeout=%ss, max_tokens=%s, "
-                "max_iterations=%s, language=%s, paid_search=%s, embedding=%s)",
+                "max_iterations=%s, language=%s, paid_search=%s, stream=%s, embedding=%s)",
                 OPENJIUWEN_HOME_PATH,
                 bool(self.cfg.model),
                 self.cfg.timeout,
@@ -535,25 +571,47 @@ class OpenjiuwenClient:
                 self.cfg.max_iterations,
                 self.cfg.language,
                 self.cfg.paid_search,
+                self.cfg.stream,
                 bool(self.cfg.embedding),
             )
 
     def _build_mcp_configs(self) -> List[McpServerConfig]:
-        configs: List[McpServerConfig] = [
-            McpServerConfig(
-                server_id="mcp:playwright",
-                server_name="playwright",
-                server_path="stdio://playwright",
-                client_type="stdio",
-                params={
-                    "command": "npx",
-                    "args": [
-                        f"@playwright/mcp@{self.cfg.playwright_mcp_version}",
-                        "--browser", "chromium",
-                    ],
-                },
+        configs: List[McpServerConfig] = []
+        if os.environ.get("MCP_PLAYWRIGHT", "off") == "on":
+            configs.append(
+                McpServerConfig(
+                    server_id="mcp:playwright",
+                    server_name="playwright",
+                    server_path="stdio://playwright",
+                    client_type="stdio",
+                    params={
+                        "command": "npx",
+                        "args": [
+                            f"@playwright/mcp@{self.cfg.playwright_mcp_version}",
+                            "--browser", "chromium",
+                        ],
+                    },
+                )
             )
-        ]
+        if os.environ.get("IMAGE_READING", "off") == "on":
+            image_reading_path = os.environ.get("IMAGE_READING_PATH")
+            vl_env = {k: v for k, v in os.environ.items() if k.startswith("VL_")}
+            if image_reading_path:
+                configs.append(
+                    McpServerConfig(
+                        server_id="mcp:image-reading",
+                        server_name="image-reading",
+                        server_path="stdio://image-reading",
+                        client_type="stdio",
+                        params={
+                            "command": "node",
+                            "args": [image_reading_path],
+                            "env": vl_env,
+                        },
+                    )
+                )
+            else:
+                logger.warning("IMAGE_READING=on but IMAGE_READING_PATH not set; skipping")
         github_token = (
             os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN")
             or os.environ.get("GITHUB_TOKEN")

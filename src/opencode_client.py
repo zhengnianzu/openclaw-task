@@ -315,6 +315,10 @@ class OpenCodeAgent:
         command = self._build_command()
         prompt = query.encode("utf-8")
 
+        # 显式设置 HOME 指向 workspace 父级，确保 opencode CLI 的内部存储路径
+        env = dict(os.environ)
+        env["HOME"] = str(self._workspace.parent)
+
         # start_new_session=True: 创建独立进程组,便于用 os.killpg 清理子进程树
         try:
             process = await asyncio.create_subprocess_exec(
@@ -323,6 +327,7 @@ class OpenCodeAgent:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(self._workspace),
+                env=env,
                 start_new_session=True,
             )
         except Exception as exc:

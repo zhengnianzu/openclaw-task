@@ -2,8 +2,7 @@
 
 每个 ``(agent_name, session_name)`` 维护一个长期运行的
 ``pi --mode rpc --session-dir <dir>`` 子进程，通过 stdin/stdout JSONL 协议交互。
-会话历史落盘到 ``_PI_SESSION_DIR``（默认 ``/home/ma-user/.pi/agent/sessions``），
-便于事后审计;子进程内多轮上下文仍然由 RPC 内存态维持。
+会话历史落盘到 _PI_SESSION_DIR; 子进程内多轮上下文仍然由 RPC 内存态维持。
 Pi CLI、模型和明文密钥均由部署阶段预先配置。
 """
 
@@ -26,7 +25,7 @@ logger = logging.getLogger("harness_automation")
 _RPC_STREAM_LIMIT = 16 * 1024 * 1024
 
 # Pi 会话落盘目录
-_PI_SESSION_DIR = "/home/ma-user/.pi/agent/sessions"
+_PI_SESSION_DIR = Path("~/.pi/agent/sessions").expanduser()
 
 
 class PiHarnessError(RuntimeError):
