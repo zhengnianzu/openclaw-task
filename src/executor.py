@@ -399,6 +399,7 @@ def _make_options(timeout: int, client: Any):
         "src.grok_client":       ("src.grok_client",         "ExecutionOptions"),
         "src.dsh_client":        ("src.dsh_client",          "ExecutionOptions"),
         "src.jiuwenswarm_client": ("src.jiuwenswarm_client", "ExecutionOptions"),
+        "src.openclaw_local_client": ("src.openclaw_local_client", "ExecutionOptions"),
     }
     entry = harness_options.get(client_module)
     if entry is None:

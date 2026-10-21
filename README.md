@@ -5,6 +5,7 @@
 
 一个强大的、配置驱动的自动化系统，用于编排和执行 AI Agent 任务。支持多 Agent 协作、工作空间管理、结果传递等功能。目前支持框架如下：
 - OpenClaw
+- OpenClaw Local（本地 CLI）
 - Hermes
 - Claude-Code
 - JiuwenClaw
@@ -18,6 +19,13 @@
 > 基于 openclaw-sdk 的配置驱动任务编排框架
 | `openclaw_automation.py` | OpenClaw 网关 | WebSocket → `openclaw-sdk` | 已有 OpenClaw 实例 (`ws://127.0.0.1:18789`) | `.openclaw/openclaw.json`全局兜底配置
 详见 `src/openclaw_client.py`。
+
+## OpenClaw Local
+
+通过官方 OpenClaw CLI 的 `agent --local --json` 模式执行任务，使用 `--harness openclaw-local` 选择。
+模型、凭据和工作区写入 `~/.openclaw/openclaw.json`；从 `PATH` 自动定位官方安装，也可通过 `OPENCLAW_DIR` 指定目录。
+复用公共任务编排、技能装配、模拟用户、评估器和轨迹统计。
+部署、配置和运行方式见 [OpenClaw Local 集成说明](docs/OPENCLAW_LOCAL_INTEGRATION.md)。
 
 ## Hermes
 > from run_agent import AIAgent
@@ -163,8 +171,10 @@ python python harness_automation.py --config configs/config_simple.json --harnes
 ```
 
 ## 文档
+
 | 文档 | 说明 |
 |---|---|
+| [OPENCLAW_LOCAL_INTEGRATION.md](docs/OPENCLAW_LOCAL_INTEGRATION.md) | OpenClaw Local 部署、配置与运行验收 |
 | [OPENCODE_INTEGRATION.md](OPENCODE_INTEGRATION.md) | OpenCode 接入方式、opencode.json、workspace、skill、session |
 | [TASK_STATUS_STATS.md](TASK_STATUS_STATS.md) | 任务轨迹统计 |
 | [CONFIG_STRUCTURE.md](CONFIG_STRUCTURE.md) | 配置结构说明 |
