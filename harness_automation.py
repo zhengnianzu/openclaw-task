@@ -163,7 +163,7 @@ class HarnessAutomation:
         self.simulator_model_cfg = all_cfgs.pop("user_simulator", None)
         self.agent_overrides = all_cfgs
 
-        if self.harness_type == "openclaw-local":
+        if self.harness_type == "openclaw-tui":
             from src.openclaw_local_client import OpenclawLocalWorkspaceManager
             self.workspace_manager = OpenclawLocalWorkspaceManager()
         elif self.harness_type == "hermes":
@@ -203,7 +203,7 @@ class HarnessAutomation:
         logger.info("自动化任务系统 (harness_type=%s)", self.harness_type)
         logger.info("=" * 60)
 
-        if self.harness_type == "openclaw-local":
+        if self.harness_type == "openclaw-tui":
             return await self._run_openclaw_local()
         elif self.harness_type == "hermes":
             return await self._run_hermes()

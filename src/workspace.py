@@ -14,6 +14,8 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger("harness_automation")
 
+DEFAULT_CONFIG_DIR = "__default__"
+
 
 DEFAULT_CONFIG_DIR = "__default__"
 
