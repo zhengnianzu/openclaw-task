@@ -15,9 +15,39 @@ from typing import Dict, List, Optional
 logger = logging.getLogger("harness_automation")
 
 
+DEFAULT_CONFIG_DIR = "__default__"
+
+
 def copy_path(src: Path, dst: Path):
-    """复制文件或目录，自动判断类型，目标已存在时合并/覆盖"""
+    """复制文件或目录，自动判断类型，目标已存在时合并/覆盖。
+
+    ``__default__`` 是 Agent 配置的公共来源目录，不应出现在最终 workspace：
+    复制整个目录时将其子项合并到目标根；复制其直接子项时自动去掉目标路径中的
+    ``__default__`` 层。
+    """
+    src = Path(src)
+    dst = Path(dst)
+
+    if src.is_dir() and src.name == DEFAULT_CONFIG_DIR:
+        target_root = dst.parent if dst.name == DEFAULT_CONFIG_DIR else dst
+        target_root.mkdir(parents=True, exist_ok=True)
+        for child in src.iterdir():
+            copy_path(child, target_root / child.name)
+        return
+
+    if src.parent.name == DEFAULT_CONFIG_DIR and dst.parent.name == DEFAULT_CONFIG_DIR:
+        default_dst = dst.parent
+        dst = dst.parent.parent / dst.name
+        # 部分 client 会在调用 copy_path 前预建 target.parent；这里只清理空目录，
+        # 若其中已有其他内容则保留，避免误删调用方数据。
+        if default_dst.is_dir():
+            try:
+                default_dst.rmdir()
+            except OSError:
+                pass
+
     if src.is_file():
+        dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
     elif src.is_dir():
         shutil.copytree(src, dst, dirs_exist_ok=True)
