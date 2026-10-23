@@ -13,9 +13,6 @@ hermes-agent==0.18.2
 # claude-code harness
 claude-agent-sdk==0.2.144
 
-# jiuwenswarm
-workswarm==0.2.7
-
 # codex
 openai-codex==0.147.0
 

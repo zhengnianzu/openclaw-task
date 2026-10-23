@@ -2,7 +2,7 @@
 
 本项目通过官方 OpenClaw CLI 的 `agent --local --json` 模式运行 Agent。`src/openclaw_local_client.py` 是 harness 与 OpenClaw 之间的 Python 适配层，不包含模型运行时；Agent、模型服务、凭据、工具、skills、workspace 和原生会话均由 OpenClaw 管理。
 
-任务通过 `--harness openclaw-local` 选择该后端。本文以当前 `openclaw_local_client.py` 的实际行为为准，并说明它与 `D:\openclaw-task-codes\local_oc` 中 OpenClaw 2026.7.2 独立源码包的关系。
+任务通过 `--harness openclaw-local` 选择该后端。本文以当前 `openclaw_local_client.py` 的实际行为为准，并说明它与 zhangchen 中 OpenClaw 2026.7.2 独立源码包的关系。
 
 ## 1. 架构与职责边界
 
@@ -46,7 +46,7 @@ OpenClaw 负责：
 通过 npm 安装时：
 
 ```bash
-npm install --global openclaw@<已验证版本>
+npm install openclaw@2026.6.6
 openclaw --version
 openclaw onboard
 ```

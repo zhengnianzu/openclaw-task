@@ -10,9 +10,12 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import sqlite3
+import subprocess
+import tempfile
 import uuid
 from contextlib import closing
 from pathlib import Path
@@ -34,10 +37,54 @@ logger = logging.getLogger("harness_automation")
 DEFAULT_EXECUTION_TIMEOUT_SECONDS = 3600
 DEFAULT_CLI_TIMEOUT_SECONDS = 60
 PROCESS_STOP_TIMEOUT_SECONDS = 3
-# OpenClaw 2026.6.6 仅支持 ``--message <text>``，尚无 ``--message-file``。
-# Windows CreateProcess 的完整命令行上限为 32767 个 UTF-16 code unit；为 node
-# 路径和其他参数保留余量，消息本身采用更保守的上限。
-MAX_INLINE_MESSAGE_UTF16_UNITS = 24_000
+
+# 消息投递方式按 OpenClaw 版本分流:
+#   - 2026.6.6 仅有 ``--message <text>``,整条消息必须塞进单个 argv。
+#     Linux MAX_ARG_STRLEN = 32 页 = 131072 字节;取 128000 留余量。
+#   - 2026.10.6 新增 ``--message-file <path>``(UTF-8,上限 4MiB),走临时文件不受 argv 限制。
+MAX_INLINE_MESSAGE_BYTES = 128_000          # 单参数内核上限 131072,留 3KB 余量
+MESSAGE_FILE_MAX_BYTES = 4 * 1024 * 1024    # --message-file 官方上限 4MiB
+
+# 各版本绑定的运行时(node 与 openclaw.mjs 所在目录)
+OC_RUNTIME = {
+    "default": {
+        "node": "/usr/local/node24/bin/node",
+        "dir": "/usr/local/node24/lib/node_modules/openclaw",
+    },
+    # 2026.10.6 要求 Node >=24.22.1,镜像默认的 24.14.1 不满足,必须用 node26
+    "2026.10.6": {
+        "node": "/usr/local/node26/bin/node",
+        "dir": "/usr/local/node26/lib/node_modules/openclaw",
+    },
+}
+
+
+def get_openclaw_version(
+    command: List[str] = ["openclaw"],
+    timeout: float = 3.0,
+    fallback: str = "2026.6.6",
+) -> str:
+    """探测并返回 OpenClaw 版本号（如 '2026.10.6'），失败时返回降级默认版本。"""
+    try:
+        result = subprocess.run(
+            [*command, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        output = result.stdout + result.stderr
+        if match := re.search(r"(\d{4}\.\d+\.\d+)", output):
+            return match.group(1)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    return fallback
+
+
+# 预先探测当前环境的 OpenClaw 版本,后续命令构造据此分支
+OC_TUI_VERSION = get_openclaw_version()
+
 
 _TERMINAL_STOP_REASONS = {"error", "timeout", "aborted", "cancelled"}
 _HISTORY_ERRORS = (OSError, ValueError, KeyError, TypeError, sqlite3.Error)
@@ -102,27 +149,28 @@ class OpenclawLocalClient:
         self._agents: Dict[Tuple[str, str], OpenclawLocalAgent] = {}
         self._processes: Set[asyncio.subprocess.Process] = set()
 
-    @staticmethod
-    def _resolve_command() -> List[str]:
-        root = os.environ.get("OPENCLAW_DIR")
-        executable = shutil.which("openclaw") if not root else None
+    def _resolve_command(self) -> List[str]:
+        """按 OC_TUI_VERSION 取绑定的 node 与 openclaw 入口。"""
+        runtime = OC_RUNTIME.get(OC_TUI_VERSION, OC_RUNTIME["default"])
+        node = os.environ.get("OPENCLAW_LOCAL_NODE") or runtime["node"]
+        root = os.environ.get("OPENCLAW_DIR") or runtime["dir"]
 
-        if root:
-            entry = Path(root).expanduser().resolve() / "openclaw.mjs"
-        elif executable:
-            entry = Path(executable).resolve()
-            if entry.name != "openclaw.mjs":
-                entry = entry.parent / "node_modules" / "openclaw" / "openclaw.mjs"
-        else:
-            entry = None
+        entry = Path(root).expanduser() / "openclaw.mjs"
+        if not entry.is_file():
+            # 绑定的目录不存在时,退回 PATH 反查
+            executable = shutil.which("openclaw")
+            if executable:
+                entry = Path(executable).resolve()
+                if entry.name != "openclaw.mjs":
+                    entry = entry.parent / "node_modules" / "openclaw" / "openclaw.mjs"
 
-        if entry is None or not entry.is_file():
+        if not entry.is_file():
             raise OpenclawLocalError(
                 "未找到 OpenClaw 入口；请将官方 npm 安装加入 PATH，"
                 "或设置 OPENCLAW_DIR 指向包含 openclaw.mjs 的已构建目录"
             )
 
-        node = os.environ.get("OPENCLAW_LOCAL_NODE", "node")
+        logger.info("OpenClaw 版本: %s(node: %s, entry: %s)", OC_TUI_VERSION, node, entry)
         return [node, str(entry)]
 
     async def __aenter__(self) -> OpenclawLocalClient:
@@ -332,7 +380,21 @@ class OpenclawLocalAgent:
             self._evidence_incomplete = previous is None
             return previous
 
-    def _build_command(self, prompt: str, timeout: float) -> List[str]:
+    # ------------------------------------------------------------------
+    # 命令构造:按全局 OC_TUI_VERSION 分支。
+    # ------------------------------------------------------------------
+
+    def _build_command(
+        self,
+        prompt: str,
+        timeout: float,
+    ) -> Tuple[List[str], Optional[str]]:
+        """按 OC_TUI_VERSION 拼装 ``agent --local`` 命令。
+
+        返回 ``(argv, message_file)``;``message_file`` 非空时由调用方在
+        执行结束后删除(见 ``_discard_message_file``)。
+        """
+        raw = prompt.encode("utf-8")
         args = [
             "agent",
             "--local",
@@ -343,13 +405,43 @@ class OpenclawLocalAgent:
             "--timeout",
             f"{timeout:g}",
             "--json",
-            "--message",
-            prompt,
         ]
-        model = self._client._models[self.agent_name]
+        message_file: Optional[str] = None
+
+        if OC_TUI_VERSION == "2026.10.6":
+            # 2026.10.6 起支持 --message-file,消息落盘,不受 argv 长度限制(上限 4MiB)
+            if len(raw) > MESSAGE_FILE_MAX_BYTES:
+                raise OpenclawLocalError(
+                    "消息超过 OpenClaw --message-file 上限"
+                    f"（{len(raw)} > {MESSAGE_FILE_MAX_BYTES} 字节）"
+                )
+            fd, message_file = tempfile.mkstemp(prefix="openclaw-msg-", suffix=".txt")
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(raw)
+            except BaseException:
+                Path(message_file).unlink(missing_ok=True)
+                raise
+            args.extend(["--message-file", message_file])
+        else:
+            # 其余版本仅有 --message,消息内联进 argv,受单参数内核上限 131072 字节约束
+            if len(raw) > MAX_INLINE_MESSAGE_BYTES:
+                raise OpenclawLocalError(
+                    f"OpenClaw {OC_TUI_VERSION} 仅支持 --message，消息过长无法安全放入命令行"
+                    f"（{len(raw)} > {MAX_INLINE_MESSAGE_BYTES} 字节）；"
+                    "升级到 2026.10.6 可用 --message-file 突破该限制"
+                )
+            args.extend(["--message", prompt])
+
+        model = self._client._models.get(self.agent_name)
         if model:
             args.extend(["--model", model])
-        return args
+        return args, message_file
+
+    @staticmethod
+    def _discard_message_file(message_file: Optional[str]) -> None:
+        if message_file:
+            Path(message_file).unlink(missing_ok=True)
 
     @staticmethod
     def _parse_result(data: Any) -> Tuple[str, Dict[str, Any]]:
@@ -409,24 +501,21 @@ class OpenclawLocalAgent:
             else DEFAULT_EXECUTION_TIMEOUT_SECONDS
         )
         prompt = self._build_prompt(query)
-        prompt_utf16_units = len(prompt.encode("utf-16-le")) // 2
-        if prompt_utf16_units > MAX_INLINE_MESSAGE_UTF16_UNITS:
-            raise OpenclawLocalError(
-                "OpenClaw 2026.6.6 仅支持 --message；消息过长，无法安全放入"
-                f"命令行（{prompt_utf16_units} > "
-                f"{MAX_INLINE_MESSAGE_UTF16_UNITS} UTF-16 units）"
-            )
+        args, message_file = self._build_command(prompt, timeout)
 
         previous_ids = self._snapshot_history_ids()
-        data = await self._client._run_json(
-            self._build_command(prompt, timeout),
-            cwd=str(
-                self._client.workspace_manager.get_agent_workspace(
-                    self.agent_name
-                )
-            ),
-            timeout=timeout,
-        )
+        try:
+            data = await self._client._run_json(
+                args,
+                cwd=str(
+                    self._client.workspace_manager.get_agent_workspace(
+                        self.agent_name
+                    )
+                ),
+                timeout=timeout,
+            )
+        finally:
+            self._discard_message_file(message_file)
 
         content, meta = self._parse_result(data)
         agent_meta = meta.get("agentMeta") or {}

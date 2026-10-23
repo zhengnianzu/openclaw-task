@@ -477,6 +477,8 @@ class Evaluator:
         )
         try:
             resp = await eval_agent.execute(prompt + schema_suffix)
+            if not resp.success:
+                raise RuntimeError(f"evaluator agent 执行失败: {resp.error_message or resp.stop_reason}")
             result = _parse_json_as(resp.content, EvaluationResult)
         except Exception as e:  # noqa: BLE001
             # 执行或解析失败:安全降级为 None(不阻断任务)。格式健壮性靠 schema_suffix/

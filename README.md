@@ -15,6 +15,126 @@
 - DeepSeek Harness (DSH)
 - JiuwenSwarm（TUI 协议）
 
+
+## 镜像管理
+1. openclaw-tui: 
+镜像版本：swr.cn-east-4.myhuaweicloud.com/rl_team/openclaw:26.6.6
+通过 npm 安装时：
+```bash
+npm install openclaw@2026.6.6
+openclaw --version
+openclaw onboard
+```
+镜像版本v2:
+swr.cn-east-4.myhuaweicloud.com/rl_team/openclaw:26.8.2
+
+
+两者的差异不止 --message-file 一处。我实际用两个版本各跑了一轮 agent，逐项做了比对。
+
+  结论：真正影响代码的只有 1 处，其余是外围变化
+
+  会影响我们代码的
+
+  1. transcript 存储介质变了（已兼容 ✅）
+
+  ┌──────┬─────────────────────────────────────────────────────────────────────────────┐
+  │ 版本 │                                  会话历史                                   │
+  ├──────┼─────────────────────────────────────────────────────────────────────────────┤
+  │ 6.6  │ ~/.openclaw/agents/main/sessions/<sid>.jsonl                                │
+  ├──────┼─────────────────────────────────────────────────────────────────────────────┤
+  │ 8.2  │ ~/.openclaw/agents/main/agent/openclaw-agent.sqlite 的 transcript_events 表 │
+  └──────┴─────────────────────────────────────────────────────────────────────────────┘
+
+  这是最容易踩的一个坑，因为工具调用证据（_extract_new_tool_calls）依赖它。好消息是 _history() 里已经写好了双路径：先试 SQLite，失败就回落到 JSONL。我实测两个版本都返回 rows=2，且样本字段完全一致。这块不用改。
+
+  2. 配置 schema 严格度不同（未处理 ⚠️ ）
+
+  同一份 openclaw_linux.json：
+
+  - 6.6：只报 2 条，而且措辞是「Legacy config keys detected … Run openclaw doctor --fix」，属于警告
+  - 8.2：报 6 条，措辞是「OpenClaw config is invalid」，属于硬校验失败
+
+  8.2 新增拒绝的键：meta.lastTouchedAt、browser.profiles.*.color、browser.remoteCdpTimeoutMs / remoteCdpHandshakeTimeoutMs / color、gateway.tailscale.resetOnExit。
+
+  两个版本都因为这份配置跑不了 agents list，但 6.6 对旧键更宽容。这才是切到 26.8.2 时真正会受阻的地方，比 --message-file 严重得多。
+
+  不影响我们代码的
+
+  3. JSON 结果结构（一致 ✅）
+
+  两个版本跑同一句「回复一个字：好」：
+
+  TOP:     ['meta', 'payloads']                     ← 完全相同
+  meta:    13 个键，完全相同
+  payloads[0]: ['mediaUrl', 'text']                 ← 完全相同
+  stopReason: 'stop'                                ← 相同
+
+  agentMeta 里 8.2 多出 assistantTurns、codeModeEngaged、contextTokensSource、costUsd、credentialSource、terminalReceipt，都是新增字段，_parse_result 只读 error/aborted/isError/stopReason/sessionId，全部还在。
+
+  4. agents list --json 输出（一致 ✅）
+
+  两个版本都是 id / workspace / agentDir / bindings / isDefault，一个字不差。
+
+  5. CLI 表面的其它变化（不影响我们）
+
+  - 新增 agent exec 子命令、--thinking ultra
+  - 顶层新增 attach/audit/automations/browser/connect/database/exec-approvals，删掉 commitments/crestodian/health
+  - config 加了 patch/schema 子命令
+  - channel 列表增删了几个（buzz/raft/a2a/reef/qqbot）
+
+  这些都绕开了我们用的 agent --local 路径。
+
+  6. Node 版本要求
+
+  6.6 要 >=22.19.0，8.2 要 >=24.22.1 <25 || >=26.12.1。容器里原来是 24.14.1，卡在中间——既不满足 24.22.1，也不满足 26.12.1。这就是你昨天让我装 node 26 的原因。
+
+  一个待确认的风险
+
+  8.2 的 --local 描述从「requires model provider API keys in your shell」改成了「using configured provider credentials or local CLI logins」。凭据解析路径可能变了，agentMeta.credentialSource
+  这个新字段也在暗示这点。我这次实测能正常出结果（provider 配置从 openclaw.json 读到），但如果你们生产环境靠环境变量传 key，值得在切版本前单独验一次。
+
+  建议的下一步
+
+  --message-file 那块代码已经改好并验证了。剩下要让 26.8.2 真跑起来，还差：配置迁移（手工删旧键 vs openclaw doctor --fix）+ 容器里升 openclaw 本体。这两件需要你定方向，要我继续吗？
+
+
+2. jiuwenswarm：
+镜像版本：swr.cn-east-4.myhuaweicloud.com/rl_team/jiuwenswarm:dev-stable-2026.10.22
+完整源码安装：
+```
+python -m pip install "jiuwenswarm @ git+https://gitcode.com/openJiuwen/jiuwenswarm.git@9f21b447874e83f3aff1646b5f9ae70213d33125"
+
+jiuwenswarm==0.2.3（gitcode 源码直装）
+jiuwenswarm-init
+```
+
+```
+requirements.txt
+
+# openclaw harness
+openclaw-sdk==2.1.0
+aiohttp
+
+# hermes harness
+pydantic==2.13.4
+certifi==2026.5.20
+openai>=1.0
+httpx>=0.27
+pyyaml
+hermes-agent==0.18.2
+
+# claude-code harness
+claude-agent-sdk==0.2.144
+
+# codex
+openai-codex==0.147.0
+
+# deepseek harness
+deepseek-harness-sdk==0.1.1rc1
+
+zstandard
+```
+
 ## OpenClaw 
 > 基于 openclaw-sdk 的配置驱动任务编排框架
 | `openclaw_automation.py` | OpenClaw 网关 | WebSocket → `openclaw-sdk` | 已有 OpenClaw 实例 (`ws://127.0.0.1:18789`) | `.openclaw/openclaw.json`全局兜底配置
