@@ -13,8 +13,8 @@ hermes-agent==0.18.2
 # claude-code harness
 claude-agent-sdk==0.2.144
 
-# jiuwenswarm
-workswarm==0.2.7
+# openjiuwen harness；JiuwenSwarm 服务在独立环境安装，见集成文档
+openjiuwen==0.1.19
 
 # codex
 openai-codex==0.147.0

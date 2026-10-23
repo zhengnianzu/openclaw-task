@@ -5,7 +5,7 @@
 模型由服务端按 alias / model_name 自解析，客户端只透传 agents[].model。
 AGENT.md / SOUL.md / USER.md / IDENTITY.md 仍显式注入（服务端
 ContextAssembleRail 黑名单这四个文件，不会自动进 system prompt）；
-skills 由服务端从 workspace_dir/skills 自动发现。
+项目声明的技能同样在首轮注入，原生技能库仍由服务端管理。
 """
 
 from __future__ import annotations
@@ -140,8 +140,11 @@ class JiuwenSwarmAgent:
             path = workspace / name
             if path.is_file():
                 parts.append(f"## {name}\n{path.read_text(encoding='utf-8')}")
-        # 原生技能库位于服务端全局目录；项目技能由服务端从 workspace_dir/skills
-        # 自动发现（SkillManager 会补登记手动拷入的目录），不再逐条注入 SKILL.md。
+        # dev-stable 只自动发现服务端注册的技能目录，显式注入各 Agent 的项目技能。
+        for skill in config.skills:
+            path = workspace / "skills" / Path(skill).name / "SKILL.md"
+            if path.is_file():
+                parts.append(f"## 技能 {path.parent.name}（目录：{path.parent}）\n{path.read_text(encoding='utf-8')}")
         return "\n\n".join([*parts, query])
 
     def _request(self, method: str, **params) -> dict:
@@ -153,7 +156,7 @@ class JiuwenSwarmAgent:
 
     async def execute(self, query: str, options: ExecutionOptions = None) -> ExecutionResult:
         timeout = getattr(options, "timeout_seconds", None) or 3600
-        # 每轮使用独立连接，避免上一轮终止后的尾随事件被下一轮误读。
+        # 每轮使用独立连接；服务端仍可能转发同会话上一轮的尾随事件。
         async with self._client._lock:
             try:
                 async with asyncio.timeout(timeout):
@@ -176,8 +179,9 @@ class JiuwenSwarmAgent:
                             model_name = self._client._models.get(self.agent_name)
                             if model_name:
                                 params["model_name"] = model_name
-                            await ws.send_json(self._request("chat.send", **params))
-                            result = await self._receive(ws)
+                            request = self._request("chat.send", **params)
+                            await ws.send_json(request)
+                            result = await self._receive(ws, request["id"])
                             self._initialized = True
                             return result
                         except (Exception, asyncio.CancelledError):
@@ -193,7 +197,7 @@ class JiuwenSwarmAgent:
             except (aiohttp.ClientError, OSError, ValueError, TypeError, RuntimeError) as exc:
                 return ExecutionResult(success=False, stop_reason="error", error_message=_redact_error_text(str(exc)))
 
-    async def _receive(self, ws) -> ExecutionResult:
+    async def _receive(self, ws, request_id: str) -> ExecutionResult:
         content = ""
         messages = []
         usage = None
@@ -212,6 +216,9 @@ class JiuwenSwarmAgent:
                 continue
             event = frame.get("event")
             inner = payload.get("event_type")
+            # dev-stable 的结束状态可能在下一轮连接后才到达；旧版无请求编号。
+            if event == "chat.processing_status" and payload.get("request_id") not in (None, "", request_id):
+                continue
             if event == "chat.error" or inner == "team.error":
                 raise RuntimeError(str(payload.get("error") or payload.get("message") or "Agent 执行失败"))
             if event in ("chat.ask_user_question", "plan.approval_required"):
