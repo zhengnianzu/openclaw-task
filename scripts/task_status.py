@@ -14,6 +14,10 @@
                        由各 adapter 子类的 find_trajectory/extract_eval_traj_verdict 适配)
   - 统计结果输出   : <project_root>/logs/traj_stats_result.json
 
+JiuwenSwarm dev-stable 轨迹:
+  - ~/.jiuwenswarm/service_*/agent_*/agent/sessions/<session_id>/history.json
+  - 同目录 metadata.json 的 project_dir 用于区分 main/evaluator/其他 agent
+
 harness_type 来源优先级: 显式传参 > config 的 harness_type 字段 > openclaw。
 
 task_level 分级 (逐层递进, 直接统计主 agent 的最好档):
@@ -518,7 +522,7 @@ def main() -> None:
     parser.add_argument(
             "--harness",
             default=None,
-            help="harness类型(openclaw|hermes|claude-code|dsh|opencode|pi|grok; 不指定则使用配置文件中的 harness_type,缺省为 openclaw)"
+            help="harness类型(openclaw|hermes|claude-code|dsh|opencode|pi|grok|openjiuwen|jiuwenswarm; 不指定则使用配置文件中的 harness_type,缺省为 openclaw)"
     )
     args = parser.parse_args()
 

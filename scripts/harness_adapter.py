@@ -17,6 +17,9 @@ harness 轨迹落盘位置 (沙箱内路径, 脚本在沙箱里被 harness_autom
                  (逐行 jsonl、OpenAI 风格消息: 工具调用在顶层 tool_calls, token 在
                  usage_metadata; 文件名 base 来自 task_config queries[].session_name,
                  evaluator 多一层 eval_ 前缀; 同目录 <session>.json 只存对话记录不统计)
+  - jiuwenswarm: ~/.jiuwenswarm/service_*/agent_*/agent/sessions/<session_id>/history.json
+                 (逐行事件流; metadata.json.project_dir 区分 main/evaluator/其他 agent,
+                 chat.tool_call 统计工具调用, chat.usage_metadata 划分模型轮次和 token)
   - codex： 暂未保存session
   (其余 harness 走「基类 HarnessAdapter」兜底: 不解析轨迹, 只靠 evaluator_use.log +
    run.log 给大致结果, 分级忽略 ge3 门槛, 结果带 "fallback": True)
@@ -1175,6 +1178,170 @@ class OpenjiuwenAdapter(HarnessAdapter):
             return False, None
         return _extract_completion_from_eval_text(texts)
 
+
+class JiuwenSwarmAdapter(HarnessAdapter):
+    """JiuwenSwarm dev-stable 原生会话轨迹适配器。
+
+    每个会话目录包含 ``history.json``（NDJSON 事件流）和 ``metadata.json``。
+    JiuwenSwarm 的 session id 是随机 UUID，不能靠文件名区分 agent；应使用
+    ``metadata.project_dir`` 的 workspace 末段：main 为 ``jiuwenclaw_workspace``，
+    其他 agent 为 ``jiuwenclaw_workspace-<agent_name>``。
+    """
+
+    name = "jiuwenswarm"
+
+    def _sessions_root(self) -> Path:
+        return Path("~/.jiuwenswarm").expanduser()
+
+    @staticmethod
+    def _workspace_leaf(agent_name: str) -> str:
+        if agent_name == "main":
+            return "jiuwenclaw_workspace"
+        return f"jiuwenclaw_workspace-{agent_name}"
+
+    @staticmethod
+    def _metadata(history_path: Path) -> Dict[str, Any]:
+        metadata_path = history_path.parent / "metadata.json"
+        try:
+            with open(metadata_path, encoding="utf-8", errors="replace") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _matches_agent(self, history_path: Path, agent_name: str) -> bool:
+        metadata = self._metadata(history_path)
+        project_dir = str(metadata.get("project_dir") or "").rstrip("/\\")
+        if project_dir:
+            return Path(project_dir).name == self._workspace_leaf(agent_name)
+        # 旧版 metadata 可能没有 project_dir；evaluator 的标题仍有稳定标记。
+        title = str(metadata.get("title") or "").lower()
+        return agent_name == evaluator_agent and "evaluator" in title
+
+    def _session_order_key(self, history_path: Path) -> Tuple[float, int, str]:
+        metadata = self._metadata(history_path)
+        try:
+            last_message_at = float(metadata.get("last_message_at") or 0)
+        except (TypeError, ValueError):
+            last_message_at = 0
+        try:
+            size = history_path.stat().st_size
+        except OSError:
+            size = 0
+        return last_message_at, size, history_path.parent.name
+
+    def find_trajectory(self, agent_name: str) -> Optional[Path]:
+        """定位指定 agent 最新的 ``history.json``。
+
+        service/agent 目录名允许未来版本变化，因此从 ``~/.jiuwenswarm`` 递归寻找，
+        但只接受路径中同时含 ``service_*``、``agent_*`` 和 ``sessions`` 的记录。
+        """
+        root = self._sessions_root()
+        if not root.is_dir():
+            return None
+        candidates: List[Path] = []
+        for path in root.rglob("history.json"):
+            if not path.is_file():
+                continue
+            parts = path.parts
+            if "sessions" not in parts:
+                continue
+            if not any(part.startswith("service_") for part in parts):
+                continue
+            if not any(part.startswith("agent_") for part in parts):
+                continue
+            if self._matches_agent(path, agent_name):
+                candidates.append(path)
+        if not candidates:
+            return None
+        return max(candidates, key=self._session_order_key)
+
+    def analyze(self, path: Path, agent_name: str) -> Dict[str, int]:
+        """分析 JiuwenSwarm ``history.json`` 事件流。
+
+        ``chat.usage_metadata`` 标记一次模型调用的开始；直到下一条 usage 事件前的
+        ``chat.tool_call`` 与 ``chat.final`` 都属于同一模型轮。这样可避免把“文字说明
+        + 工具调用”的同一轮误算为纯文字轮。token 取 usage_metadata 内的真实用量。
+        """
+        tool_calls = plain_rounds = assistant_rounds = 0
+        input_tk = output_tk = reasoning_tk = 0
+        current: Optional[Dict[str, bool]] = None
+
+        def finish_round() -> None:
+            nonlocal plain_rounds
+            if current and current["has_content"] and not current["has_tool"]:
+                plain_rounds += 1
+
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    event_type = event.get("event_type")
+                    if event_type == "chat.usage_metadata":
+                        finish_round()
+                        assistant_rounds += 1
+                        current = {"has_content": False, "has_tool": False}
+                        usage = (event.get("metadata") or {}).get("usage_metadata") or {}
+                        if isinstance(usage, dict):
+                            input_tk += int(usage.get("input_tokens") or 0)
+                            output_tk += int(usage.get("output_tokens") or 0)
+                            reasoning_tk += int(usage.get("reasoning_tokens") or 0)
+                    elif event_type == "chat.tool_call":
+                        tool_calls += 1
+                        if current is None:
+                            assistant_rounds += 1
+                            current = {"has_content": False, "has_tool": False}
+                        current["has_tool"] = True
+                    elif (event_type == "chat.final"
+                          and str(event.get("content") or "").strip()):
+                        if current is None:
+                            assistant_rounds += 1
+                            current = {"has_content": False, "has_tool": False}
+                        current["has_content"] = True
+        except OSError:
+            pass
+        finish_round()
+        return {
+            "tool_calls": tool_calls,
+            "plain_rounds": plain_rounds,
+            "assistant_rounds": assistant_rounds,
+            "input_tokens": input_tk,
+            "output_tokens": output_tk,
+            "reasoning_tokens": reasoning_tk,
+            "total_tokens": input_tk + output_tk + reasoning_tk,
+        }
+
+    def extract_eval_traj_verdict(
+        self, path: Optional[Path]
+    ) -> Tuple[bool, Optional[float]]:
+        """从 evaluator history 的 ``chat.final`` 文本兜底提取首轮裁决。"""
+        if not path or not path.is_file():
+            return False, None
+        texts: List[str] = []
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict) or event.get("event_type") != "chat.final":
+                        continue
+                    content = event.get("content")
+                    if isinstance(content, str) and content.strip():
+                        texts.append(content)
+        except OSError:
+            return False, None
+        return _extract_completion_from_eval_text(texts) if texts else (False, None)
+
 HARNESS_ADAPTER_CLASSES: Dict[str, type] = {
     "openclaw": OpenclawAdapter,
     "openclaw-local": OpenclawAdapter,
@@ -1185,6 +1352,8 @@ HARNESS_ADAPTER_CLASSES: Dict[str, type] = {
     "pi": PiAdapter,
     "grok": GrokAdapter,
     "openjiuwen": OpenjiuwenAdapter,
+    "jiuwenswarm": JiuwenSwarmAdapter,
+    "jiuwenswarm-dev-stable": JiuwenSwarmAdapter,
 }
 
 
