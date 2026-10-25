@@ -1177,6 +1177,7 @@ class OpenjiuwenAdapter(HarnessAdapter):
 
 HARNESS_ADAPTER_CLASSES: Dict[str, type] = {
     "openclaw": OpenclawAdapter,
+    "openclaw-local": OpenclawAdapter,
     "hermes": HermesAdapter,
     "claude-code": ClaudeCodeAdapter,
     "dsh": DshAdapter,

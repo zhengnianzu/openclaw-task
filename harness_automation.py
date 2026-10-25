@@ -3,6 +3,7 @@
 
 通过配置文件中的 harness_type 字段切换 :
 - openclaw 
+- openclaw-local
 - hermes 
 - claude-code
 - openjiuwen
@@ -163,7 +164,10 @@ class HarnessAutomation:
         self.simulator_model_cfg = all_cfgs.pop("user_simulator", None)
         self.agent_overrides = all_cfgs
 
-        if self.harness_type == "hermes":
+        if self.harness_type == "openclaw-local":
+            from src.openclaw_local_client import OpenclawLocalWorkspaceManager
+            self.workspace_manager = OpenclawLocalWorkspaceManager()
+        elif self.harness_type == "hermes":
             from src.hermes_client import HermesWorkspaceManager
             self.workspace_manager = HermesWorkspaceManager("~/.hermes")
         elif self.harness_type == "opencode":
@@ -201,7 +205,9 @@ class HarnessAutomation:
         logger.info("自动化任务系统 (harness_type=%s)", self.harness_type)
         logger.info("=" * 60)
 
-        if self.harness_type == "hermes":
+        if self.harness_type == "openclaw-local":
+            return await self._run_openclaw_local()
+        elif self.harness_type == "hermes":
             return await self._run_hermes()
         elif self.harness_type == "opencode":
             return await self._run_opencode()
@@ -557,6 +563,31 @@ class HarnessAutomation:
                 run_id=_RUN_ID,
             )
             return results
+
+    async def _run_openclaw_local(self) -> Dict[str, Any]:
+        from src.openclaw_local_client import build_openclaw_local_client, execute_openclaw_local
+        from src.executor import execute_queries
+
+        async with await build_openclaw_local_client(self.workspace_manager) as client:
+            self.client = client
+            for agent_config in self.config.agents:
+                client.setup_agent(agent_config, self.agent_overrides.get(agent_config.name))
+            await self._setup_workspaces()
+            client.evaluator_names = {
+                q.evaluate.agent_name for q in self.config.queries if q.evaluate is not None
+            }
+            return await execute_queries(
+                queries=self.config.queries,
+                client=client,
+                get_agent_fn=client.get_agent,
+                execute_with_retry_fn=execute_openclaw_local,
+                simulator_factory=lambda: create_simulator(self.config, self.simulator_model_cfg),
+                agent_system_prompts={
+                    a.name: a.system_prompt for a in self.config.agents if a.system_prompt
+                },
+                max_turn=self.config.user_max_turn,
+                run_id=_RUN_ID,
+            )
 
     async def _run_jiuwenswarm(self) -> Dict[str, Any]:
         from src.jiuwenswarm_client import (
