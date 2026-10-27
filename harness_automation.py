@@ -9,8 +9,8 @@
 - openjiuwen
 - opencode
 - codex
-- jiuwenswarm
-- jiuwenswarm-dev-stable
+- jiuwenswarm-dev
+- jiuwenswarm-xiaoyi
 - pi agent
 - grok
 - deepseek harness(dsh)
@@ -191,9 +191,12 @@ class HarnessAutomation:
         elif self.harness_type == "dsh":
             from src.dsh_client import DshWorkspaceManager
             self.workspace_manager = DshWorkspaceManager("~/.dsh/workspace")
-        elif self.harness_type == "jiuwenswarm":
+        elif self.harness_type == "jiuwenswarm-dev":
             from src.jiuwenswarm_client import JiuwenSwarmWorkspaceManager
             self.workspace_manager = JiuwenSwarmWorkspaceManager("~/.jiuwenswarm/agent/jiuwenclaw_workspace")
+        elif self.harness_type == "jiuwenswarm-xiaoyi":
+            from src.jiuwenswarm_client import JiuwenSwarmWorkspaceManager
+            self.workspace_manager = JiuwenSwarmWorkspaceManager("~/.jiuwenswarm/agent/workspace")
         else:
             from src.openclaw_client import OpenclawWorkspaceManager
             self.workspace_manager = OpenclawWorkspaceManager("~/.openclaw/workspace")
@@ -222,7 +225,10 @@ class HarnessAutomation:
             return await self._run_grok()
         elif self.harness_type == "dsh":
             return await self._run_dsh()
-        elif self.harness_type in ("jiuwenswarm", "jiuwenswarm-dev-stable"):
+        elif self.harness_type in (
+            "jiuwenswarm-dev",
+            "jiuwenswarm-xiaoyi",
+        ):
             return await self._run_jiuwenswarm()
         else:
             return await self._run_openclaw()
@@ -596,7 +602,9 @@ class HarnessAutomation:
         )
         from src.executor import execute_queries
 
-        async with await build_jiuwenswarm_client() as client:
+        async with await build_jiuwenswarm_client(
+            harness_type=self.harness_type,
+        ) as client:
             self.client = client
             await self._setup_workspaces()
 

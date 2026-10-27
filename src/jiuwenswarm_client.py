@@ -34,11 +34,14 @@ class JiuwenSwarmHarnessError(RuntimeError):
     """JiuwenSwarm 网关、配置或返回结果不可用。"""
 
 
-async def build_jiuwenswarm_client() -> "JiuwenSwarmClient":
+async def build_jiuwenswarm_client(
+    harness_type: Optional[str] = None,
+) -> "JiuwenSwarmClient":
     """读取部署环境配置，不向公共配置模型增加 Agent 专属字段。"""
     return JiuwenSwarmClient(
         os.environ.get("JIUWENSWARM_GATEWAY_URL", "ws://127.0.0.1:19001/tui"),
         os.environ.get("JIUWENSWARM_MODE", "code.normal"),
+        harness_type=harness_type,
     )
 
 
@@ -73,9 +76,15 @@ class JiuwenSwarmWorkspaceManager(BaseWorkspaceManager):
 
 
 class JiuwenSwarmClient:
-    def __init__(self, gateway_url: str, mode: str):
+    def __init__(
+        self,
+        gateway_url: str,
+        mode: str,
+        harness_type: Optional[str] = None,
+    ):
         self.gateway_url = gateway_url
         self.mode = mode
+        self.harness_type = harness_type
         self.workspace_manager: Optional[JiuwenSwarmWorkspaceManager] = None
         self._configs = {}
         self._models = {}
@@ -123,11 +132,13 @@ class JiuwenSwarmAgent:
         self.agent_name = agent_name
         self.session_name = session_name
         self.session_key = f"harness-{uuid.uuid4().hex}"
+        self._session_created = False
         self._initialized = False
 
     def clear_session(self) -> None:
         """重试前清空历史：换新原生会话并重置首轮注入标记。"""
         self.session_key = f"harness-{uuid.uuid4().hex}"
+        self._session_created = False
         self._initialized = False
 
     def _prompt(self, query: str) -> str:
@@ -154,6 +165,64 @@ class JiuwenSwarmAgent:
             "params": {"session_id": self.session_key, "mode": self._client.mode, **params},
         }
 
+    @staticmethod
+    async def _receive_response(ws, request_id: str) -> dict:
+        """读取指定 RPC 的响应。
+
+        两个目标分支都使用 legacy TUI ``res`` 帧；按 id 匹配可避免把连接上
+        延迟到达的其他响应误认为 session.create 的结果。
+        """
+        while True:
+            frame = await ws.receive_json()
+            if frame.get("type") != "res" or frame.get("id") != request_id:
+                continue
+            if frame.get("ok") is False:
+                error = frame.get("error") or frame.get("payload") or "RPC 执行失败"
+                if isinstance(error, dict):
+                    error = error.get("message") or error.get("error") or error
+                raise RuntimeError(str(error))
+            payload = frame.get("payload")
+            return payload if isinstance(payload, dict) else {}
+
+    async def _ensure_session(self, ws, workspace: str) -> None:
+        """用同一套流程建立两种 JiuwenSwarm 分支的原生会话。
+
+        dev-stable 会忽略客户端 session_id 并返回新 ID；xiaoyi_0.2.4.beta3
+        会保留传入 ID。后续请求始终采用服务端返回的权威 ID。
+        """
+        if self._session_created:
+            return
+        requested_session_id = self.session_key
+        request = self._request(
+            "session.create",
+            cwd=workspace,
+            project_dir=workspace,
+            workspace_dir=workspace,
+            trusted_dirs=[workspace],
+            supports_user_interaction=False,
+            agent_ref={"mode": self._client.mode, "id": "default"},
+        )
+        await ws.send_json(request)
+        payload = await self._receive_response(ws, request["id"])
+        returned_session_id = payload.get("session_id") or payload.get("sessionId")
+        if not returned_session_id:
+            raise RuntimeError("JiuwenSwarm session.create 未返回 session_id")
+        self.session_key = str(returned_session_id)
+        if (
+            self._client.harness_type == "jiuwenswarm-xiaoyi"
+            and self.session_key != requested_session_id
+        ):
+            raise RuntimeError(
+                "jiuwenswarm-xiaoyi 要求 session.create 保留客户端 session_id，"
+                f"但服务端返回了 {self.session_key}"
+            )
+        self._session_created = True
+        logger.info(
+            "JiuwenSwarm 会话已建立: harness_type=%s session_id=%s",
+            self._client.harness_type,
+            self.session_key,
+        )
+
     async def execute(self, query: str, options: ExecutionOptions = None) -> ExecutionResult:
         timeout = getattr(options, "timeout_seconds", None) or 3600
         # 每轮使用独立连接；服务端仍可能转发同会话上一轮的尾随事件。
@@ -168,6 +237,7 @@ class JiuwenSwarmAgent:
                             if ack.get("type") != "event" or ack.get("event") != "connection.ack":
                                 raise RuntimeError("未收到 TUI connection.ack")
                             workspace = str(self._client.workspace_manager.get_agent_workspace(self.agent_name))
+                            await self._ensure_session(ws, workspace)
                             prompt = self._prompt(query)
                             params = dict(
                                 content=prompt, query=prompt,
@@ -212,12 +282,16 @@ class JiuwenSwarmAgent:
             if frame.get("type") != "event":
                 continue
             payload = frame.get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
             if payload.get("session_id") not in (None, "", self.session_key):
                 continue
             event = frame.get("event")
             inner = payload.get("event_type")
-            # dev-stable 的结束状态可能在下一轮连接后才到达；旧版无请求编号。
-            if event == "chat.processing_status" and payload.get("request_id") not in (None, "", request_id):
+            # 两个分支都可能在下一轮连接后才送达上一轮的终态；旧事件无请求编号。
+            if event in ("chat.processing_status", "chat.final", "chat.error") and (
+                payload.get("request_id") or payload.get("requestId")
+            ) not in (None, "", request_id):
                 continue
             if event == "chat.error" or inner == "team.error":
                 raise RuntimeError(str(payload.get("error") or payload.get("message") or "Agent 执行失败"))
@@ -225,8 +299,16 @@ class JiuwenSwarmAgent:
                 raise RuntimeError("当前为非交互执行，Agent 请求人工输入或审批；请使用普通模式或在 TUI 中处理")
             if event == "chat.delta":
                 content += payload.get("content") or ""
-            elif event == "chat.llm_usage" or (event == "chat.final" and inner == "chat.llm_usage"):
-                usage = payload
+            elif event in ("chat.llm_usage", "chat.usage_metadata", "chat.usage_summary") or (
+                event == "chat.final"
+                and inner in ("chat.llm_usage", "chat.usage_metadata", "chat.usage_summary")
+            ):
+                usage = (
+                    payload.get("usage")
+                    or payload.get("usage_metadata")
+                    or payload.get("metadata")
+                    or payload
+                )
             elif event == "chat.tool_call":
                 tool = payload.get("tool_call") or payload
                 arguments = tool.get("arguments", tool.get("input", {}))
@@ -238,15 +320,25 @@ class JiuwenSwarmAgent:
                     },
                 }]})
             elif event == "chat.tool_result":
+                tool_result = payload.get("tool_result")
+                tool_result = tool_result if isinstance(tool_result, dict) else payload
                 messages.append({
-                    "role": "tool", "tool_call_id": payload.get("tool_call_id") or payload.get("call_id"),
-                    "content": payload.get("result", payload.get("output", "")),
+                    "role": "tool",
+                    "tool_call_id": tool_result.get("tool_call_id") or tool_result.get("call_id") or tool_result.get("id"),
+                    "content": tool_result.get("result", tool_result.get("output", tool_result.get("content", ""))),
                 })
             elif event == "chat.final" and inner in (None, "", "chat.final"):
-                content = payload.get("content") or content
+                final_content = payload.get("content")
+                message = payload.get("message")
+                if not final_content and isinstance(message, dict):
+                    final_content = message.get("content") or message.get("text")
+                content = final_content or content
                 if not team_mode:
                     break
-            elif event == "chat.processing_status" and payload.get("is_processing") is False:
+            elif event == "chat.processing_status" and (
+                payload.get("is_processing") is False
+                or str(payload.get("status") or "").lower() in ("complete", "completed", "done", "idle")
+            ):
                 break
         if not content:
             raise RuntimeError("JiuwenSwarm 未返回回复内容")

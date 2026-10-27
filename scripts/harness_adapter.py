@@ -17,9 +17,10 @@ harness 轨迹落盘位置 (沙箱内路径, 脚本在沙箱里被 harness_autom
                  (逐行 jsonl、OpenAI 风格消息: 工具调用在顶层 tool_calls, token 在
                  usage_metadata; 文件名 base 来自 task_config queries[].session_name,
                  evaluator 多一层 eval_ 前缀; 同目录 <session>.json 只存对话记录不统计)
-  - jiuwenswarm: ~/.jiuwenswarm/service_*/agent_*/agent/sessions/<session_id>/history.json
-                 (逐行事件流; metadata.json.project_dir 区分 main/evaluator/其他 agent,
-                 chat.tool_call 统计工具调用, chat.usage_metadata 划分模型轮次和 token)
+  - jiuwenswarm-dev: ~/.jiuwenswarm/service_*/agent_*/agent/sessions/<session_id>/history.json
+  - jiuwenswarm-xiaoyi: ~/.jiuwenswarm/agent/sessions/<session_id>/history.json
+                 (两种布局均为逐行事件流; metadata.json.project_dir 区分 agent,
+                 chat.tool_call 统计工具调用, usage 事件划分模型轮次和 token)
   - codex： 暂未保存session
   (其余 harness 走「基类 HarnessAdapter」兜底: 不解析轨迹, 只靠 evaluator_use.log +
    run.log 给大致结果, 分级忽略 ge3 门槛, 结果带 "fallback": True)
@@ -1180,24 +1181,21 @@ class OpenjiuwenAdapter(HarnessAdapter):
 
 
 class JiuwenSwarmAdapter(HarnessAdapter):
-    """JiuwenSwarm dev-stable 原生会话轨迹适配器。
+    """JiuwenSwarm 两个分支共用的轨迹解析基类。
 
     每个会话目录包含 ``history.json``（NDJSON 事件流）和 ``metadata.json``。
     JiuwenSwarm 的 session id 是随机 UUID，不能靠文件名区分 agent；应使用
-    ``metadata.project_dir`` 的 workspace 末段：main 为 ``jiuwenclaw_workspace``，
-    其他 agent 为 ``jiuwenclaw_workspace-<agent_name>``。
+    ``metadata.project_dir`` 的 workspace 末段。dev 与 xiaoyi 的目录定位和
+    workspace 命名不同，由子类实现；事件统计与 evaluator 裁决解析共用。
     """
 
-    name = "jiuwenswarm"
+    name = "jiuwenswarm-base"
 
     def _sessions_root(self) -> Path:
         return Path("~/.jiuwenswarm").expanduser()
 
-    @staticmethod
-    def _workspace_leaf(agent_name: str) -> str:
-        if agent_name == "main":
-            return "jiuwenclaw_workspace"
-        return f"jiuwenclaw_workspace-{agent_name}"
+    def _workspace_leaf(self, agent_name: str) -> str:
+        raise NotImplementedError
 
     @staticmethod
     def _metadata(history_path: Path) -> Dict[str, Any]:
@@ -1229,32 +1227,6 @@ class JiuwenSwarmAdapter(HarnessAdapter):
         except OSError:
             size = 0
         return last_message_at, size, history_path.parent.name
-
-    def find_trajectory(self, agent_name: str) -> Optional[Path]:
-        """定位指定 agent 最新的 ``history.json``。
-
-        service/agent 目录名允许未来版本变化，因此从 ``~/.jiuwenswarm`` 递归寻找，
-        但只接受路径中同时含 ``service_*``、``agent_*`` 和 ``sessions`` 的记录。
-        """
-        root = self._sessions_root()
-        if not root.is_dir():
-            return None
-        candidates: List[Path] = []
-        for path in root.rglob("history.json"):
-            if not path.is_file():
-                continue
-            parts = path.parts
-            if "sessions" not in parts:
-                continue
-            if not any(part.startswith("service_") for part in parts):
-                continue
-            if not any(part.startswith("agent_") for part in parts):
-                continue
-            if self._matches_agent(path, agent_name):
-                candidates.append(path)
-        if not candidates:
-            return None
-        return max(candidates, key=self._session_order_key)
 
     def analyze(self, path: Path, agent_name: str) -> Dict[str, int]:
         """分析 JiuwenSwarm ``history.json`` 事件流。
@@ -1289,7 +1261,13 @@ class JiuwenSwarmAdapter(HarnessAdapter):
                         finish_round()
                         assistant_rounds += 1
                         current = {"has_content": False, "has_tool": False}
-                        usage = (event.get("metadata") or {}).get("usage_metadata") or {}
+                        metadata = event.get("metadata") or {}
+                        usage = (
+                            metadata.get("usage_metadata")
+                            or event.get("usage_metadata")
+                            or event.get("usage")
+                            or {}
+                        )
                         if isinstance(usage, dict):
                             input_tk += int(usage.get("input_tokens") or 0)
                             output_tk += int(usage.get("output_tokens") or 0)
@@ -1342,6 +1320,63 @@ class JiuwenSwarmAdapter(HarnessAdapter):
             return False, None
         return _extract_completion_from_eval_text(texts) if texts else (False, None)
 
+
+class JiuwenSwarmDevAdapter(JiuwenSwarmAdapter):
+    """dev/dev-stable 布局的 JiuwenSwarm 轨迹适配器。"""
+
+    name = "jiuwenswarm-dev"
+
+    def _workspace_leaf(self, agent_name: str) -> str:
+        if agent_name == "main":
+            return "jiuwenclaw_workspace"
+        return f"jiuwenclaw_workspace-{agent_name}"
+
+    def find_trajectory(self, agent_name: str) -> Optional[Path]:
+        """从 ``service_*/agent_*/agent/sessions`` 选择指定 agent 最新轨迹。"""
+        root = self._sessions_root()
+        if not root.is_dir():
+            return None
+        candidates: List[Path] = []
+        for path in root.rglob("history.json"):
+            if not path.is_file():
+                continue
+            parts = path.parts
+            if "sessions" not in parts:
+                continue
+            if not any(part.startswith("service_") for part in parts):
+                continue
+            if not any(part.startswith("agent_") for part in parts):
+                continue
+            if self._matches_agent(path, agent_name):
+                candidates.append(path)
+        if not candidates:
+            return None
+        return max(candidates, key=self._session_order_key)
+
+
+class JiuwenSwarmXiaoyiAdapter(JiuwenSwarmAdapter):
+    """xiaoyi_0.2.4.beta3 布局的 JiuwenSwarm 轨迹适配器。"""
+
+    name = "jiuwenswarm-xiaoyi"
+
+    def _workspace_leaf(self, agent_name: str) -> str:
+        if agent_name == "main":
+            return "workspace"
+        return f"workspace-{agent_name}"
+
+    def find_trajectory(self, agent_name: str) -> Optional[Path]:
+        """从 ``agent/sessions`` 选择指定 agent 最新轨迹。"""
+        sessions_dir = self._sessions_root() / "agent" / "sessions"
+        if not sessions_dir.is_dir():
+            return None
+        candidates = [
+            path for path in sessions_dir.rglob("history.json")
+            if path.is_file() and self._matches_agent(path, agent_name)
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=self._session_order_key)
+
 HARNESS_ADAPTER_CLASSES: Dict[str, type] = {
     "openclaw": OpenclawAdapter,
     "openclaw-local": OpenclawAdapter,
@@ -1352,8 +1387,8 @@ HARNESS_ADAPTER_CLASSES: Dict[str, type] = {
     "pi": PiAdapter,
     "grok": GrokAdapter,
     "openjiuwen": OpenjiuwenAdapter,
-    "jiuwenswarm": JiuwenSwarmAdapter,
-    "jiuwenswarm-dev-stable": JiuwenSwarmAdapter,
+    "jiuwenswarm-dev": JiuwenSwarmDevAdapter,
+    "jiuwenswarm-xiaoyi": JiuwenSwarmXiaoyiAdapter,
 }
 
 
