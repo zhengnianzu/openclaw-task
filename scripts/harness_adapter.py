@@ -17,10 +17,10 @@ harness 轨迹落盘位置 (沙箱内路径, 脚本在沙箱里被 harness_autom
                  (逐行 jsonl、OpenAI 风格消息: 工具调用在顶层 tool_calls, token 在
                  usage_metadata; 文件名 base 来自 task_config queries[].session_name,
                  evaluator 多一层 eval_ 前缀; 同目录 <session>.json 只存对话记录不统计)
-  - jiuwenswarm-dev: ~/.jiuwenswarm/service_*/agent_*/agent/sessions/<session_id>/history.json
-  - jiuwenswarm-xiaoyi: ~/.jiuwenswarm/agent/sessions/<session_id>/history.json
-                 (两种布局均为逐行事件流; metadata.json.project_dir 区分 agent,
-                 chat.tool_call 统计工具调用, usage 事件划分模型轮次和 token)
+  - jiuwenswarm-dev: ~/.jiuwenswarm/service_default/agent_default/agent/sessions/<session_id>/history.json
+  - jiuwenswarm-xiaoyi: ~/.jiuwenswarm/agent/sessions/<session_id>/history.jsonl
+                 (metadata.json.project_dir 区分 main/evaluator/其他 agent；dev 使用
+                 chat.usage_metadata，xiaoyi 使用消息事件和 chat.final 顶层 usage)
   - codex： 暂未保存session
   (其余 harness 走「基类 HarnessAdapter」兜底: 不解析轨迹, 只靠 evaluator_use.log +
    run.log 给大致结果, 分级忽略 ge3 门槛, 结果带 "fallback": True)
@@ -1181,21 +1181,26 @@ class OpenjiuwenAdapter(HarnessAdapter):
 
 
 class JiuwenSwarmAdapter(HarnessAdapter):
-    """JiuwenSwarm 两个分支共用的轨迹解析基类。
+    """JiuwenSwarm dev-stable 原生会话轨迹适配器。
 
     每个会话目录包含 ``history.json``（NDJSON 事件流）和 ``metadata.json``。
     JiuwenSwarm 的 session id 是随机 UUID，不能靠文件名区分 agent；应使用
-    ``metadata.project_dir`` 的 workspace 末段。dev 与 xiaoyi 的目录定位和
-    workspace 命名不同，由子类实现；事件统计与 evaluator 裁决解析共用。
+    ``metadata.project_dir`` 的 workspace 末段：main 为 ``jiuwenclaw_workspace``，
+    其他 agent 为 ``jiuwenclaw_workspace-<agent_name>``。
     """
 
-    name = "jiuwenswarm-base"
+    name = "jiuwenswarm-dev"
 
     def _sessions_root(self) -> Path:
-        return Path("~/.jiuwenswarm").expanduser()
+        return Path(
+            "~/.jiuwenswarm/service_default/agent_default/agent/sessions"
+        ).expanduser()
 
-    def _workspace_leaf(self, agent_name: str) -> str:
-        raise NotImplementedError
+    @staticmethod
+    def _workspace_leaf(agent_name: str) -> str:
+        if agent_name == "main":
+            return "jiuwenclaw_workspace"
+        return f"jiuwenclaw_workspace-{agent_name}"
 
     @staticmethod
     def _metadata(history_path: Path) -> Dict[str, Any]:
@@ -1227,6 +1232,25 @@ class JiuwenSwarmAdapter(HarnessAdapter):
         except OSError:
             size = 0
         return last_message_at, size, history_path.parent.name
+
+    def find_trajectory(self, agent_name: str) -> Optional[Path]:
+        """定位指定 agent 最新的 ``history.json``。
+
+        根目录与 Hive 的 ``upload_paths`` 保持一致：
+        ``~/.jiuwenswarm/service_default/agent_default/agent/sessions``。
+        交付件会把该目录映射为任务目录下的 ``sessions``，因此这里只依靠同级
+        ``metadata.json.project_dir`` 区分 main/evaluator，不再依赖上级目录名猜测。
+        """
+        root = self._sessions_root()
+        if not root.is_dir():
+            return None
+        candidates = [
+            path for path in root.rglob("history.json")
+            if path.is_file() and self._matches_agent(path, agent_name)
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=self._session_order_key)
 
     def analyze(self, path: Path, agent_name: str) -> Dict[str, int]:
         """分析 JiuwenSwarm ``history.json`` 事件流。
@@ -1261,13 +1285,7 @@ class JiuwenSwarmAdapter(HarnessAdapter):
                         finish_round()
                         assistant_rounds += 1
                         current = {"has_content": False, "has_tool": False}
-                        metadata = event.get("metadata") or {}
-                        usage = (
-                            metadata.get("usage_metadata")
-                            or event.get("usage_metadata")
-                            or event.get("usage")
-                            or {}
-                        )
+                        usage = (event.get("metadata") or {}).get("usage_metadata") or {}
                         if isinstance(usage, dict):
                             input_tk += int(usage.get("input_tokens") or 0)
                             output_tk += int(usage.get("output_tokens") or 0)
@@ -1321,61 +1339,138 @@ class JiuwenSwarmAdapter(HarnessAdapter):
         return _extract_completion_from_eval_text(texts) if texts else (False, None)
 
 
-class JiuwenSwarmDevAdapter(JiuwenSwarmAdapter):
-    """dev/dev-stable 布局的 JiuwenSwarm 轨迹适配器。"""
-
-    name = "jiuwenswarm-dev"
-
-    def _workspace_leaf(self, agent_name: str) -> str:
-        if agent_name == "main":
-            return "jiuwenclaw_workspace"
-        return f"jiuwenclaw_workspace-{agent_name}"
-
-    def find_trajectory(self, agent_name: str) -> Optional[Path]:
-        """从 ``service_*/agent_*/agent/sessions`` 选择指定 agent 最新轨迹。"""
-        root = self._sessions_root()
-        if not root.is_dir():
-            return None
-        candidates: List[Path] = []
-        for path in root.rglob("history.json"):
-            if not path.is_file():
-                continue
-            parts = path.parts
-            if "sessions" not in parts:
-                continue
-            if not any(part.startswith("service_") for part in parts):
-                continue
-            if not any(part.startswith("agent_") for part in parts):
-                continue
-            if self._matches_agent(path, agent_name):
-                candidates.append(path)
-        if not candidates:
-            return None
-        return max(candidates, key=self._session_order_key)
-
-
 class JiuwenSwarmXiaoyiAdapter(JiuwenSwarmAdapter):
-    """xiaoyi_0.2.4.beta3 布局的 JiuwenSwarm 轨迹适配器。"""
+    """JiuwenSwarm xiaoyi_0.2.4.beta3 会话轨迹适配器。
+
+    沙箱原始路径为 ``~/.jiuwenswarm/agent/sessions/<session_id>``，交付件中
+    ``agent/sessions`` 会被映射为任务目录下的 ``sessions``。每个会话包含
+    ``metadata.json`` 和消息型 ``history.jsonl``；主/evaluator 依靠
+    ``metadata.project_dir`` 的 ``workspace[-<agent>]`` 末段区分。
+    """
 
     name = "jiuwenswarm-xiaoyi"
 
-    def _workspace_leaf(self, agent_name: str) -> str:
+    def _sessions_root(self) -> Path:
+        return Path("~/.jiuwenswarm/agent/sessions").expanduser()
+
+    @staticmethod
+    def _workspace_leaf(agent_name: str) -> str:
         if agent_name == "main":
             return "workspace"
         return f"workspace-{agent_name}"
 
     def find_trajectory(self, agent_name: str) -> Optional[Path]:
-        """从 ``agent/sessions`` 选择指定 agent 最新轨迹。"""
-        sessions_dir = self._sessions_root() / "agent" / "sessions"
-        if not sessions_dir.is_dir():
+        """按 metadata.project_dir 定位指定 agent 最新的 ``history.jsonl``。"""
+        root = self._sessions_root()
+        if not root.is_dir():
             return None
         candidates = [
-            path for path in sessions_dir.rglob("history.json")
-            if path.is_file() and self._matches_agent(path, agent_name)
+            path for path in root.rglob("history.jsonl")
+            if path.is_file()
+            and ".prewarm" not in path.parts
+            and self._matches_agent(path, agent_name)
         ]
         if not candidates:
             return None
         return max(candidates, key=self._session_order_key)
+
+    @staticmethod
+    def _tool_call_id(event: Dict[str, Any]) -> str:
+        tool_call = event.get("tool_call") or {}
+        if not isinstance(tool_call, dict):
+            tool_call = {}
+        return str(
+            tool_call.get("tool_call_id")
+            or tool_call.get("call_id")
+            or tool_call.get("id")
+            or event.get("tool_call_id")
+            or event.get("call_id")
+            or ""
+        )
+
+    def analyze(self, path: Path, agent_name: str) -> Dict[str, int]:
+        """分析 Xiaoyi 消息型 ``history.jsonl``。
+
+        一次模型工具轮可能并行产生多条 ``chat.tool_call``，随后逐条产生
+        ``chat.tool_result``，因此按 pending tool_call_id 从首个 call 到最后一个
+        result 合并成一个 assistant 工具轮。带顶层 ``usage`` 的 ``chat.final`` 是
+        请求末尾的纯文本轮，同时携带该请求的汇总 token；中间不带 usage 的
+        ``chat.final`` 只是工具循环中的阶段文本，不重复计轮次。
+        """
+        tool_calls = plain_rounds = assistant_rounds = 0
+        input_tk = output_tk = reasoning_tk = total_tk = 0
+        pending_tool_ids: set[str] = set()
+        tool_round_open = False
+        has_usage_final = False
+        has_final_content = False
+
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict) or event.get("role") != "assistant":
+                        continue
+
+                    event_type = event.get("event_type")
+                    if event_type == "chat.tool_call":
+                        tool_calls += 1
+                        if not tool_round_open:
+                            assistant_rounds += 1
+                            tool_round_open = True
+                        call_id = self._tool_call_id(event)
+                        if call_id:
+                            pending_tool_ids.add(call_id)
+                    elif event_type == "chat.tool_result":
+                        call_id = self._tool_call_id(event)
+                        if call_id:
+                            pending_tool_ids.discard(call_id)
+                        if not pending_tool_ids:
+                            tool_round_open = False
+                    elif event_type == "chat.final":
+                        has_final_content = has_final_content or bool(
+                            str(event.get("content") or "").strip()
+                        )
+                        usage = event.get("usage")
+                        if not isinstance(usage, dict):
+                            continue
+
+                        has_usage_final = True
+                        assistant_rounds += 1
+                        plain_rounds += 1
+                        in_tokens = int(usage.get("input_tokens") or 0)
+                        out_tokens = int(usage.get("output_tokens") or 0)
+                        reason_tokens = int(usage.get("reasoning_tokens") or 0)
+                        input_tk += in_tokens
+                        output_tk += out_tokens
+                        reasoning_tk += reason_tokens
+                        total_tk += int(
+                            usage.get("total_tokens")
+                            or (in_tokens + out_tokens + reason_tokens)
+                        )
+        except (OSError, TypeError, ValueError):
+            pass
+
+        # 兼容没有 usage summary 的未完成/旧版 Xiaoyi 历史：最后的 final 至少是
+        # 一轮纯文字回复，但不虚构 token。
+        if has_final_content and not has_usage_final:
+            assistant_rounds += 1
+            plain_rounds += 1
+
+        return {
+            "tool_calls": tool_calls,
+            "plain_rounds": plain_rounds,
+            "assistant_rounds": assistant_rounds,
+            "input_tokens": input_tk,
+            "output_tokens": output_tk,
+            "reasoning_tokens": reasoning_tk,
+            "total_tokens": total_tk,
+        }
 
 HARNESS_ADAPTER_CLASSES: Dict[str, type] = {
     "openclaw": OpenclawAdapter,
@@ -1387,7 +1482,8 @@ HARNESS_ADAPTER_CLASSES: Dict[str, type] = {
     "pi": PiAdapter,
     "grok": GrokAdapter,
     "openjiuwen": OpenjiuwenAdapter,
-    "jiuwenswarm-dev": JiuwenSwarmDevAdapter,
+    "jiuwenswarm-dev": JiuwenSwarmAdapter,
+    "jiuwenswarm-dev-stable": JiuwenSwarmAdapter,
     "jiuwenswarm-xiaoyi": JiuwenSwarmXiaoyiAdapter,
 }
 

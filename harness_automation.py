@@ -193,7 +193,7 @@ class HarnessAutomation:
             self.workspace_manager = DshWorkspaceManager("~/.dsh/workspace")
         elif self.harness_type == "jiuwenswarm-dev":
             from src.jiuwenswarm_client import JiuwenSwarmWorkspaceManager
-            self.workspace_manager = JiuwenSwarmWorkspaceManager("~/.jiuwenswarm/agent/jiuwenclaw_workspace")
+            self.workspace_manager = JiuwenSwarmWorkspaceManager("~/.jiuwenswarm/service_default/agent_default/agent/jiuwenclaw_workspace")
         elif self.harness_type == "jiuwenswarm-xiaoyi":
             from src.jiuwenswarm_client import JiuwenSwarmWorkspaceManager
             self.workspace_manager = JiuwenSwarmWorkspaceManager("~/.jiuwenswarm/agent/workspace")

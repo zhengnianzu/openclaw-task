@@ -17,6 +17,8 @@ import os
 import uuid
 from pathlib import Path
 from typing import Optional
+from datetime import datetime, timezone, timedelta
+
 
 import aiohttp
 
@@ -29,6 +31,67 @@ logger = logging.getLogger("harness_automation")
 EXECUTION_MAX_ATTEMPTS = 5
 EXECUTION_RETRY_WAIT_SECONDS = 60
 
+# jiuwenswarm 的 app.py / server app 均以 load_dotenv(override=True) 读取
+# ~/.jiuwenswarm/config/.env, 该文件里 SERPER_API_KEY 等是空行, 会把沙箱注入的
+# 环境变量清空(日志表现为「SERPER_API_KEY 存在但为空」)。故在建会话前把非空的
+# 环境变量回填进 .env。空值不回填, 保住模板自带的端口等运行期默认值。
+JIUWENSWARM_ENV_KEYS = (
+    "SERPER_API_KEY",
+    "SERPER_API_URL",
+    "SEARCH_API_KEY",
+    "SEARCH_BACKEND_URL",
+    "BOCHA_API_KEY",
+    "BOCHA_API_URL",
+    "PERPLEXITY_API_KEY",
+    "PPLX_API_URL",
+    "JINA_API_KEY",
+    "JINA_API_URL"
+)
+
+
+def sync_jiuwenswarm_env(env_file: Optional[Path] = None) -> Optional[Path]:
+    """把当前进程的非空环境变量回填到 ~/.jiuwenswarm/config/.env。
+
+    服务端每次 create_instance 都会以 override=True 重新加载该文件, 所以在
+    建立会话前写入即可生效。文件不存在时不新建(交给产品自身初始化), 返回 None。
+    """
+    env_path = Path(env_file) if env_file else Path.home() / ".jiuwenswarm" / "config" / ".env"
+    if not env_path.exists():
+        logger.warning("jiuwenswarm .env not found, skip env sync: %s", env_path)
+        return None
+
+    overrides = {
+        k: v for k in JIUWENSWARM_ENV_KEYS
+        if (v := os.environ.get(k, "")).strip()
+    }
+    if not overrides:
+        logger.info("no jiuwenswarm env overrides in os.environ, .env unchanged")
+        return env_path
+
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+        seen = set()
+        out = []
+        for line in lines:
+            stripped = line.strip()
+            key = ""
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                key = stripped.split("=", 1)[0].strip()
+            if key and key in overrides:
+                out.append(f"{key}={overrides[key]}")
+                seen.add(key)
+            else:
+                out.append(line)
+        # 环境里给了、模板里没有的键, 追加到末尾
+        out.extend(f"{k}={v}" for k, v in overrides.items() if k not in seen)
+        env_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    except OSError as e:
+        logger.warning("write jiuwenswarm .env failed: %s: %s", type(e).__name__, e)
+        return env_path
+
+    logger.info("synced jiuwenswarm .env keys: %s", sorted(overrides))
+    return env_path
+
 
 class JiuwenSwarmHarnessError(RuntimeError):
     """JiuwenSwarm 网关、配置或返回结果不可用。"""
@@ -38,6 +101,8 @@ async def build_jiuwenswarm_client(
     harness_type: Optional[str] = None,
 ) -> "JiuwenSwarmClient":
     """读取部署环境配置，不向公共配置模型增加 Agent 专属字段。"""
+    # 建连(= 建会话)前把环境变量回填进 .env, 服务端 create_instance 会重新加载。
+    sync_jiuwenswarm_env()
     return JiuwenSwarmClient(
         os.environ.get("JIUWENSWARM_GATEWAY_URL", "ws://127.0.0.1:19001/tui"),
         os.environ.get("JIUWENSWARM_MODE", "code.normal"),
@@ -136,27 +201,30 @@ class JiuwenSwarmAgent:
         self._initialized = False
 
     def clear_session(self) -> None:
-        """重试前清空历史：换新原生会话并重置首轮注入标记。"""
+        """重试前清空历史，并重置首轮注入标记。
+
+        xiaoyi 分支例外：**沿用原有 session_key**。换新会话必须再走一次
+        session.create，而 TUI 单次 RPC 上限只有 25s（gateway
+        agent_request_timeout._TUI_DEFAULT_UNARY_TIMEOUT_SECONDS）；上一轮被中断的
+        turn 在服务端没停干净时，session.create 必然超时，5 次重试会全部卡死在
+        这一步、根本到不了 chat.send（实测间隔 85s = 60s 等待 + 25s 超时）。
+        沿用原会话可直接发 chat.send（流式路径没有总超时），重试才真正作用在请求上。
+        """
+        if self._client.harness_type == "jiuwenswarm-xiaoyi":
+            self._initialized = False
+            return
         self.session_key = f"harness-{uuid.uuid4().hex}"
         self._session_created = False
         self._initialized = False
 
     def _prompt(self, query: str) -> str:
-        if self._initialized:
-            return query
-        config = self._client._configs[self.agent_name]
-        workspace = self._client.workspace_manager.get_agent_workspace(self.agent_name)
-        parts = [config.system_prompt] if config.system_prompt else []
-        for name in config.config:
-            path = workspace / name
-            if path.is_file():
-                parts.append(f"## {name}\n{path.read_text(encoding='utf-8')}")
-        # dev-stable 只自动发现服务端注册的技能目录，显式注入各 Agent 的项目技能。
-        for skill in config.skills:
-            path = workspace / "skills" / Path(skill).name / "SKILL.md"
-            if path.is_file():
-                parts.append(f"## 技能 {path.parent.name}（目录：{path.parent}）\n{path.read_text(encoding='utf-8')}")
-        return "\n\n".join([*parts, query])
+        if self._client.harness_type == "jiuwenswarm-xiaoyi":
+            tz = timezone(timedelta(hours=8))
+            now = datetime.now(tz)
+            ts = now.strftime("%a %Y-%m-%d %H:%M")
+            tz_str = "GMT+8"
+            query = f"[{ts} {tz_str}] {query}"
+        return query
 
     def _request(self, method: str, **params) -> dict:
         return {
@@ -185,12 +253,18 @@ class JiuwenSwarmAgent:
             return payload if isinstance(payload, dict) else {}
 
     async def _ensure_session(self, ws, workspace: str) -> None:
-        """用同一套流程建立两种 JiuwenSwarm 分支的原生会话。
+        """为需要前置建会话的分支建立 JiuwenSwarm 原生会话。
 
-        dev-stable 会忽略客户端 session_id 并返回新 ID；xiaoyi_0.2.4.beta3
-        会保留传入 ID。后续请求始终采用服务端返回的权威 ID。
+        xiaoyi_0.2.4.beta3 会保留传入 ID，后续请求采用服务端返回的权威 ID。
+
+        dev-stable 不走这里（见下方 early-return）：它的 chat.send 直接接受客户端
+        session_id，不需要 session.create；
         """
         if self._session_created:
+            return
+        if self._client.harness_type != "jiuwenswarm-xiaoyi":
+            # dev-stable: 不建会话，chat.send 自带 session_id 即可（对齐 v1024 已验证行为）
+            self._session_created = True
             return
         requested_session_id = self.session_key
         request = self._request(
@@ -256,9 +330,11 @@ class JiuwenSwarmAgent:
                             return result
                         except (Exception, asyncio.CancelledError):
                             # 先通知服务端停止，单纯断开连接不能保证后台任务已取消。
+                            # 2s 太短：interrupt 未送达时服务端会继续跑完整个 turn，
+                            # 后续重试的 session.create 便一直排在它后面直至超时。
                             if not ws.closed:
                                 try:
-                                    await asyncio.wait_for(ws.send_json(self._request("chat.interrupt")), 2)
+                                    await asyncio.wait_for(ws.send_json(self._request("chat.interrupt")), 10)
                                 except (Exception, asyncio.CancelledError):
                                     pass
                             raise

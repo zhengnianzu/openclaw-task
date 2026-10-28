@@ -39,6 +39,12 @@ logger = logging.getLogger("harness_automation")
 # SDK 对 `claude` CLI 子进程的 stdout 做了 单条 JSON 消息 1 MiB 上限
 _claude_code_max_buffer_size = 32 * 1024 * 1024  # 32 MiB
 
+# receive_response() 收到 ResultMessage 时,Claude CLI 可能仍在异步刷新 session JSONL。
+# 如果此时立即 SIGKILL/SIGTERM,最后一条 assistant 回复可能尚未写入轨迹。
+_CC_TRANSCRIPT_FLUSH_GRACE_SECONDS = 1.0
+_CC_DISCONNECT_TIMEOUT_SECONDS = 10.0
+_CC_FORCE_KILL_WAIT_SECONDS = 3.0
+
 # Claude Code CLI 的用户级配置
 _CC_USER_SETTINGS_PATH = Path("~/.claude/settings.json").expanduser()
 
@@ -194,6 +200,7 @@ class ClaudecodeAgent:
 
         self._sdk: Optional[ClaudeSDKClient] = None
         self._lock = asyncio.Lock()
+        self._last_result_at: Optional[float] = None
 
     def _build_options(self) -> ClaudeAgentOptions:
         mcp_servers: Dict[str, Any] = {}
@@ -253,17 +260,71 @@ class ClaudecodeAgent:
         return sdk
 
     async def close(self) -> None:
+        """优雅关闭 SDK，确保最终回复有机会写入 session JSONL。
+
+        ``receive_response()`` 在收到 ``ResultMessage`` 后立即返回，但 Claude CLI
+        的轨迹落盘可能略晚。正常路径先等待剩余落盘窗口，再调用 SDK 官方
+        ``disconnect()``；只有优雅断开超时或失败时才强制结束子进程。
+        """
         if self._sdk is None:
             return
         sdk = self._sdk
         self._sdk = None
-        await self._force_kill_subprocess(sdk)
 
-    async def _force_kill_subprocess(self, sdk: ClaudeSDKClient) -> None:
-        """SIGKILL CLI 子进程,3s 内等回收,否则交给 OS。"""
+        # disconnect() 会清空 SDK 内部 transport，提前保留 process 仅用于异常兜底。
+        transport = getattr(sdk, "_transport", None)
+        proc = getattr(transport, "_process", None) if transport else None
+
+        if self._last_result_at is not None:
+            elapsed = time.monotonic() - self._last_result_at
+            remaining = _CC_TRANSCRIPT_FLUSH_GRACE_SECONDS - elapsed
+            if remaining > 0:
+                logger.debug(
+                    "等待 Claude Code session JSONL 落盘 %.3fs "
+                    "(agent=%s session=%s)",
+                    remaining,
+                    self.agent_name,
+                    self.session_name,
+                )
+                await asyncio.sleep(remaining)
+
         try:
-            transport = getattr(sdk, "_transport", None)
-            proc = getattr(transport, "_process", None) if transport else None
+            await asyncio.wait_for(
+                sdk.disconnect(),
+                timeout=_CC_DISCONNECT_TIMEOUT_SECONDS,
+            )
+            logger.debug(
+                "ClaudeSDKClient disconnected gracefully: agent=%s session=%s",
+                self.agent_name,
+                self.session_name,
+            )
+        except asyncio.CancelledError:
+            # SDK 0.2.144 会在取消路径中保护 transport 清理；保留取消语义，
+            # 避免上层关停流程被本层吞掉。
+            raise
+        except asyncio.TimeoutError:
+            logger.warning(
+                "ClaudeSDKClient.disconnect 超时 %.1fs,强制回收子进程 "
+                "(agent=%s session=%s)",
+                _CC_DISCONNECT_TIMEOUT_SECONDS,
+                self.agent_name,
+                self.session_name,
+            )
+            await self._force_kill_subprocess(proc)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "ClaudeSDKClient.disconnect 失败,强制回收子进程 "
+                "(agent=%s session=%s): %s: %s",
+                self.agent_name,
+                self.session_name,
+                type(e).__name__,
+                e,
+            )
+            await self._force_kill_subprocess(proc)
+
+    async def _force_kill_subprocess(self, proc: Any) -> None:
+        """异常兜底：强制结束 CLI 子进程并短暂等待 OS 回收。"""
+        try:
             if proc is None or getattr(proc, "returncode", None) is not None:
                 return
             try:
@@ -271,7 +332,10 @@ class ClaudecodeAgent:
             except ProcessLookupError:
                 return
             try:
-                await asyncio.wait_for(proc.wait(), timeout=3.0)
+                await asyncio.wait_for(
+                    proc.wait(),
+                    timeout=_CC_FORCE_KILL_WAIT_SECONDS,
+                )
             except asyncio.TimeoutError:
                 logger.warning(
                     "kill 兜底:proc.wait 仍未返回 (agent=%s),交给 OS",
@@ -350,6 +414,9 @@ class ClaudecodeAgent:
                                     )
                     elif isinstance(msg, ResultMessage):
                         last_result = msg
+                        # ResultMessage 表示协议层完成，不代表 session JSONL 已经完成
+                        # 最后一轮 fsync。close() 会据此补足一个很短的落盘窗口。
+                        self._last_result_at = time.monotonic()
                     elif isinstance(msg, SystemMessage):
                         # thinking_tokens 是 SDK 的流式思考进度心跳,单次 execute
                         if msg.subtype == "thinking_tokens":
