@@ -55,11 +55,11 @@ def test_single_turn(simulator: User_simulator, agent_message: str) -> str:
 
 
 def test_render_offline():
-    """离线单测（不调 API）：_render 注入当前时间且占位符被替换。"""
+    """离线单测（不调 API）：_render 注入当前时间、占位符被替换、语种中立。"""
     import re
 
     print("=" * 60)
-    print("离线单测: _render 当前时间注入")
+    print("离线单测: _render 当前时间注入 + 语种中立")
     print("=" * 60)
 
     simulator = User_simulator(
@@ -68,13 +68,16 @@ def test_render_offline():
         api_key="dummy",  # 不发起请求,仅构造实例
     )
 
-    # __init__ 缓存了当前时间(YYYY-mm-dd HH:MM:SS)
-    assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", simulator._current_time), \
-        f"当前时间格式异常: {simulator._current_time!r}"
-    print(f"  __init__ 缓存当前时间 = {simulator._current_time} ✓")
+    # 当前时间由 _now_str() 每次调用现算(YYYY-mm-dd HH:MM:SS),不再于 __init__ 缓存
+    now_str = simulator._now_str()
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", now_str), \
+        f"当前时间格式异常: {now_str!r}"
+    print(f"  _now_str() 当前时间 = {now_str} ✓")
 
-    rendered = simulator._render("测试任务", "（暂无对话历史）", "")
-    assert simulator._current_time in rendered, "渲染结果应包含当前时间串"
+    rendered = simulator._render("测试任务", simulator._build_history_str(), "")
+    assert re.fullmatch(
+        r".*\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}.*", rendered, re.S
+    ), "渲染结果应包含当前时间串"
     print("  _render 输出含当前时间串 ✓")
 
     # 无残留占位符(所有 {xxx} 已替换)
@@ -82,10 +85,11 @@ def test_render_offline():
     assert not leftover, f"仍有未替换的占位符: {leftover}"
     print("  无残留占位符({current_time} 等已替换) ✓")
 
-    # 同一实例多次 _render,时间不变(方案甲:__init__ 缓存复用)
-    rendered2 = simulator._render("测试任务", "（暂无对话历史）", "")
-    assert simulator._current_time in rendered2, "复用时间应稳定"
-    print("  会话内复用同一时间(不每轮现取) ✓")
+    # 语种中立:system prompt 不再写死作答语种,且显式要求跟随 Origin_query
+    assert "中文" not in rendered, "渲染后的 system prompt 不应再写死「中文」作答语种"
+    assert "语种必须与 Origin_query 保持一致" in rendered, "应含语种跟随 Origin_query 的强指令"
+    assert "（暂无对话历史）" not in rendered and "（本轮无第三方评估）" not in rendered
+    print("  system prompt 无写死语种、含语种跟随指令 ✓")
 
     print("\n✅ 离线 _render 测试通过\n")
 

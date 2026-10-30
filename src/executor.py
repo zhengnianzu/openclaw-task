@@ -267,7 +267,7 @@ async def execute_queries(
                 if retry >= 3:
                     logger.error("连续3次未收到回复,任务失败")
                     break
-                current_query = "没有看到你的回复,请重新执行。"
+                current_query = "[No reply received. Please run it again.]"
                 continue
 
             retry = 0
@@ -303,9 +303,12 @@ async def execute_queries(
                 else:
                     # 超时兜底:未完成子代理保留在 pending,带入下一轮继续追踪
                     wait_min = int(BG_WATCH_TIMEOUT // 60) or 1
+                    # 语言中立(英文)系统提示:这段会拼进 agent_reply 原样交给 user_simulator,
+                    # 中文元文本会诱导 simulator 改用中文作答,污染"语种跟随 Origin_query"的约束。
                     bg_notice = (
-                        f"\n\n【系统提示】后台子代理长时间未全部完成,"
-                        f"已等待约 {wait_min} 分钟。请向对方确认后台任务实际进展"
+                        f"\n\n[System notice] Background sub-agents have not all finished "
+                        f"after about {wait_min} minute(s). Please check with the agent on "
+                        f"the actual progress of the background work."
                     )
             agent._bg_pending_children = pending_children  # 空集也回写,确保状态一致
 
