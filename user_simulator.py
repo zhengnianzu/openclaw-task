@@ -69,6 +69,8 @@ class User_simulator:
         conversation_history: str = "",
         evaluator_feedback: str = "",
     ) -> str:
+        # 元数据占位串一律用语言中立写法(英文/方括号标签),避免中文元文本反过来
+        # 把"作答语种"带偏——语种只应由 Origin_query 决定(见 system_prompt.md 回复语言一节)。
         return (
             self._template
             .replace("{origin_query}", origin_query)
@@ -76,7 +78,7 @@ class User_simulator:
             .replace("{user_directory}", self._user_directory)
             .replace("{current_time}", self._now_str())
             .replace("{conversation_history}", conversation_history)
-            .replace("{evaluator_feedback}", evaluator_feedback or "（本轮无第三方评估）")
+            .replace("{evaluator_feedback}", evaluator_feedback or "(no evaluator feedback this turn)")
         )
 
     def update_origin_query(self, origin_query: str) -> None:
@@ -84,11 +86,13 @@ class User_simulator:
         self._current_origin_query = origin_query
 
     def _build_history_str(self) -> str:
+        # 角色标签/占位串用语言中立的 [user] / [agent],不用中文"用户/Agent":
+        # 历史里出现的中文标签会诱导 simulator 用中文作答,而作答语种应只跟随 Origin_query。
         if not self.messages:
-            return "（暂无对话历史）"
+            return "(no conversation history yet)"
         lines = []
         for msg in self.messages:
-            role = "用户" if msg["role"] == "assistant" else "Agent"
+            role = "user" if msg["role"] == "assistant" else "agent"
             lines.append(f"[{role}]: {msg['content']}")
         return "\n".join(lines)
 
