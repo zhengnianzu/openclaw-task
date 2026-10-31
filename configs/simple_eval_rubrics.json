@@ -34,7 +34,7 @@
       "id": "PT1",
       "when": "per_turn",
       "evaluator": "llm_judge",
-      "text": "回答使用中文，表述清晰易懂"
+      "text": "回答语种与用户 query 一致，表述清晰易懂"
     }
   ],
   "scoring": {

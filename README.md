@@ -511,7 +511,7 @@ execute_queries() 每轮循环
   "rubrics": [
     "[gate] 回答包含核心概念",
     "[final] 给出了代码实现",
-    "[per_turn] 使用中文回答"
+    "[per_turn] 回答语种与用户 query 一致"
   ]
 }
 ```
@@ -557,7 +557,7 @@ execute_queries() 每轮循环
       "id": "PT1",
       "when": "per_turn",
       "evaluator": "llm_judge",
-      "text": "使用中文回答"
+      "text": "回答语种与用户 query 一致"
     }
   ],
   "scoring": {

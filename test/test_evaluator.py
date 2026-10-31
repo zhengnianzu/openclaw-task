@@ -48,7 +48,7 @@ MOCK_RUBRICS = [
     Rubric(id="R2", when="final", evaluator="llm_judge",
            text="给出该城市为经济中心的依据(如 GDP/金融机构/交易所等)"),
     Rubric(id="R3", when="final", evaluator="llm_judge",
-           text="回答使用中文"),
+           text="回答语种与用户 query 一致"),
 ]
 
 MOCK_ORIGIN_QUERY = "中国的经济中心是哪里？请给出依据。"
