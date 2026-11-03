@@ -3,9 +3,9 @@
 复用公共工作区、查询循环、OpenCode 返回类型及凭证遮蔽逻辑。
 服务端管理模型与原生技能；每个逻辑 Agent/session 复用真实 session_id。
 模型由服务端按 alias / model_name 自解析，客户端只透传 agents[].model。
-AGENT.md / SOUL.md / USER.md / IDENTITY.md 仍显式注入（服务端
-ContextAssembleRail 黑名单这四个文件，不会自动进 system prompt）；
-项目声明的技能同样在首轮注入，原生技能库仍由服务端管理。
+AGENT.md / SOUL.md 在首轮随 system_prompt 一起注入（服务端
+ContextAssembleRail 黑名单这几个文件，不会自动进 system prompt）；
+项目声明的技能不注入正文，由服务端按 workspace 的 skills 目录发现。
 """
 
 from __future__ import annotations
@@ -31,22 +31,26 @@ logger = logging.getLogger("harness_automation")
 EXECUTION_MAX_ATTEMPTS = 5
 EXECUTION_RETRY_WAIT_SECONDS = 60
 
+
+def _resolve_work_mode(mode: str, work_mode: Optional[str] = None) -> str:
+    """解析网关工作模式；Agent 请求对应 work，Code 请求对应 code。"""
+    configured = (work_mode or "").strip().lower()
+    if configured == "agent":
+        configured = "work"
+    if configured:
+        if configured not in {"code", "work"}:
+            raise ValueError(
+                "JIUWENSWARM_WORK_MODE 仅支持 code/work（agent 会自动映射为 work）"
+            )
+        return configured
+
+    mode_name = (mode or "").strip().lower().split(".", 1)[0]
+    return "work" if mode_name == "agent" else "code"
+
 # jiuwenswarm 的 app.py / server app 均以 load_dotenv(override=True) 读取
 # ~/.jiuwenswarm/config/.env, 该文件里 SERPER_API_KEY 等是空行, 会把沙箱注入的
-# 环境变量清空(日志表现为「SERPER_API_KEY 存在但为空」)。故在建会话前把非空的
-# 环境变量回填进 .env。空值不回填, 保住模板自带的端口等运行期默认值。
-JIUWENSWARM_ENV_KEYS = (
-    "SERPER_API_KEY",
-    "SERPER_API_URL",
-    "SEARCH_API_KEY",
-    "SEARCH_BACKEND_URL",
-    "BOCHA_API_KEY",
-    "BOCHA_API_URL",
-    "PERPLEXITY_API_KEY",
-    "PPLX_API_URL",
-    "JINA_API_KEY",
-    "JINA_API_URL"
-)
+# 环境变量清空(日志表现为「SERPER_API_KEY 存在但为空」)。故在建会话前把当前
+# 进程的所有非空环境变量回填进 .env。空值不回填, 保住模板自带的端口等运行期默认值。
 
 
 def sync_jiuwenswarm_env(env_file: Optional[Path] = None) -> Optional[Path]:
@@ -54,16 +58,14 @@ def sync_jiuwenswarm_env(env_file: Optional[Path] = None) -> Optional[Path]:
 
     服务端每次 create_instance 都会以 override=True 重新加载该文件, 所以在
     建立会话前写入即可生效。文件不存在时不新建(交给产品自身初始化), 返回 None。
+    已存在的键原地覆盖, 新增的键追加到文件末尾。
     """
     env_path = Path(env_file) if env_file else Path.home() / ".jiuwenswarm" / "config" / ".env"
     if not env_path.exists():
         logger.warning("jiuwenswarm .env not found, skip env sync: %s", env_path)
         return None
 
-    overrides = {
-        k: v for k in JIUWENSWARM_ENV_KEYS
-        if (v := os.environ.get(k, "")).strip()
-    }
+    overrides = {k: v for k, v in os.environ.items() if v.strip()}
     if not overrides:
         logger.info("no jiuwenswarm env overrides in os.environ, .env unchanged")
         return env_path
@@ -97,16 +99,67 @@ class JiuwenSwarmHarnessError(RuntimeError):
     """JiuwenSwarm 网关、配置或返回结果不可用。"""
 
 
+def _llm_log_candidates() -> list:
+    """服务端 llm.log 的候选路径(相对当前工作目录,即 harness 运行目录)。"""
+    return [
+        Path.cwd() / "logs" / "llm.log",
+        Path.home() / ".jiuwenswarm" / "logs" / "llm.log",
+    ]
+
+
+def _recent_llm_exception(max_bytes: int = 256 * 1024) -> str:
+    """从服务端 llm.log 末尾取最近一条异常原文。
+
+    服务端下发的 chat.error 只有包装后的文案("模型调用异常，将在 0.5 秒后..."),
+    真实根因(如 ``No module named 'anthropic'``)只记录在这个文件里。
+    """
+    for path in _llm_log_candidates():
+        try:
+            if not path.exists():
+                continue
+            with open(path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - max_bytes))
+                chunk = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        # 倒序找最近一条带 exception 的记录
+        for line in reversed(chunk.splitlines()):
+            if '"exception"' not in line:
+                continue
+            try:
+                record = json.loads(line[line.index("{"):])
+            except (ValueError, KeyError):
+                continue
+            exc = record.get("exception")
+            if exc:
+                return str(exc)
+    return ""
+
+
+def _with_real_cause(message: str) -> str:
+    """把包装后的错误文案补上 llm.log 里的真实原因。"""
+    cause = _recent_llm_exception()
+    if not cause:
+        return message
+    if cause in message:
+        return message
+    return f"{message} (真实原因: {cause})"
+
+
 async def build_jiuwenswarm_client(
     harness_type: Optional[str] = None,
 ) -> "JiuwenSwarmClient":
     """读取部署环境配置，不向公共配置模型增加 Agent 专属字段。"""
     # 建连(= 建会话)前把环境变量回填进 .env, 服务端 create_instance 会重新加载。
     sync_jiuwenswarm_env()
+    mode = os.environ.get("JIUWENSWARM_MODE", "code.normal")
     return JiuwenSwarmClient(
         os.environ.get("JIUWENSWARM_GATEWAY_URL", "ws://127.0.0.1:19001/tui"),
-        os.environ.get("JIUWENSWARM_MODE", "code.normal"),
+        mode,
         harness_type=harness_type,
+        work_mode=os.environ.get("JIUWENSWARM_WORK_MODE"),
     )
 
 
@@ -146,9 +199,11 @@ class JiuwenSwarmClient:
         gateway_url: str,
         mode: str,
         harness_type: Optional[str] = None,
+        work_mode: Optional[str] = None,
     ):
         self.gateway_url = gateway_url
         self.mode = mode
+        self.work_mode = _resolve_work_mode(mode, work_mode)
         self.harness_type = harness_type
         self.workspace_manager: Optional[JiuwenSwarmWorkspaceManager] = None
         self._configs = {}
@@ -221,16 +276,49 @@ class JiuwenSwarmAgent:
         if self._client.harness_type == "jiuwenswarm-xiaoyi":
             tz = timezone(timedelta(hours=8))
             now = datetime.now(tz)
-            ts = now.strftime("%a %Y-%m-%d %H:%M")
-            tz_str = "GMT+8"
-            query = f"[{ts} {tz_str}] {query}"
-        return query
+            ts = now.strftime("%Y-%m-%d %H:%M:%S")
+            payload = json.dumps({"timestamp": ts}, separators=(",", ":"))
+            query = f"<claw_context>{payload}</claw_context>\n\n{query}"
+        return self._with_system_prompt(query)
+
+    def _with_system_prompt(self, query: str) -> str:
+        """首轮把 system_prompt 与 workspace 里的 AGENT.md / SOUL.md 拼到 query 前面。
+
+        服务端 ContextAssembleRail 不会自动把这几个文件放进 system prompt，而
+        chat.send 只有 content/query 两个文本入口，所以只能作为首轮消息的一部分
+        发送；后续轮次沿用既有上下文，只发 query。文件不存在或内容为空时跳过。
+        """
+        if self._initialized:
+            return query
+        parts = []
+        config = self._client._configs.get(self.agent_name)
+        system_prompt = (getattr(config, "system_prompt", None) or "").strip()
+        if system_prompt:
+            parts.append(system_prompt)
+        workspace_manager = self._client.workspace_manager
+        if workspace_manager is not None:
+            workspace = workspace_manager.get_agent_workspace(self.agent_name)
+            for filename in ("AGENT.md", "SOUL.md"):
+                try:
+                    content = (workspace / filename).read_text(encoding="utf-8").strip()
+                except (OSError, UnicodeDecodeError):
+                    continue
+                if content:
+                    parts.append(f"## {filename}\n\n{content}")
+        if not parts:
+            return query
+        return "\n\n".join([*parts, query])
 
     def _request(self, method: str, **params) -> dict:
         return {
             "type": "req", "id": uuid.uuid4().hex, "method": method,
             "is_stream": method == "chat.send",
-            "params": {"session_id": self.session_key, "mode": self._client.mode, **params},
+            "params": {
+                "session_id": self.session_key,
+                "mode": self._client.mode,
+                "work_mode": self._client.work_mode,
+                **params,
+            },
         }
 
     @staticmethod
@@ -468,7 +556,8 @@ def make_jiuwenswarm_execute_with_retry(client: JiuwenSwarmClient):
                     result.error_message if not result.success
                     else "JiuwenSwarm returned empty content"
                 )
-                raise JiuwenSwarmHarnessError(message)
+                # 服务端 chat.error 只给包装后的文案，真实原因补在这里
+                raise JiuwenSwarmHarnessError(_with_real_cause(message))
             except (JiuwenSwarmHarnessError, asyncio.TimeoutError) as exc:
                 last_exc = exc
                 if attempt >= EXECUTION_MAX_ATTEMPTS:

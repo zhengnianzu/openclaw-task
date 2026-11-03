@@ -5,17 +5,17 @@
 WebSocket 协议，通过 `harness_type` 选择各自的镜像、配置模板、工作区和轨迹解析。
 源码仓库为 [openJiuwen/jiuwenswarm](https://gitcode.com/openJiuwen/jiuwenswarm)。
 
-不要再使用通用的 `jiuwenswarm` 或额外的 `jiuwenswarm_variant` 字段。规范值只有：
-
 - `jiuwenswarm-dev`
 - `jiuwenswarm-xiaoyi`
 
 ## 1. 版本与镜像
 
-| Harness | 源码基线 | Python 包 | 当前基础镜像 |
-| --- | --- | --- | --- |
-| `jiuwenswarm-dev` | `dev-stable`；已校验提交 `9f21b447874e83f3aff1646b5f9ae70213d33125` | `0.2.3` | `swr.cn-east-4.myhuaweicloud.com/rl_team/jiuwenswarm:dev-stable-2026.10.23v1` |
-| `jiuwenswarm-xiaoyi` | `xiaoyi_0.2.4.beta3` | 以固定镜像内版本为准 | `swr.cn-east-4.myhuaweicloud.com/rl_team/jiuwenswarm:xiaoyi-2026.10.26` |
+| 项目 | `jiuwenswarm-dev` | `jiuwenswarm-xiaoyi` |
+| --- | --- | --- |
+| **源码基线** | `dev-stable`；已校验提交 `9f21b447874e83f3aff1646b5f9ae70213d33125` | `toc-stable`；已校验提交 `3e1e19bb1379fc65c2e2c231086d7b26be772c0a` |
+| **Python 包** | `0.2.3` | `xiaoyi_0.2.4.beta3` |
+| **当前基础镜像** | `swr.cn-east-4.myhuaweicloud.com/rl_team/jiuwenswarm:dev-stable-2026.10.23v1` | `swr.cn-east-4.myhuaweicloud.com/rl_team/jiuwenswarm:xiaoyi-2026.10.26` |
+| **当前windows镜像** | `swr.cn-east-4.myhuaweicloud.com/rl_team/jiuwenswarm:windows-jiuwenswarm-dev-stable-0.2.3-20261102` | `swr.cn-east-4.myhuaweicloud.com/rl_team/jiuwenswarm:windows-jiuwenswarm-xiaoyi-0.2.4.beta3-toc-stable-20261103` |
 
 生产和批量评测应优先使用上表的固定镜像，避免分支移动导致配置或轨迹格式发生变化。
 需要从源码安装时可使用：
@@ -27,7 +27,7 @@ python -m pip install \
 
 # xiaoyi：按分支安装；生产使用前建议再替换为实际验证过的 commit SHA
 python -m pip install \
-  "git+https://gitcode.com/openJiuwen/jiuwenswarm.git@xiaoyi_0.2.4.beta3"
+  "git+https://gitcode.com/openJiuwen/jiuwenswarm.git@3e1e19bb1379fc65c2e2c231086d7b26be772c0a"
 ```
 
 ## 2. 总体架构

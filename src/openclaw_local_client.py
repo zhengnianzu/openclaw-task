@@ -2,6 +2,9 @@
 
 通过官方 ``openclaw agent --local --json`` 命令接入，复用 OpenClaw 原生
 Agent、模型配置和会话记录，并将结果适配为统一执行器使用的格式。
+
+2026.6.6 保持原有默认逻辑；仅在明确检测到 2026.10.6 时启用该版本新增的
+运行时路径、消息文件和 SQLite 轨迹读取逻辑。
 """
 
 from __future__ import annotations
@@ -47,6 +50,7 @@ MESSAGE_FILE_MAX_BYTES = 4 * 1024 * 1024    # --message-file 官方上限 4MiB
 
 # 各版本绑定的运行时(node 与 openclaw.mjs 所在目录)
 OC_RUNTIME = {
+    # 2026.6.6 镜像默认的 24.14.1
     "default": {
         "node": "/usr/local/node24/bin/node",
         "dir": "/usr/local/node24/lib/node_modules/openclaw",
@@ -82,7 +86,7 @@ def get_openclaw_version(
     return fallback
 
 
-# 预先探测当前环境的 OpenClaw 版本,后续命令构造据此分支
+# 只有精确等于 2026.10.6 才进入新版本差异逻辑，其余情况均走 2026.6.6。
 OC_TUI_VERSION = get_openclaw_version()
 
 
@@ -150,8 +154,12 @@ class OpenclawLocalClient:
         self._processes: Set[asyncio.subprocess.Process] = set()
 
     def _resolve_command(self) -> List[str]:
-        """按 OC_TUI_VERSION 取绑定的 node 与 openclaw 入口。"""
-        runtime = OC_RUNTIME.get(OC_TUI_VERSION, OC_RUNTIME["default"])
+        """10.6 使用新增运行时；其他版本保持原 6.6 运行时。"""
+        if OC_TUI_VERSION == "2026.10.6":
+            runtime = OC_RUNTIME["2026.10.6"]
+        else:
+            runtime = OC_RUNTIME["default"]
+
         node = os.environ.get("OPENCLAW_LOCAL_NODE") or runtime["node"]
         root = os.environ.get("OPENCLAW_DIR") or runtime["dir"]
 
@@ -170,7 +178,12 @@ class OpenclawLocalClient:
                 "或设置 OPENCLAW_DIR 指向包含 openclaw.mjs 的已构建目录"
             )
 
-        logger.info("OpenClaw 版本: %s(node: %s, entry: %s)", OC_TUI_VERSION, node, entry)
+        logger.info(
+            "OpenClaw 版本: %s (node: %s, entry: %s)",
+            OC_TUI_VERSION,
+            node,
+            entry,
+        )
         return [node, str(entry)]
 
     async def __aenter__(self) -> OpenclawLocalClient:
@@ -333,6 +346,16 @@ class OpenclawLocalAgent:
             raise KeyError("CLI 尚未返回原生会话 ID")
 
         path = directory / f"{self._native_session_id}.jsonl"
+        if OC_TUI_VERSION != "2026.10.6":
+            # 默认保持 2026.6.6 原逻辑，不访问新版本的 SQLite。
+            rows = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            return [row for row in rows if row.get("type") == "message"]
+
+        # 以下仅为 2026.10.6 新增逻辑。
         database = directory.parent / "agent" / "openclaw-agent.sqlite"
         if database.exists():
             try:
