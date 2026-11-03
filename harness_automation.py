@@ -3,13 +3,14 @@
 
 通过配置文件中的 harness_type 字段切换 :
 - openclaw 
+- openclaw-local
 - hermes 
 - claude-code
 - openjiuwen
 - opencode
 - codex
-- jiuwenswarm
-- jiuwenswarm-dev-stable
+- jiuwenswarm-dev
+- jiuwenswarm-xiaoyi
 - pi agent
 - grok
 - deepseek harness(dsh)
@@ -163,7 +164,10 @@ class HarnessAutomation:
         self.simulator_model_cfg = all_cfgs.pop("user_simulator", None)
         self.agent_overrides = all_cfgs
 
-        if self.harness_type == "hermes":
+        if self.harness_type == "openclaw-tui":
+            from src.openclaw_local_client import OpenclawLocalWorkspaceManager
+            self.workspace_manager = OpenclawLocalWorkspaceManager()
+        elif self.harness_type == "hermes":
             from src.hermes_client import HermesWorkspaceManager
             self.workspace_manager = HermesWorkspaceManager("~/.hermes")
         elif self.harness_type == "opencode":
@@ -187,10 +191,12 @@ class HarnessAutomation:
         elif self.harness_type == "dsh":
             from src.dsh_client import DshWorkspaceManager
             self.workspace_manager = DshWorkspaceManager("~/.dsh/workspace")
-        elif self.harness_type in ("jiuwenswarm", "jiuwenswarm-dev-stable"):
+        elif self.harness_type == "jiuwenswarm-dev":
             from src.jiuwenswarm_client import JiuwenSwarmWorkspaceManager
-            workspace_name = "jiuwenclaw_workspace" if self.harness_type == "jiuwenswarm-dev-stable" else "workspace"
-            self.workspace_manager = JiuwenSwarmWorkspaceManager(f"~/.jiuwenswarm/agent/{workspace_name}")
+            self.workspace_manager = JiuwenSwarmWorkspaceManager("~/.jiuwenswarm/service_default/agent_default/agent/jiuwenclaw_workspace")
+        elif self.harness_type == "jiuwenswarm-xiaoyi":
+            from src.jiuwenswarm_client import JiuwenSwarmWorkspaceManager
+            self.workspace_manager = JiuwenSwarmWorkspaceManager("~/.jiuwenswarm/agent/workspace")
         else:
             from src.openclaw_client import OpenclawWorkspaceManager
             self.workspace_manager = OpenclawWorkspaceManager("~/.openclaw/workspace")
@@ -201,7 +207,9 @@ class HarnessAutomation:
         logger.info("自动化任务系统 (harness_type=%s)", self.harness_type)
         logger.info("=" * 60)
 
-        if self.harness_type == "hermes":
+        if self.harness_type == "openclaw-tui":
+            return await self._run_openclaw_local()
+        elif self.harness_type == "hermes":
             return await self._run_hermes()
         elif self.harness_type == "opencode":
             return await self._run_opencode()
@@ -217,7 +225,10 @@ class HarnessAutomation:
             return await self._run_grok()
         elif self.harness_type == "dsh":
             return await self._run_dsh()
-        elif self.harness_type in ("jiuwenswarm", "jiuwenswarm-dev-stable"):
+        elif self.harness_type in (
+            "jiuwenswarm-dev",
+            "jiuwenswarm-xiaoyi",
+        ):
             return await self._run_jiuwenswarm()
         else:
             return await self._run_openclaw()
@@ -558,6 +569,31 @@ class HarnessAutomation:
             )
             return results
 
+    async def _run_openclaw_local(self) -> Dict[str, Any]:
+        from src.openclaw_local_client import build_openclaw_local_client, execute_openclaw_local
+        from src.executor import execute_queries
+
+        async with await build_openclaw_local_client(self.workspace_manager) as client:
+            self.client = client
+            for agent_config in self.config.agents:
+                client.setup_agent(agent_config, self.agent_overrides.get(agent_config.name))
+            await self._setup_workspaces()
+            client.evaluator_names = {
+                q.evaluate.agent_name for q in self.config.queries if q.evaluate is not None
+            }
+            return await execute_queries(
+                queries=self.config.queries,
+                client=client,
+                get_agent_fn=client.get_agent,
+                execute_with_retry_fn=execute_openclaw_local,
+                simulator_factory=lambda: create_simulator(self.config, self.simulator_model_cfg),
+                agent_system_prompts={
+                    a.name: a.system_prompt for a in self.config.agents if a.system_prompt
+                },
+                max_turn=self.config.user_max_turn,
+                run_id=_RUN_ID,
+            )
+
     async def _run_jiuwenswarm(self) -> Dict[str, Any]:
         from src.jiuwenswarm_client import (
             build_jiuwenswarm_client,
@@ -566,7 +602,9 @@ class HarnessAutomation:
         )
         from src.executor import execute_queries
 
-        async with await build_jiuwenswarm_client() as client:
+        async with await build_jiuwenswarm_client(
+            harness_type=self.harness_type,
+        ) as client:
             self.client = client
             await self._setup_workspaces()
 

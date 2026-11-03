@@ -3,9 +3,8 @@
 复用公共工作区、查询循环、OpenCode 返回类型及凭证遮蔽逻辑。
 服务端管理模型与原生技能；每个逻辑 Agent/session 复用真实 session_id。
 模型由服务端按 alias / model_name 自解析，客户端只透传 agents[].model。
-AGENT.md / SOUL.md / USER.md / IDENTITY.md 仍显式注入（服务端
-ContextAssembleRail 黑名单这四个文件，不会自动进 system prompt）；
-项目声明的技能同样在首轮注入，原生技能库仍由服务端管理。
+首轮仅注入配置的 system_prompt 与运行约束；工作区 Markdown 不手动
+注入正文，项目声明的技能由服务端按 workspace 的 skills 目录发现。
 """
 
 from __future__ import annotations
@@ -17,6 +16,8 @@ import os
 import uuid
 from pathlib import Path
 from typing import Optional
+from datetime import datetime, timezone, timedelta
+
 
 import aiohttp
 
@@ -29,16 +30,154 @@ logger = logging.getLogger("harness_automation")
 EXECUTION_MAX_ATTEMPTS = 5
 EXECUTION_RETRY_WAIT_SECONDS = 60
 
+FIRST_TURN_SYSTEM_REMINDER = """======<system-reminder>
+以下是本会话的运行约束，不是用户任务正文；实际权限与工具参数以运行时为准。
+
+## 网络搜索
+
+- 如需互联网搜索，必须优先使用当前已启用、可用的搜索技能。
+- 通过已注册的技能接口获取所选搜索技能的使用说明，并实际执行其搜索流程。只读取说明或准备调用，不算已经尝试搜索。
+- 执行搜索技能脚本前，先确认该技能在当前运行时中的真实绝对路径；必须在同一次 Shell 调用中使用 cd "<技能目录绝对路径>" && <执行命令>，从技能根目录运行脚本。不得在当前项目目录直接执行技能的相对路径脚本，不依赖前一次调用中的 cd 状态，也不得猜测或写死其他环境的技能路径。
+- 只有该搜索技能已经尝试并执行失败，或当前未提供、不可用时，才依次尝试其他可用搜索技能及已注册的 web_search、paid_search 等方案；不能跳过可用的搜索技能直接降级。只读取说明或计划执行不算失败。
+
+## 工具使用约束
+
+- read_file 仅用于读取文本文件。每次调用前，先检查目标路径的扩展名；扩展名不明或无法确定为文本时，先确认文件类型。
+- 禁止使用 read_file 直接读取 PDF、任何图片或其他二进制文件，包括 .pdf、.png、.jpg、.jpeg、.webp、.gif、.bmp、.tif、.tiff、.heic、.svg 等，扩展名检查不区分大小写。
+- 处理 PDF 时，使用当前可用的 PDF 查看、解析、转换或文本提取能力，再读取提取出的文本；不得用 read_file 直接读取原始 PDF。
+- 所有图像查看和理解场景，必须优先调用已注册的 image_reading MCP 工具，不能用 read_file 读取图片代替图像理解。
+- 如 image_reading 未注册或调用失败，应说明限制，再使用其他确实可用的图像理解能力；仍然禁止用 read_file 直接读取图片。
+</system-reminder>==="""
+
+
+def _resolve_work_mode(mode: str, work_mode: Optional[str] = None) -> str:
+    """解析网关工作模式；Agent 请求对应 work，Code 请求对应 code。"""
+    configured = (work_mode or "").strip().lower()
+    if configured == "agent":
+        configured = "work"
+    if configured:
+        if configured not in {"code", "work"}:
+            raise ValueError(
+                "JIUWENSWARM_WORK_MODE 仅支持 code/work（agent 会自动映射为 work）"
+            )
+        return configured
+
+    mode_name = (mode or "").strip().lower().split(".", 1)[0]
+    return "work" if mode_name == "agent" else "code"
+
+# jiuwenswarm 的 app.py / server app 均以 load_dotenv(override=True) 读取
+# ~/.jiuwenswarm/config/.env, 该文件里 SERPER_API_KEY 等是空行, 会把沙箱注入的
+# 环境变量清空(日志表现为「SERPER_API_KEY 存在但为空」)。故在建会话前把当前
+# 进程的所有非空环境变量回填进 .env。空值不回填, 保住模板自带的端口等运行期默认值。
+
+
+def sync_jiuwenswarm_env(env_file: Optional[Path] = None) -> Optional[Path]:
+    """把当前进程的非空环境变量回填到 ~/.jiuwenswarm/config/.env。
+
+    服务端每次 create_instance 都会以 override=True 重新加载该文件, 所以在
+    建立会话前写入即可生效。文件不存在时不新建(交给产品自身初始化), 返回 None。
+    已存在的键原地覆盖, 新增的键追加到文件末尾。
+    """
+    env_path = Path(env_file) if env_file else Path.home() / ".jiuwenswarm" / "config" / ".env"
+    if not env_path.exists():
+        logger.warning("jiuwenswarm .env not found, skip env sync: %s", env_path)
+        return None
+
+    overrides = {k: v for k, v in os.environ.items() if v.strip()}
+    if not overrides:
+        logger.info("no jiuwenswarm env overrides in os.environ, .env unchanged")
+        return env_path
+
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+        seen = set()
+        out = []
+        for line in lines:
+            stripped = line.strip()
+            key = ""
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                key = stripped.split("=", 1)[0].strip()
+            if key and key in overrides:
+                out.append(f"{key}={overrides[key]}")
+                seen.add(key)
+            else:
+                out.append(line)
+        # 环境里给了、模板里没有的键, 追加到末尾
+        out.extend(f"{k}={v}" for k, v in overrides.items() if k not in seen)
+        env_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    except OSError as e:
+        logger.warning("write jiuwenswarm .env failed: %s: %s", type(e).__name__, e)
+        return env_path
+
+    logger.info("synced jiuwenswarm .env keys: %s", sorted(overrides))
+    return env_path
+
 
 class JiuwenSwarmHarnessError(RuntimeError):
     """JiuwenSwarm 网关、配置或返回结果不可用。"""
 
 
-async def build_jiuwenswarm_client() -> "JiuwenSwarmClient":
+def _llm_log_candidates() -> list:
+    """服务端 llm.log 的候选路径(相对当前工作目录,即 harness 运行目录)。"""
+    return [
+        Path.cwd() / "logs" / "llm.log",
+        Path.home() / ".jiuwenswarm" / "logs" / "llm.log",
+    ]
+
+
+def _recent_llm_exception(max_bytes: int = 256 * 1024) -> str:
+    """从服务端 llm.log 末尾取最近一条异常原文。
+
+    服务端下发的 chat.error 只有包装后的文案("模型调用异常，将在 0.5 秒后..."),
+    真实根因(如 ``No module named 'anthropic'``)只记录在这个文件里。
+    """
+    for path in _llm_log_candidates():
+        try:
+            if not path.exists():
+                continue
+            with open(path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - max_bytes))
+                chunk = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        # 倒序找最近一条带 exception 的记录
+        for line in reversed(chunk.splitlines()):
+            if '"exception"' not in line:
+                continue
+            try:
+                record = json.loads(line[line.index("{"):])
+            except (ValueError, KeyError):
+                continue
+            exc = record.get("exception")
+            if exc:
+                return str(exc)
+    return ""
+
+
+def _with_real_cause(message: str) -> str:
+    """把包装后的错误文案补上 llm.log 里的真实原因。"""
+    cause = _recent_llm_exception()
+    if not cause:
+        return message
+    if cause in message:
+        return message
+    return f"{message} (真实原因: {cause})"
+
+
+async def build_jiuwenswarm_client(
+    harness_type: Optional[str] = None,
+) -> "JiuwenSwarmClient":
     """读取部署环境配置，不向公共配置模型增加 Agent 专属字段。"""
+    # 建连(= 建会话)前把环境变量回填进 .env, 服务端 create_instance 会重新加载。
+    sync_jiuwenswarm_env()
+    mode = os.environ.get("JIUWENSWARM_MODE", "code.normal")
     return JiuwenSwarmClient(
         os.environ.get("JIUWENSWARM_GATEWAY_URL", "ws://127.0.0.1:19001/tui"),
-        os.environ.get("JIUWENSWARM_MODE", "code.normal"),
+        mode,
+        harness_type=harness_type,
+        work_mode=os.environ.get("JIUWENSWARM_WORK_MODE"),
     )
 
 
@@ -73,9 +212,17 @@ class JiuwenSwarmWorkspaceManager(BaseWorkspaceManager):
 
 
 class JiuwenSwarmClient:
-    def __init__(self, gateway_url: str, mode: str):
+    def __init__(
+        self,
+        gateway_url: str,
+        mode: str,
+        harness_type: Optional[str] = None,
+        work_mode: Optional[str] = None,
+    ):
         self.gateway_url = gateway_url
         self.mode = mode
+        self.work_mode = _resolve_work_mode(mode, work_mode)
+        self.harness_type = harness_type
         self.workspace_manager: Optional[JiuwenSwarmWorkspaceManager] = None
         self._configs = {}
         self._models = {}
@@ -123,36 +270,126 @@ class JiuwenSwarmAgent:
         self.agent_name = agent_name
         self.session_name = session_name
         self.session_key = f"harness-{uuid.uuid4().hex}"
+        self._session_created = False
         self._initialized = False
 
     def clear_session(self) -> None:
-        """重试前清空历史：换新原生会话并重置首轮注入标记。"""
+        """重试前清空历史，并重置首轮注入标记。
+
+        xiaoyi 分支例外：**沿用原有 session_key**。换新会话必须再走一次
+        session.create，而 TUI 单次 RPC 上限只有 25s（gateway
+        agent_request_timeout._TUI_DEFAULT_UNARY_TIMEOUT_SECONDS）；上一轮被中断的
+        turn 在服务端没停干净时，session.create 必然超时，5 次重试会全部卡死在
+        这一步、根本到不了 chat.send（实测间隔 85s = 60s 等待 + 25s 超时）。
+        沿用原会话可直接发 chat.send（流式路径没有总超时），重试才真正作用在请求上。
+        """
+        if self._client.harness_type == "jiuwenswarm-xiaoyi":
+            self._initialized = False
+            return
         self.session_key = f"harness-{uuid.uuid4().hex}"
+        self._session_created = False
         self._initialized = False
 
     def _prompt(self, query: str) -> str:
+        if self._client.harness_type == "jiuwenswarm-xiaoyi":
+            tz = timezone(timedelta(hours=8))
+            now = datetime.now(tz)
+            ts = now.strftime("%Y-%m-%d %H:%M:%S")
+            payload = json.dumps({"timestamp": ts}, separators=(",", ":"))
+            query = f"<claw_context>{payload}</claw_context>\n\n{query}"
+        return self._with_system_prompt(query)
+
+    def _with_system_prompt(self, query: str) -> str:
+        """首轮把 system_prompt 和运行约束拼到 query 前面。
+
+        chat.send 只有 content/query 两个文本入口，所以只能作为首轮消息的一部分
+        发送；后续轮次沿用既有上下文，只发 query。
+        """
         if self._initialized:
             return query
-        config = self._client._configs[self.agent_name]
-        workspace = self._client.workspace_manager.get_agent_workspace(self.agent_name)
-        parts = [config.system_prompt] if config.system_prompt else []
-        for name in config.config:
-            path = workspace / name
-            if path.is_file():
-                parts.append(f"## {name}\n{path.read_text(encoding='utf-8')}")
-        # dev-stable 只自动发现服务端注册的技能目录，显式注入各 Agent 的项目技能。
-        for skill in config.skills:
-            path = workspace / "skills" / Path(skill).name / "SKILL.md"
-            if path.is_file():
-                parts.append(f"## 技能 {path.parent.name}（目录：{path.parent}）\n{path.read_text(encoding='utf-8')}")
+        parts = []
+        config = self._client._configs.get(self.agent_name)
+        system_prompt = (getattr(config, "system_prompt", None) or "").strip()
+        if system_prompt:
+            parts.append(system_prompt)
+        parts.append(FIRST_TURN_SYSTEM_REMINDER)
         return "\n\n".join([*parts, query])
 
     def _request(self, method: str, **params) -> dict:
         return {
             "type": "req", "id": uuid.uuid4().hex, "method": method,
             "is_stream": method == "chat.send",
-            "params": {"session_id": self.session_key, "mode": self._client.mode, **params},
+            "params": {
+                "session_id": self.session_key,
+                "mode": self._client.mode,
+                "work_mode": self._client.work_mode,
+                **params,
+            },
         }
+
+    @staticmethod
+    async def _receive_response(ws, request_id: str) -> dict:
+        """读取指定 RPC 的响应。
+
+        两个目标分支都使用 legacy TUI ``res`` 帧；按 id 匹配可避免把连接上
+        延迟到达的其他响应误认为 session.create 的结果。
+        """
+        while True:
+            frame = await ws.receive_json()
+            if frame.get("type") != "res" or frame.get("id") != request_id:
+                continue
+            if frame.get("ok") is False:
+                error = frame.get("error") or frame.get("payload") or "RPC 执行失败"
+                if isinstance(error, dict):
+                    error = error.get("message") or error.get("error") or error
+                raise RuntimeError(str(error))
+            payload = frame.get("payload")
+            return payload if isinstance(payload, dict) else {}
+
+    async def _ensure_session(self, ws, workspace: str) -> None:
+        """为需要前置建会话的分支建立 JiuwenSwarm 原生会话。
+
+        xiaoyi_0.2.4.beta3 会保留传入 ID，后续请求采用服务端返回的权威 ID。
+
+        dev-stable 不走这里（见下方 early-return）：它的 chat.send 直接接受客户端
+        session_id，不需要 session.create；
+        """
+        if self._session_created:
+            return
+        if self._client.harness_type != "jiuwenswarm-xiaoyi":
+            # dev-stable: 不建会话，chat.send 自带 session_id 即可（对齐 v1024 已验证行为）
+            self._session_created = True
+            return
+        requested_session_id = self.session_key
+        request = self._request(
+            "session.create",
+            cwd=workspace,
+            project_dir=workspace,
+            workspace_dir=workspace,
+            trusted_dirs=[workspace],
+            supports_user_interaction=False,
+            agent_ref={"mode": self._client.mode, "id": "default"},
+        )
+        await ws.send_json(request)
+        payload = await self._receive_response(ws, request["id"])
+        returned_session_id = payload.get("session_id") or payload.get("sessionId")
+        if not returned_session_id:
+            raise RuntimeError("JiuwenSwarm session.create 未返回 session_id")
+        self.session_key = str(returned_session_id)
+        if (
+            self._client.harness_type == "jiuwenswarm-xiaoyi"
+            and self.session_key != requested_session_id
+        ):
+            raise RuntimeError(
+                "jiuwenswarm-xiaoyi 要求 session.create 保留客户端 session_id，"
+                f"但服务端返回了 {self.session_key}"
+            )
+        self._session_created = True
+        logger.info(
+            "JiuwenSwarm 会话已建立: harness_type=%s session_id=%s",
+            self._client.harness_type,
+            self.session_key,
+        )
 
     async def execute(self, query: str, options: ExecutionOptions = None) -> ExecutionResult:
         timeout = getattr(options, "timeout_seconds", None) or 3600
@@ -168,6 +405,7 @@ class JiuwenSwarmAgent:
                             if ack.get("type") != "event" or ack.get("event") != "connection.ack":
                                 raise RuntimeError("未收到 TUI connection.ack")
                             workspace = str(self._client.workspace_manager.get_agent_workspace(self.agent_name))
+                            await self._ensure_session(ws, workspace)
                             prompt = self._prompt(query)
                             params = dict(
                                 content=prompt, query=prompt,
@@ -186,9 +424,11 @@ class JiuwenSwarmAgent:
                             return result
                         except (Exception, asyncio.CancelledError):
                             # 先通知服务端停止，单纯断开连接不能保证后台任务已取消。
+                            # 2s 太短：interrupt 未送达时服务端会继续跑完整个 turn，
+                            # 后续重试的 session.create 便一直排在它后面直至超时。
                             if not ws.closed:
                                 try:
-                                    await asyncio.wait_for(ws.send_json(self._request("chat.interrupt")), 2)
+                                    await asyncio.wait_for(ws.send_json(self._request("chat.interrupt")), 10)
                                 except (Exception, asyncio.CancelledError):
                                     pass
                             raise
@@ -212,12 +452,16 @@ class JiuwenSwarmAgent:
             if frame.get("type") != "event":
                 continue
             payload = frame.get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
             if payload.get("session_id") not in (None, "", self.session_key):
                 continue
             event = frame.get("event")
             inner = payload.get("event_type")
-            # dev-stable 的结束状态可能在下一轮连接后才到达；旧版无请求编号。
-            if event == "chat.processing_status" and payload.get("request_id") not in (None, "", request_id):
+            # 两个分支都可能在下一轮连接后才送达上一轮的终态；旧事件无请求编号。
+            if event in ("chat.processing_status", "chat.final", "chat.error") and (
+                payload.get("request_id") or payload.get("requestId")
+            ) not in (None, "", request_id):
                 continue
             if event == "chat.error" or inner == "team.error":
                 raise RuntimeError(str(payload.get("error") or payload.get("message") or "Agent 执行失败"))
@@ -225,8 +469,16 @@ class JiuwenSwarmAgent:
                 raise RuntimeError("当前为非交互执行，Agent 请求人工输入或审批；请使用普通模式或在 TUI 中处理")
             if event == "chat.delta":
                 content += payload.get("content") or ""
-            elif event == "chat.llm_usage" or (event == "chat.final" and inner == "chat.llm_usage"):
-                usage = payload
+            elif event in ("chat.llm_usage", "chat.usage_metadata", "chat.usage_summary") or (
+                event == "chat.final"
+                and inner in ("chat.llm_usage", "chat.usage_metadata", "chat.usage_summary")
+            ):
+                usage = (
+                    payload.get("usage")
+                    or payload.get("usage_metadata")
+                    or payload.get("metadata")
+                    or payload
+                )
             elif event == "chat.tool_call":
                 tool = payload.get("tool_call") or payload
                 arguments = tool.get("arguments", tool.get("input", {}))
@@ -238,15 +490,25 @@ class JiuwenSwarmAgent:
                     },
                 }]})
             elif event == "chat.tool_result":
+                tool_result = payload.get("tool_result")
+                tool_result = tool_result if isinstance(tool_result, dict) else payload
                 messages.append({
-                    "role": "tool", "tool_call_id": payload.get("tool_call_id") or payload.get("call_id"),
-                    "content": payload.get("result", payload.get("output", "")),
+                    "role": "tool",
+                    "tool_call_id": tool_result.get("tool_call_id") or tool_result.get("call_id") or tool_result.get("id"),
+                    "content": tool_result.get("result", tool_result.get("output", tool_result.get("content", ""))),
                 })
             elif event == "chat.final" and inner in (None, "", "chat.final"):
-                content = payload.get("content") or content
+                final_content = payload.get("content")
+                message = payload.get("message")
+                if not final_content and isinstance(message, dict):
+                    final_content = message.get("content") or message.get("text")
+                content = final_content or content
                 if not team_mode:
                     break
-            elif event == "chat.processing_status" and payload.get("is_processing") is False:
+            elif event == "chat.processing_status" and (
+                payload.get("is_processing") is False
+                or str(payload.get("status") or "").lower() in ("complete", "completed", "done", "idle")
+            ):
                 break
         if not content:
             raise RuntimeError("JiuwenSwarm 未返回回复内容")
@@ -300,7 +562,8 @@ def make_jiuwenswarm_execute_with_retry(client: JiuwenSwarmClient):
                     result.error_message if not result.success
                     else "JiuwenSwarm returned empty content"
                 )
-                raise JiuwenSwarmHarnessError(message)
+                # 服务端 chat.error 只给包装后的文案，真实原因补在这里
+                raise JiuwenSwarmHarnessError(_with_real_cause(message))
             except (JiuwenSwarmHarnessError, asyncio.TimeoutError) as exc:
                 last_exc = exc
                 if attempt >= EXECUTION_MAX_ATTEMPTS:
