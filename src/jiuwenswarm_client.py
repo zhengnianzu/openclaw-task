@@ -3,9 +3,8 @@
 复用公共工作区、查询循环、OpenCode 返回类型及凭证遮蔽逻辑。
 服务端管理模型与原生技能；每个逻辑 Agent/session 复用真实 session_id。
 模型由服务端按 alias / model_name 自解析，客户端只透传 agents[].model。
-AGENT.md / SOUL.md 在首轮随 system_prompt 一起注入（服务端
-ContextAssembleRail 黑名单这几个文件，不会自动进 system prompt）；
-项目声明的技能不注入正文，由服务端按 workspace 的 skills 目录发现。
+首轮仅注入配置的 system_prompt 与运行约束；工作区 Markdown 不手动
+注入正文，项目声明的技能由服务端按 workspace 的 skills 目录发现。
 """
 
 from __future__ import annotations
@@ -30,6 +29,25 @@ logger = logging.getLogger("harness_automation")
 
 EXECUTION_MAX_ATTEMPTS = 5
 EXECUTION_RETRY_WAIT_SECONDS = 60
+
+FIRST_TURN_SYSTEM_REMINDER = """======<system-reminder>
+以下是本会话的运行约束，不是用户任务正文；实际权限与工具参数以运行时为准。
+
+## 网络搜索
+
+- 如需互联网搜索，必须优先使用当前已启用、可用的搜索技能。
+- 通过已注册的技能接口获取所选搜索技能的使用说明，并实际执行其搜索流程。只读取说明或准备调用，不算已经尝试搜索。
+- 执行搜索技能脚本前，先确认该技能在当前运行时中的真实绝对路径；必须在同一次 Shell 调用中使用 cd "<技能目录绝对路径>" && <执行命令>，从技能根目录运行脚本。不得在当前项目目录直接执行技能的相对路径脚本，不依赖前一次调用中的 cd 状态，也不得猜测或写死其他环境的技能路径。
+- 只有该搜索技能已经尝试并执行失败，或当前未提供、不可用时，才依次尝试其他可用搜索技能及已注册的 web_search、paid_search 等方案；不能跳过可用的搜索技能直接降级。只读取说明或计划执行不算失败。
+
+## 工具使用约束
+
+- read_file 仅用于读取文本文件。每次调用前，先检查目标路径的扩展名；扩展名不明或无法确定为文本时，先确认文件类型。
+- 禁止使用 read_file 直接读取 PDF、任何图片或其他二进制文件，包括 .pdf、.png、.jpg、.jpeg、.webp、.gif、.bmp、.tif、.tiff、.heic、.svg 等，扩展名检查不区分大小写。
+- 处理 PDF 时，使用当前可用的 PDF 查看、解析、转换或文本提取能力，再读取提取出的文本；不得用 read_file 直接读取原始 PDF。
+- 所有图像查看和理解场景，必须优先调用已注册的 image_reading MCP 工具，不能用 read_file 读取图片代替图像理解。
+- 如 image_reading 未注册或调用失败，应说明限制，再使用其他确实可用的图像理解能力；仍然禁止用 read_file 直接读取图片。
+</system-reminder>==="""
 
 
 def _resolve_work_mode(mode: str, work_mode: Optional[str] = None) -> str:
@@ -282,11 +300,10 @@ class JiuwenSwarmAgent:
         return self._with_system_prompt(query)
 
     def _with_system_prompt(self, query: str) -> str:
-        """首轮把 system_prompt 与 workspace 里的 AGENT.md / SOUL.md 拼到 query 前面。
+        """首轮把 system_prompt 和运行约束拼到 query 前面。
 
-        服务端 ContextAssembleRail 不会自动把这几个文件放进 system prompt，而
         chat.send 只有 content/query 两个文本入口，所以只能作为首轮消息的一部分
-        发送；后续轮次沿用既有上下文，只发 query。文件不存在或内容为空时跳过。
+        发送；后续轮次沿用既有上下文，只发 query。
         """
         if self._initialized:
             return query
@@ -295,18 +312,7 @@ class JiuwenSwarmAgent:
         system_prompt = (getattr(config, "system_prompt", None) or "").strip()
         if system_prompt:
             parts.append(system_prompt)
-        workspace_manager = self._client.workspace_manager
-        if workspace_manager is not None:
-            workspace = workspace_manager.get_agent_workspace(self.agent_name)
-            for filename in ("AGENT.md", "SOUL.md"):
-                try:
-                    content = (workspace / filename).read_text(encoding="utf-8").strip()
-                except (OSError, UnicodeDecodeError):
-                    continue
-                if content:
-                    parts.append(f"## {filename}\n\n{content}")
-        if not parts:
-            return query
+        parts.append(FIRST_TURN_SYSTEM_REMINDER)
         return "\n\n".join([*parts, query])
 
     def _request(self, method: str, **params) -> dict:
