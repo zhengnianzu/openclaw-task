@@ -119,6 +119,8 @@ run_config:
 每个 Agent 使用独立 `alias`，`agents[].model` 由客户端作为 `model_name` 透传，服务端
 再按 alias 或实际模型名解析。
 
+新版配置文件只保存用户覆盖项，初始可能只有 `version`、`permissions`、`preferred_language` 等字段，看不到 `models` 时直接在文件末尾补上该段即可。`alias` 是任务引用的名称，`model_client_config.model_name` 才是实际发送给服务的模型名称；多个别名也可以统一指向同一个 DeepSeek 模型。
+
 ```yaml
 models:
   defaults:
