@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -41,6 +42,26 @@ PROJECT_ROOT = Path(__file__).parent.resolve()
 # ============================================================================
 # Logger
 # ============================================================================
+
+def _configure_windows_utf8_stdio() -> None:
+    """避免 Windows 控制台/重定向输出使用本地代码页而产生中文乱码。"""
+    if os.name != "nt":
+        return
+
+    # reconfigure 对原生控制台和重定向输出均有效；部分测试/嵌入环境的
+    # stream 不提供该接口，因此按能力检测。
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="backslashreplace")
+            except (OSError, ValueError):
+                # IDE/服务宿主可能暴露一个不可重配置的包装流，不影响主流程。
+                pass
+
+    # 保证由本程序启动的 Python 子进程也沿用 UTF-8。
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
 
 def setup_logger(config_file: Optional[str] = None) -> logging.Logger:
     logger = logging.getLogger("harness_automation")
@@ -596,6 +617,7 @@ class HarnessAutomation:
 
     async def _run_jiuwenswarm(self) -> Dict[str, Any]:
         from src.jiuwenswarm_client import (
+            build_serper_env,
             build_jiuwenswarm_client,
             JiuwenSwarmAgentManager,
             make_jiuwenswarm_execute_with_retry,
@@ -607,6 +629,8 @@ class HarnessAutomation:
         ) as client:
             self.client = client
             await self._setup_workspaces()
+            # 写入当前分支默认 workspace 的 skills/serper/.env。
+            build_serper_env(self.workspace_manager)
 
             agent_manager = JiuwenSwarmAgentManager(
                 client,
@@ -724,6 +748,8 @@ async def main(
 
 if __name__ == "__main__":
     import argparse
+
+    _configure_windows_utf8_stdio()
 
     parser = argparse.ArgumentParser(description="自动化任务执行系统")
     parser.add_argument(

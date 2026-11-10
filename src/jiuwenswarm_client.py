@@ -65,6 +65,7 @@ def _resolve_work_mode(mode: str, work_mode: Optional[str] = None) -> str:
     mode_name = (mode or "").strip().lower().split(".", 1)[0]
     return "work" if mode_name == "agent" else "code"
 
+
 # jiuwenswarm 的 app.py / server app 均以 load_dotenv(override=True) 读取
 # ~/.jiuwenswarm/config/.env, 该文件里 SERPER_API_KEY 等是空行, 会把沙箱注入的
 # 环境变量清空(日志表现为「SERPER_API_KEY 存在但为空」)。故在建会话前把当前
@@ -110,6 +111,38 @@ def sync_jiuwenswarm_env(env_file: Optional[Path] = None) -> Optional[Path]:
         return env_path
 
     logger.info("synced jiuwenswarm .env keys: %s", sorted(overrides))
+    return env_path
+
+
+def build_serper_env(
+    workspace_manager: "JiuwenSwarmWorkspaceManager",
+) -> Path:
+    """把 Serper 环境变量写入默认 workspace 的 ``skills/serper/.env``。
+
+    dev/xiaoyi 的 ``workspace_manager.base_dir`` 已分别指向各自默认 workspace。
+    调用方必须在技能复制完成后、Agent 建立会话前调用，避免文件被覆盖。
+    """
+    api_key = os.environ.get("SERPER_API_KEY", "")
+    api_url = os.environ.get("SERPER_API_URL", "")
+    lines = []
+    if api_key:
+        lines.append(f"SERPER_API_KEY={api_key}")
+    if api_url:
+        lines.append(f"SERPER_API_URL={api_url}")
+
+    content = "\n".join(lines)
+    if lines:
+        content += "\n"
+
+    skill_dir = workspace_manager.base_dir / "skills" / "serper"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    env_path = skill_dir / ".env"
+    env_path.write_text(content, encoding="utf-8")
+    logger.info(
+        "wrote JiuwenSwarm serper env: path=%s keys=%s",
+        env_path,
+        [line.split("=", 1)[0] for line in lines],
+    )
     return env_path
 
 
@@ -172,12 +205,14 @@ async def build_jiuwenswarm_client(
     """读取部署环境配置，不向公共配置模型增加 Agent 专属字段。"""
     # 建连(= 建会话)前把环境变量回填进 .env, 服务端 create_instance 会重新加载。
     sync_jiuwenswarm_env()
-    mode = os.environ.get("JIUWENSWARM_MODE", "code.normal")
+    # 所有分支统一按通用 Agent 跑: 网关默认走 code(原生 CLI 不写 work_mode),
+    # 这里显式钉死 mode=agent + work_mode=work, 与该 harness 的评测语义一致。
+    # 不读 JIUWENSWARM_MODE / JIUWENSWARM_WORK_MODE, 避免环境残留导致两个分支行为不一致。
     return JiuwenSwarmClient(
         os.environ.get("JIUWENSWARM_GATEWAY_URL", "ws://127.0.0.1:19001/tui"),
-        mode,
+        "agent",
         harness_type=harness_type,
-        work_mode=os.environ.get("JIUWENSWARM_WORK_MODE"),
+        work_mode="work",
     )
 
 

@@ -59,6 +59,10 @@ EXECUTION_HISTORY_FALLBACK_LIMIT = 50
 EXECUTION_HISTORY_FALLBACK_MAX_POLLS = 40
 EXECUTION_HISTORY_FALLBACK_POLL_INTERVAL_SECONDS = 30.0
 
+AUTO_COMPACTION_UNRECOVERABLE_MARKER = (
+    "auto-compaction could not recover this turn"
+)
+
 
 # ============================================================================
 # ResilientGateway: ProtocolGateway 子类
@@ -596,6 +600,27 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                 isinstance(message, dict)
                 and str(message.get("role", "")).lower() == "assistant"
             )
+        """ openclaw.json配置项修改如下：
+            "contextWindow": 512000,
+            "compaction": {
+                "mode": "safeguard",
+                "reserveTokensFloor": 120000,
+                "midTurnPrecheck": {
+                    "enabled": true
+                },
+                "timeoutSeconds": 300
+            }
+        """
+        def raise_if_unrecoverable_compaction(text: Any) -> None:
+            """识别网关注入的终态错误，禁止向同一 session 继续发送消息。"""
+            if (
+                isinstance(text, str)
+                and AUTO_COMPACTION_UNRECOVERABLE_MARKER in text.lower()
+            ):
+                raise RuntimeError(
+                    "Auto-compaction could not recover this turn; "
+                    "terminating the current agent-loop instead of reusing the blocked session"
+                )
 
         async def fetch_history() -> List[dict[str, Any]]:
             try:
@@ -665,19 +690,32 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                 )
             return None
 
+        # 空回复恢复属于当前有效 turn 的内部重试：后续只发送“继续”，不会返回
+        # executor 进入下一轮，因此不占用 user_max_turn。
+        attempt_query = query_text
+        continued_after_empty = False
+
         for attempt in range(1, max_attempts + 1):
             before_history = await fetch_history()
             try:
-                result = await agent.execute(query_text, options=options)
+                result = await agent.execute(attempt_query, options=options)
                 if result is None:
-                    raise RuntimeError("Agent returned None")
-                if query_text == "真棒" or query_text == "好吧":
+                    raise RuntimeError("Agent returned empty reply: result is None")
+                if attempt_query == "真棒" or attempt_query == "好吧":
                     print(f"openclaw res={result}")
-                if getattr(result, "content", None):
-                    return result, False
+                content = getattr(result, "content", None)
+                has_content = (
+                    bool(content.strip())
+                    if isinstance(content, str)
+                    else bool(content)
+                )
+                if has_content:
+                    raise_if_unrecoverable_compaction(content)
+                    return result, continued_after_empty
 
                 fallback_text = await history_fallback(before_history)
                 if fallback_text:
+                    raise_if_unrecoverable_compaction(fallback_text)
                     return result.model_copy(
                         update={
                             "success": True,
@@ -688,6 +726,7 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                     ), True
 
                 error_message = getattr(result, "error_message", None)
+                raise_if_unrecoverable_compaction(error_message)
                 if error_message and not str(error_message).startswith(
                     "Agent completed with no response"
                 ):
@@ -698,6 +737,11 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                 )
             except AgentExecutionError as e:
                 msg = str(e).lower()
+                if AUTO_COMPACTION_UNRECOVERABLE_MARKER in msg:
+                    logger.error(
+                        "检测到不可恢复的 auto-compaction 终态，立即终止当前 agent-loop"
+                    )
+                    raise RuntimeError(str(e)) from e
                 if "llm request failed" in msg:
                     reason = "llm request failed"
                 else:
@@ -711,6 +755,7 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                 await asyncio.sleep(60)
                 fallback_text = await history_fallback(before_history)
                 if fallback_text:
+                    raise_if_unrecoverable_compaction(fallback_text)
                     logger.info("%s但 agent 已完成,从 history 获取到回复", reason)
                     return ExecutionResult(
                         success=True,
@@ -727,11 +772,26 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                 )
                 try:
                     result = await agent.execute("继续", options=options)
-                    if result is not None and getattr(result, "content", None):
+                    retry_content = (
+                        getattr(result, "content", None)
+                        if result is not None
+                        else None
+                    )
+                    retry_has_content = (
+                        bool(retry_content.strip())
+                        if isinstance(retry_content, str)
+                        else bool(retry_content)
+                    )
+                    if retry_has_content:
+                        raise_if_unrecoverable_compaction(retry_content)
                         logger.info("'继续'重试成功,agent 恢复执行")
                         return result, True
                 except Exception as retry_e:
+                    if AUTO_COMPACTION_UNRECOVERABLE_MARKER in str(retry_e).lower():
+                        raise RuntimeError(str(retry_e)) from retry_e
                     logger.warning("'继续'重试也失败: %s", retry_e)
+                attempt_query = "继续"
+                continued_after_empty = True
                 logger.warning(
                     "history 也无结果,第 %d/%d 次重试前等待 %d 秒",
                     attempt, max_attempts, EXECUTION_RETRY_WAIT_SECONDS,
@@ -759,6 +819,7 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
 
                 fallback_text = await history_fallback(before_history)
                 if fallback_text:
+                    raise_if_unrecoverable_compaction(fallback_text)
                     logger.info("WS 断开但 agent 已完成,从 history 获取到回复")
                     return ExecutionResult(
                         success=True,
@@ -775,14 +836,31 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                 await asyncio.sleep(EXECUTION_RETRY_WAIT_SECONDS)
                 continue
             except RuntimeError as e:
-                if attempt >= max_attempts:
-                    logger.error("agent 连续返回空内容 %d 次: %s", attempt, e)
+                msg = str(e).lower()
+                if AUTO_COMPACTION_UNRECOVERABLE_MARKER in msg:
+                    logger.error(
+                        "检测到不可恢复的 auto-compaction 终态，立即终止当前 agent-loop；"
+                        "不向原 session 发送“继续”"
+                    )
                     raise
+                if "agent returned empty" not in msg:
+                    raise
+                if attempt >= max_attempts:
+                    logger.error(
+                        "agent 连续返回空内容 %d 次（后续均已发送“继续”）: %s",
+                        attempt, e,
+                    )
+                    raise RuntimeError(
+                        f"Agent returned empty content after continue retries "
+                        f"({max_attempts} attempts)"
+                    ) from e
                 logger.warning(
-                    "agent 返回空内容且 history 无兜底,第 %d/%d 次重试前等待 %d 秒: %s",
+                    "agent 返回空内容且 history 无兜底；本有效轮内第 %d/%d 次恢复将发送“继续”，"
+                    "不消耗 user_max_turn；等待 %d 秒: %s",
                     attempt, max_attempts, EXECUTION_RETRY_WAIT_SECONDS, e,
                 )
+                attempt_query = "继续"
+                continued_after_empty = True
                 await asyncio.sleep(EXECUTION_RETRY_WAIT_SECONDS)
 
     return execute_with_retry
-
