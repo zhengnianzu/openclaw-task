@@ -16,6 +16,16 @@
 - JiuwenSwarm（TUI 协议）
 
 
+## 模型 API 转发网关
+
+模型 API 转发网关按监听端口转发 Anthropic 和 OpenAI 请求，并将请求、响应和 `session-id` 写入 `logs_proxy/traj/`。编辑 `proxy_config.json` 后，从项目根目录启动：
+
+```bash
+python -m src.proxy_gateway --config proxy_config.json
+```
+
+配置、协议转发和日志格式见 [模型 API 转发网关](docs/PROXY_GATEWAY.md)。
+
 ## 镜像管理
 1. openclaw-tui: 
 镜像版本：swr.cn-east-4.myhuaweicloud.com/rl_team/openclaw:26.6.6
