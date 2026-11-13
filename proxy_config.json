@@ -1,0 +1,10 @@
+{
+  "gongyingshang1": {
+    "target_ip": "https://www.yibuapi.com",
+    "local_ip": "127.0.0.1:5001"
+  },
+  "gongyingshang2": {
+    "target_ip": "http://115.111.111.111:8082",
+    "local_ip": "127.0.0.1:5002"
+  }
+}
