@@ -2,7 +2,7 @@
 
 复用公共工作区、查询循环、OpenCode 返回类型及凭证遮蔽逻辑。
 服务端管理模型与原生技能；每个逻辑 Agent/session 复用真实 session_id。
-模型由服务端按 alias / model_name 自解析，客户端只透传 agents[].model。
+模型由服务端从 config.yaml 的对应 Agent 配置解析，客户端不透传模型配置。
 首轮仅注入配置的 system_prompt 与运行约束；工作区 Markdown 不手动
 注入正文，项目声明的技能由服务端按 workspace 的 skills 目录发现。
 """
@@ -13,22 +13,17 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Optional
 from datetime import datetime, timezone, timedelta
-
-
 import aiohttp
+from dataclasses import dataclass, field
 
-from src.config import warn_agent_model_conflict
-from src.opencode_client import ExecutionOptions, ExecutionResult, _redact_error_text
 from src.workspace import BaseWorkspaceManager, copy_path
 
 logger = logging.getLogger("harness_automation")
-
-EXECUTION_MAX_ATTEMPTS = 5
-EXECUTION_RETRY_WAIT_SECONDS = 60
 
 FIRST_TURN_SYSTEM_REMINDER = """======<system-reminder>
 以下是本会话的运行约束，不是用户任务正文；实际权限与工具参数以运行时为准。
@@ -48,6 +43,36 @@ FIRST_TURN_SYSTEM_REMINDER = """======<system-reminder>
 - 所有图像查看和理解场景，必须优先调用已注册的 image_reading MCP 工具，不能用 read_file 读取图片代替图像理解。
 - 如 image_reading 未注册或调用失败，应说明限制，再使用其他确实可用的图像理解能力；仍然禁止用 read_file 直接读取图片。
 </system-reminder>==="""
+
+
+@dataclass
+class ExecutionOptions:
+    timeout_seconds: Optional[float] = None
+
+
+@dataclass
+class ExecutionResult:
+    success: bool = True
+    content: str = ""
+    stop_reason: Optional[str] = "complete"
+    error_message: Optional[str] = None
+    usage: Optional[Dict[str, Any]] = None
+    messages: Optional[List[Dict[str, Any]]] = field(default=None)
+    files: List[Dict[str, Any]] = field(default_factory=list)
+
+    def model_copy(self, *, update: Optional[Dict[str, Any]] = None) -> "ExecutionResult":
+        values = {
+            "success": self.success,
+            "content": self.content,
+            "stop_reason": self.stop_reason,
+            "error_message": self.error_message,
+            "usage": self.usage,
+            "messages": self.messages,
+            "files": list(self.files),
+        }
+        if update:
+            values.update(update)
+        return ExecutionResult(**values)
 
 
 def _resolve_work_mode(mode: str, work_mode: Optional[str] = None) -> str:
@@ -70,8 +95,6 @@ def _resolve_work_mode(mode: str, work_mode: Optional[str] = None) -> str:
 # ~/.jiuwenswarm/config/.env, 该文件里 SERPER_API_KEY 等是空行, 会把沙箱注入的
 # 环境变量清空(日志表现为「SERPER_API_KEY 存在但为空」)。故在建会话前把当前
 # 进程的所有非空环境变量回填进 .env。空值不回填, 保住模板自带的端口等运行期默认值。
-
-
 def sync_jiuwenswarm_env(env_file: Optional[Path] = None) -> Optional[Path]:
     """把当前进程的非空环境变量回填到 ~/.jiuwenswarm/config/.env。
 
@@ -158,12 +181,32 @@ def _llm_log_candidates() -> list:
     ]
 
 
-def _recent_llm_exception(max_bytes: int = 256 * 1024) -> str:
-    """从服务端 llm.log 末尾取最近一条异常原文。
+_LLM_LOG_LINE_TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 
-    服务端下发的 chat.error 只有包装后的文案("模型调用异常，将在 0.5 秒后..."),
-    真实根因(如 ``No module named 'anthropic'``)只记录在这个文件里。
+
+def _parse_llm_log_ts(line: str) -> Optional[datetime]:
+    """llm.log 每行以「YYYY-MM-DD HH:MM:SS」开头, 取出来做时间窗匹配。
+
+    该文件里的 JSON 体不带 session_id / request_id（trace 是字面量
+    default_trace_id），所以无法按 ID 关联, 唯一可靠的关联维度是时间。
     """
+    m = _LLM_LOG_LINE_TS.match(line)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def _llm_exception_in_window(started_at: Optional[datetime],
+                             ended_at: Optional[datetime],
+                             max_bytes: int = 1024 * 1024) -> tuple:
+    """取落在 [started_at, ended_at] 时间窗内的异常原文, 返回 (原文, 日志时间)。
+    时间窗取不到匹配时返回 ("", "") —— 宁可只报原始错误, 也不给一条错的根因。
+    """
+    if started_at is None:
+        return "", ""
     for path in _llm_log_candidates():
         try:
             if not path.exists():
@@ -175,9 +218,16 @@ def _recent_llm_exception(max_bytes: int = 256 * 1024) -> str:
                 chunk = fh.read().decode("utf-8", errors="replace")
         except OSError:
             continue
-        # 倒序找最近一条带 exception 的记录
+        # 倒序找时间窗内最近的一条
         for line in reversed(chunk.splitlines()):
             if '"exception"' not in line:
+                continue
+            line_ts = _parse_llm_log_ts(line)
+            if line_ts is None:
+                continue
+            if line_ts < started_at:
+                continue
+            if ended_at is not None and line_ts > ended_at:
                 continue
             try:
                 record = json.loads(line[line.index("{"):])
@@ -185,18 +235,27 @@ def _recent_llm_exception(max_bytes: int = 256 * 1024) -> str:
                 continue
             exc = record.get("exception")
             if exc:
-                return str(exc)
-    return ""
+                return str(exc), line_ts.strftime("%Y-%m-%d %H:%M:%S")
+    return "", ""
 
 
-def _with_real_cause(message: str) -> str:
-    """把包装后的错误文案补上 llm.log 里的真实原因。"""
-    cause = _recent_llm_exception()
-    if not cause:
-        return message
-    if cause in message:
-        return message
-    return f"{message} (真实原因: {cause})"
+def _with_real_cause(message: str,
+                     started_at: Optional[datetime] = None,
+                     ended_at: Optional[datetime] = None,
+                     request_id: str = "") -> str:
+    """把包装后的错误文案补上本次请求时间窗内的真实原因。
+
+    request_id 是本端 chat.send 的请求号, 一并带出 —— llm.log 里没有它,
+    但 gateway.log / agent_server.log 有, 拿到它才能串起完整链路。
+    """
+    cause, cause_ts = _llm_exception_in_window(started_at, ended_at)
+    parts = [message]
+    if cause and cause not in message:
+        parts.append(f"真实原因({cause_ts}): {cause}")
+    if request_id:
+        parts.append(f"request_id={request_id}")
+    return " (".join(parts) + (")" if len(parts) > 1 else "")
+
 
 
 async def build_jiuwenswarm_client(
@@ -260,7 +319,6 @@ class JiuwenSwarmClient:
         self.harness_type = harness_type
         self.workspace_manager: Optional[JiuwenSwarmWorkspaceManager] = None
         self._configs = {}
-        self._models = {}
         self._agents = {}
         # 兼容只允许一个 TUI 客户端的服务版本；包括 evaluator 在内统一排队。
         self._lock = asyncio.Lock()
@@ -275,20 +333,14 @@ class JiuwenSwarmClient:
     async def __aexit__(self, exc_type, exc, tb):
         await self._http.close()
 
-    def setup_agent(self, config, override=None) -> None:
+    def setup_agent(self, config) -> None:
+        """注册 Agent 的非模型配置。
+
+        模型选择不走这里：网关只认 chat.send params 里的 model_name(见
+        JiuwenSwarmAgent.execute)，config.yaml 的 agents.<name>.model 在
+        现网网关版本中不参与模型解析。
+        """
         self._configs[config.name] = config
-        if override:
-            warn_agent_model_conflict(config.name, config.model, override)
-        # 模型原样透传，服务端按 alias / model_name 自解析。
-        self._models[config.name] = (
-            override.model if override and override.model else config.model
-        )
-        if override and (override.base_url or override.api_key or override.api):
-            logger.warning(
-                "JiuwenSwarm Agent '%s' 的模型选择已生效；"
-                "服务地址、密钥和协议请配置在 JiuwenSwarm 的 config.yaml 中",
-                config.name,
-            )
 
     def get_agent(self, agent_name: str, session_name: str):
         # 与其他 harness 一致：按 (agent_name, session_name) 键控，
@@ -308,18 +360,38 @@ class JiuwenSwarmAgent:
         self._session_created = False
         self._initialized = False
 
-    def clear_session(self) -> None:
-        """重试前清空历史，并重置首轮注入标记。
+    def _agent_ref(self) -> dict:
+        """返回 JiuwenSwarm config.yaml 中对应的 Agent 身份引用。
 
-        xiaoyi 分支例外：**沿用原有 session_key**。换新会话必须再走一次
-        session.create，而 TUI 单次 RPC 上限只有 25s（gateway
-        agent_request_timeout._TUI_DEFAULT_UNARY_TIMEOUT_SECONDS）；上一轮被中断的
-        turn 在服务端没停干净时，session.create 必然超时，5 次重试会全部卡死在
-        这一步、根本到不了 chat.send（实测间隔 85s = 60s 等待 + 25s 超时）。
-        沿用原会话可直接发 chat.send（流式路径没有总超时），重试才真正作用在请求上。
+        agent_ref 只决定 agent 身份/会话归属，**不参与模型选择**(实测
+        2026-11-13：网关 _resolve_model_for_request 只读 params.model_name)。
+        具名 Agent 要用自己的模型，靠 execute() 里透传的
+        model_name=<agent_name> 命中 models.defaults 的 alias 条目。
+        """
+        agent_id = "default" if self.agent_name == "main" else self.agent_name
+        return {"mode": self._client.mode, "id": agent_id}
+
+    def clear_session(self) -> None:
+        """清空会话状态。
+
+        **当前调用方已移除**：JiuwenSwarm 的重试机制整体取消，两个 harness_type
+        分支都不再重试，因此不会有代码在 execute 之间调这个函数。保留它只为将来
+        需要时重新接入。
+
+        重新接入时注意两点：
+
+        1. xiaoyi 分支必须**沿用原有 session_key**。换新会话要再走一次
+           session.create，而 TUI 单次 RPC 上限只有 25s（gateway
+           agent_request_timeout._TUI_DEFAULT_UNARY_TIMEOUT_SECONDS）；上一轮被
+           中断的 turn 在服务端没停干净时 session.create 必然超时，重试会全部卡
+           在 session.create、根本到不了 chat.send（实测间隔 85s = 60s 等待
+           + 25s 超时）。沿用原会话可直接发 chat.send（流式路径没有总超时）。
+        2. 别把 _initialized 置回 False —— 那会让下一次 execute 重新拼接首轮
+           system_prompt/运行约束并重发整段任务正文，服务端会把同一个任务当成
+           新的一轮再跑一遍。实测 task_source1_mermaid-0101 的 history.jsonl 里
+           因此堆了 5 份完全相同的任务正文（仅 <claw_context> 时间戳不同）。
         """
         if self._client.harness_type == "jiuwenswarm-xiaoyi":
-            self._initialized = False
             return
         self.session_key = f"harness-{uuid.uuid4().hex}"
         self._session_created = False
@@ -403,7 +475,7 @@ class JiuwenSwarmAgent:
             workspace_dir=workspace,
             trusted_dirs=[workspace],
             supports_user_interaction=False,
-            agent_ref={"mode": self._client.mode, "id": "default"},
+            agent_ref=self._agent_ref(),
         )
         await ws.send_json(request)
         payload = await self._receive_response(ws, request["id"])
@@ -428,6 +500,10 @@ class JiuwenSwarmAgent:
 
     async def execute(self, query: str, options: ExecutionOptions = None) -> ExecutionResult:
         timeout = getattr(options, "timeout_seconds", None) or 3600
+        # 记录本次 chat.send 的起止时刻: llm.log 里没有 request/session id,
+        # 只能靠时间窗把「本次失败」和「半小时前的旧异常」区分开。
+        started_at = datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None)
+        request_id = ""
         # 每轮使用独立连接；服务端仍可能转发同会话上一轮的尾随事件。
         async with self._client._lock:
             try:
@@ -447,12 +523,20 @@ class JiuwenSwarmAgent:
                                 cwd=workspace, project_dir=workspace,
                                 workspace_dir=workspace, trusted_dirs=[workspace],
                                 supports_user_interaction=False,
-                                agent_ref={"mode": self._client.mode, "id": "default"},
+                                agent_ref=self._agent_ref(),
                             )
-                            model_name = self._client._models.get(self.agent_name)
-                            if model_name:
-                                params["model_name"] = model_name
+                            # 具名 agent 透传 model_name=<agent_name>。网关侧
+                            # _resolve_model_for_request 只认 params.model_name,
+                            # 命中 models.defaults 中 alias=<agent_name> 的条目后
+                            # 才会用该 agent 自己的 model_client_config(含 api_key);
+                            # 不传则一律落 is_default 条目 —— agent_ref 不参与
+                            # 模型选择, agents.<name>.model 也是死配置(实测
+                            # 2026-11-13: evaluator 带 alias 却全程跑 default 模型)。
+                            # main 沿用服务端 default, 不传。
+                            if self.agent_name != "main":
+                                params["model_name"] = self.agent_name
                             request = self._request("chat.send", **params)
+                            request_id = request["id"]
                             await ws.send_json(request)
                             result = await self._receive(ws, request["id"])
                             self._initialized = True
@@ -470,7 +554,16 @@ class JiuwenSwarmAgent:
             except asyncio.TimeoutError:
                 return ExecutionResult(success=False, stop_reason="timeout", error_message=f"JiuwenSwarm 执行超过 {timeout} 秒")
             except (aiohttp.ClientError, OSError, ValueError, TypeError, RuntimeError) as exc:
-                return ExecutionResult(success=False, stop_reason="error", error_message=_redact_error_text(str(exc)))
+                return ExecutionResult(
+                    success=False,
+                    stop_reason="error",
+                    error_message=_with_real_cause(
+                        str(exc),
+                        started_at=started_at,
+                        ended_at=datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None),
+                        request_id=request_id,
+                    ),
+                )
 
     async def _receive(self, ws, request_id: str) -> ExecutionResult:
         content = ""
@@ -558,59 +651,35 @@ class JiuwenSwarmAgentManager:
         self,
         client: JiuwenSwarmClient,
         workspace_manager: JiuwenSwarmWorkspaceManager,
-        agent_overrides=None,
     ):
         self.client = client
         self.workspace_manager = workspace_manager
-        self.agent_overrides = agent_overrides or {}
         self.client.workspace_manager = workspace_manager
 
     async def setup_agent(self, agent_config) -> None:
-        override = self.agent_overrides.get(agent_config.name)
-        self.client.setup_agent(agent_config, override)
+        self.client.setup_agent(agent_config)
         self.workspace_manager.get_agent_workspace(agent_config.name)
-        logger.info(
-            "设置 JiuwenSwarm Agent: %s | model=%s",
-            agent_config.name,
-            self.client._models.get(agent_config.name),
-        )
+        logger.info("设置 JiuwenSwarm Agent: %s | model=config.yaml", agent_config.name)
 
 
 def make_jiuwenswarm_execute_with_retry(client: JiuwenSwarmClient):
     """返回 JiuwenSwarm 专用 execute_with_retry。
 
-    失败按 EXECUTION_MAX_ATTEMPTS / EXECUTION_RETRY_WAIT_SECONDS 重试；每次
-    重试前 clear_session() 换新原生会话、清空上一轮累积的历史，避免脏上下文。
+    重试机制已整体取消，单次 execute 的结果就是最终结果，失败直接抛。
     """
 
     async def execute_with_retry(agent: JiuwenSwarmAgent, query_text: str, options):
-        last_exc = None
-        for attempt in range(1, EXECUTION_MAX_ATTEMPTS + 1):
-            try:
-                result = await agent.execute(query_text, options=options)
-                if result is None:
-                    raise JiuwenSwarmHarnessError("JiuwenSwarm returned None")
-                if result.success and result.content:
-                    evidence_incomplete = (result.stop_reason or "complete") != "complete"
-                    return result, evidence_incomplete
-                message = (
-                    result.error_message if not result.success
-                    else "JiuwenSwarm returned empty content"
-                )
-                # 服务端 chat.error 只给包装后的文案，真实原因补在这里
-                raise JiuwenSwarmHarnessError(_with_real_cause(message))
-            except (JiuwenSwarmHarnessError, asyncio.TimeoutError) as exc:
-                last_exc = exc
-                if attempt >= EXECUTION_MAX_ATTEMPTS:
-                    raise
-                logger.warning(
-                    "JiuwenSwarm 调用失败 (第 %d/%d 次): %s; %ds 后清空历史重试",
-                    attempt, EXECUTION_MAX_ATTEMPTS, exc, EXECUTION_RETRY_WAIT_SECONDS,
-                )
-                agent.clear_session()
-                await asyncio.sleep(EXECUTION_RETRY_WAIT_SECONDS)
-        if last_exc is not None:
-            raise last_exc
-        raise JiuwenSwarmHarnessError("JiuwenSwarm: unknown error after retries")
+        result = await agent.execute(query_text, options=options)
+        if result is None:
+            raise JiuwenSwarmHarnessError("JiuwenSwarm returned None")
+        if result.success and result.content:
+            evidence_incomplete = (result.stop_reason or "complete") != "complete"
+            return result, evidence_incomplete
+        message = (
+            result.error_message if not result.success
+            else "JiuwenSwarm returned empty content"
+        )
+        # 服务端 chat.error 只给包装后的文案，真实原因补在这里
+        raise JiuwenSwarmHarnessError(_with_real_cause(message))
 
     return execute_with_retry

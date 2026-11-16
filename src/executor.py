@@ -145,7 +145,12 @@ async def process_turn(
             trajectory, turn_record, rubric=rubric_items, window=window
         )
     except Exception as e:
-        logger.warning("evaluator 调用异常: %s", e)
+        # 评估失败不阻断任务(安全降级),但必须留痕:记进 trajectory.evaluation_errors,
+        # 随轨迹一起落盘。否则"evaluator 挂了"与"评估后判 0 分"在产物里无法区分。
+        logging.getLogger().error(
+            "evaluator 调用异常(turn=%d): %s", turn, e, exc_info=True,
+        )
+        trajectory.evaluation_errors.append({"turn": turn, "error": str(e)})
         ev = None
 
     if ev is not None:
@@ -329,12 +334,13 @@ async def execute_queries(
                 trajectory.outcome = "failed"
                 break
 
-            if "【Task_Done】" in user_reply:
+            # 兼容被日志换行折断的写法：【Task\n_Done】
+            if "【Task_Done】" in user_reply or "【Task\n_Done】" in user_reply or "【Task_\nDone】" in user_reply:
                 logger.info("任务完成(Turn %d)", turn)
                 trajectory.outcome = "done"
                 success = True
                 break
-            elif "【Task_Failed】" in user_reply:
+            elif "【Task_Failed】" in user_reply or "【Task\n_Failed】" in user_reply or "【Task_\nFailed】" in user_reply:
                 logger.error("任务失败(Turn %d):%s", turn, user_reply)
                 trajectory.outcome = "failed"
                 break

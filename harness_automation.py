@@ -634,8 +634,7 @@ class HarnessAutomation:
 
             agent_manager = JiuwenSwarmAgentManager(
                 client,
-                self.workspace_manager,
-                agent_overrides=self.agent_overrides,
+                self.workspace_manager
             )
             for agent_config in self.config.agents:
                 await agent_manager.setup_agent(agent_config)
