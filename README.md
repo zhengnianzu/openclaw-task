@@ -16,6 +16,10 @@
 - JiuwenSwarm（TUI 协议）
 
 
+## 模型 API 转发网关
+
+网关基于 llm-proxy-lite，可按端口转发模型 API 请求，并将会话和响应记录写入小时 JSONL 文件。[配置与使用说明](llm_proxy_lite/PROXY_GATEWAY.md)
+
 ## 镜像管理
 1. openclaw-tui: 
 镜像版本：swr.cn-east-4.myhuaweicloud.com/rl_team/openclaw:26.6.6
