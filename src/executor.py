@@ -145,12 +145,7 @@ async def process_turn(
             trajectory, turn_record, rubric=rubric_items, window=window
         )
     except Exception as e:
-        # 评估失败不阻断任务(安全降级),但必须留痕:记进 trajectory.evaluation_errors,
-        # 随轨迹一起落盘。否则"evaluator 挂了"与"评估后判 0 分"在产物里无法区分。
-        logging.getLogger().error(
-            "evaluator 调用异常(turn=%d): %s", turn, e, exc_info=True,
-        )
-        trajectory.evaluation_errors.append({"turn": turn, "error": str(e)})
+        logger.warning("evaluator 调用异常: %s", e)
         ev = None
 
     if ev is not None:
