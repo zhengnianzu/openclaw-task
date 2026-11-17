@@ -138,6 +138,46 @@ def _extract_assistant_text(msg: AssistantMessage) -> str:
     return "".join(parts)
 
 
+_GENERIC_CLAUDE_ERRORS = {"unknown", "error", "api_error", "api error"}
+
+
+def _resolve_claude_error_message(
+    *,
+    assistant_error: Optional[str],
+    assistant_text: Optional[str],
+    result_error: Optional[str],
+    fallback: str,
+) -> str:
+    """优先保留 Claude CLI 返回的具体错误，而不是泛化的 ``unknown``。
+
+    部分兼容模型在 API 失败时会把 ``AssistantMessage.error`` 设为
+    ``unknown``，同时把真正的 HTTP/API 错误写进最后一个 TextBlock。
+    若无条件优先使用 ``msg.error``，run.log 就只能看到 ``unknown``。
+    """
+    normalized_error = (assistant_error or "").strip()
+    if normalized_error and normalized_error.lower() not in _GENERIC_CLAUDE_ERRORS:
+        return normalized_error
+
+    assistant_detail = (assistant_text or "").strip()
+    result_detail = (result_error or "").strip()
+
+    # 兼容服务通常把完整错误放在 TextBlock，例如 ``API Error: 400 ...``。
+    # 这类明确的错误文本优先级最高；普通 assistant 文本则让位给 result。
+    assistant_detail_lower = assistant_detail.lower()
+    if assistant_detail and (
+        assistant_detail_lower.startswith(("api error", "error:", "exception:"))
+        or "request id:" in assistant_detail_lower
+    ):
+        return assistant_detail
+
+    if result_detail and result_detail.lower() not in _GENERIC_CLAUDE_ERRORS:
+        return result_detail
+    if assistant_detail and assistant_detail_lower not in _GENERIC_CLAUDE_ERRORS:
+        return assistant_detail
+
+    return normalized_error or fallback
+
+
 def _tool_result_text(content: Any) -> Optional[str]:
     """把 ToolResultBlock.content 归一成字符串:字符串直接返回,
     list[dict] 抽 text 字段拼接,None 返回 None,其它 fallback json.dumps。"""
@@ -372,6 +412,7 @@ class ClaudecodeAgent:
                 text_parts: List[str] = []
                 last_result: Optional[ResultMessage] = None
                 last_assistant_error: Optional[str] = None
+                last_assistant_text: Optional[str] = None
 
                 # 工具调用收集:AssistantMessage.ToolUseBlock 记入 pending,
                 # 随后 UserMessage.ToolResultBlock 按 tool_use_id 匹配封口;
@@ -382,7 +423,10 @@ class ClaudecodeAgent:
 
                 async for msg in sdk.receive_response():
                     if isinstance(msg, AssistantMessage):
-                        text_parts.append(_extract_assistant_text(msg))
+                        assistant_text = _extract_assistant_text(msg)
+                        text_parts.append(assistant_text)
+                        if assistant_text.strip():
+                            last_assistant_text = assistant_text
                         if msg.error:
                             last_assistant_error = msg.error
                         for block in msg.content:
@@ -430,27 +474,45 @@ class ClaudecodeAgent:
                 tool_calls = [tool_calls_by_id[i] for i in tool_calls_order]
 
                 if last_result is None:
+                    error_message = _resolve_claude_error_message(
+                        assistant_error=last_assistant_error,
+                        assistant_text=last_assistant_text,
+                        result_error=None,
+                        fallback="ClaudeSDKClient 流提前结束,没有收到 ResultMessage",
+                    )
+                    logger.error(
+                        "Claude Code 流异常结束 (agent=%s session=%s): %s",
+                        self.agent_name,
+                        self.session_name,
+                        error_message,
+                    )
                     return ExecutionResult(
                         success=False,
                         content=content,
                         stop_reason="error",
-                        error_message=(
-                            last_assistant_error
-                            or "ClaudeSDKClient 流提前结束,没有收到 ResultMessage"
-                        ),
+                        error_message=error_message,
                         tool_calls=tool_calls,
                     )
 
                 if last_result.is_error:
+                    error_message = _resolve_claude_error_message(
+                        assistant_error=last_assistant_error,
+                        assistant_text=last_assistant_text,
+                        result_error=last_result.result,
+                        fallback="Claude Code 返回 is_error=True",
+                    )
+                    logger.error(
+                        "Claude Code 返回错误 (agent=%s session=%s subtype=%s): %s",
+                        self.agent_name,
+                        self.session_name,
+                        last_result.subtype or "error",
+                        error_message,
+                    )
                     return ExecutionResult(
                         success=False,
                         content=content,
                         stop_reason=last_result.subtype or "error",
-                        error_message=(
-                            last_assistant_error
-                            or last_result.result
-                            or "Claude Code 返回 is_error=True"
-                        ),
+                        error_message=error_message,
                         usage=last_result.usage,
                         session_id=last_result.session_id,
                         total_cost_usd=last_result.total_cost_usd,
