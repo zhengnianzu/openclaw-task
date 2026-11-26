@@ -20,6 +20,14 @@
 
 网关基于 llm-proxy-lite，可按端口转发模型 API 请求，并将会话和响应记录写入小时 JSONL 文件。[配置与使用说明](llm_proxy_lite/PROXY_GATEWAY.md)
 
+## Agent 日志
+
+主日志统一显示执行状态、工具调用和失败原因，去除冗余的后端、Agent、会话前缀；SDK 原始输出和异常堆栈保存在 `logs/agents/<后端>/<agent>/<session>.log`，Hermes 沿用 `logs/hermes/`。已知密钥及常见 Bearer、`sk-` 凭据会脱敏。
+
+工具失败允许 Agent 继续恢复；最终任务失败会抛出异常。整份任务的 `【Task_Done】` 仅在查询和统计均成功后输出，中途同名文本显示为 `【Session_Done】`。
+
+任务执行期间会提取当前查询关联的网关及 OpenClaw 工具错误摘要。经网关的请求使用 `sandbox_id` 标识沙箱、`session-id` 标识对话，完整请求和响应保留在网关轨迹中。
+
 ## 镜像管理
 1. openclaw-tui: 
 镜像版本：swr.cn-east-4.myhuaweicloud.com/rl_team/openclaw:26.6.6

@@ -26,6 +26,8 @@ python llm_proxy_lite/app.py --config llm_proxy_lite/proxy_config.json
 
 同一会话的后续请求应带回同一个 `session-id`。客户端每次都省略会话标识时，网关会为每次请求单独生成 UUID。日志中的 `id` 标识单次请求。
 
+任务或网关在沙箱内首次启动时生成 `sandbox_id`，保存到项目目录下的 `cache/sandbox_id`，同一沙箱的多个进程及重启后的进程复用该值。`SANDBOX_ID` 可显式指定，`SANDBOX_ID_FILE` 可指定共享文件位置。每条轨迹和索引记录该字段，转发请求及响应头包含 `X-Sandbox-Id`，模型请求正文保持原协议。
+
 ## 协议处理
 
 | 请求 | 代码位置 | 转发和解析 |
@@ -38,6 +40,12 @@ python llm_proxy_lite/app.py --config llm_proxy_lite/proxy_config.json
 两种模型路由的普通分支遇到非 `200` 响应或连接异常时重试。模型路由最多尝试 20 次，重试间隔为 0.5 秒。流式错误沿用 Lite 的响应格式。日志记录返回给客户端的 HTTP 状态和尝试次数，状态与上游不同时另记上游状态。
 
 ## 日志文件与统计
+
+控制台输出请求状态、尝试次数、耗时和 Token 摘要；逐次尝试的细节写入 `logs_proxy/gateway.log`。能力探测与健康检查标记 `request_kind=probe/health`，只输出 DEBUG，不计入模型调用统计。
+
+SSE 按协议结束事件判断成功。完整响应后客户端关闭连接，记录 `client_closed_after_completion=true` 并保留成功；真实中断、上游 HTTP 或 SSE 错误仍失败，取消时也保留已收到的 Token 用量。
+
+`index.jsonl` 中 `success=false` 的行记录脱敏后的 `error_message`（最多 1000 字符），兼容 JSON、SSE、Anthropic 嵌套错误和 Responses 失败事件，无正文时记录连接或断流原因。上下游状态不一致时增加 `upstream_status_code`；成功或重试恢复后不写失败文本。
 
 ```text
 logs_proxy/traj/
@@ -52,11 +60,11 @@ logs_proxy/traj/
 每行都是 UTF-8 JSON 对象。以下是数据行和对应索引行的示例。
 
 ```jsonl
-{"ts":"20261113145023000","id":"request-1","session-id":"session-1","provider":"gongyingshang1","protocol":"openai","method":"POST","path":"/v1/chat/completions","headers":{"session-id":"session-1"},"req":{"model":"demo"},"res":{"headers":{"content-type":"application/json"},"status_code":429,"session-id":"session-1","json":{"error":"rate limit"}}}
+{"ts":"20261113145023000","id":"request-1","sandbox_id":"sandbox-1","session-id":"session-1","provider":"gongyingshang1","protocol":"openai","method":"POST","path":"/v1/chat/completions","headers":{"session-id":"session-1"},"req":{"model":"demo"},"res":{"headers":{"content-type":"application/json"},"status_code":429,"session-id":"session-1","json":{"error":"rate limit"}}}
 ```
 
 ```jsonl
-{"ts":"20261113145023000","id":"request-1","session-id":"session-1","provider":"gongyingshang1","model":"demo","tok_in":0,"tok_out":0,"status_code":429,"success":false,"file":"data/2026111314.jsonl","offset":0,"length":350,"total_attempts":20}
+{"ts":"20261113145023000","id":"request-1","sandbox_id":"sandbox-1","session-id":"session-1","provider":"gongyingshang1","model":"demo","tok_in":0,"tok_out":0,"status_code":429,"success":false,"error_message":"rate limit","file":"data/2026111314.jsonl","offset":0,"length":350,"total_attempts":20}
 ```
 
 | 位置 | 字段 |

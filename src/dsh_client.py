@@ -22,6 +22,8 @@ from src.config import AgentModelConfig, warn_agent_model_conflict
 from src.dsh_stream_bridge import DshNonstreamBridge
 from src.workspace import BaseWorkspaceManager, copy_path
 
+from src.agent_logging import logged_execution, log_native
+
 logger = logging.getLogger("harness_automation")
 
 
@@ -393,6 +395,7 @@ class DshAgent:
                 exc,
             )
 
+    @logged_execution("dsh")
     async def execute(
         self,
         query: str,
@@ -439,6 +442,7 @@ class DshAgent:
                 model_provider=self._defaults.model_provider,
             )
 
+        log_native("SDK事件", raw.events)
         content = (raw.final_response or "").strip()
         finish_reason = raw.finish_reason
         stop_reason = "complete" if finish_reason == "completed" else finish_reason

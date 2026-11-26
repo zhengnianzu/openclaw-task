@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import json
 import logging
 import os
 import random
+import re
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -28,6 +30,7 @@ if TYPE_CHECKING:
 
 from src.workspace import BaseWorkspaceManager, copy_path
 from src.config import AgentModelConfig, warn_agent_model_conflict
+from src.agent_logging import AgentLogBridge, logged_execution
 
 logger = logging.getLogger("harness_automation")
 
@@ -278,6 +281,7 @@ class HermesAgent:
         self._model_override = model_override
         self._agent: Optional[Any] = None
         self._history: List[Dict[str, Any]] = []
+        self._logs = AgentLogBridge("hermes", agent_name, session_name, Path("logs") / "hermes")
 
     def _enter_hermes_home(self):
         if self.hermes_home is None:
@@ -386,6 +390,20 @@ class HermesAgent:
                 )
                 ctor_kwargs["base_url"] = normalized
 
+        self._logs.secrets.add(ctor_kwargs.get("api_key") or "")
+        # 不同镜像中的 Hermes 版本不一，仅传入实际支持的日志选项。
+        parameters = inspect.signature(AIAgent).parameters
+        accepts_kwargs = any(p.kind == p.VAR_KEYWORD for p in parameters.values())
+        log_options = {
+            "quiet_mode": True,
+            "verbose_logging": False,
+            "tool_start_callback": self._logs.tool_start,
+            "tool_complete_callback": self._logs.tool_complete,
+            "status_callback": self._logs.status,
+        }
+        ctor_kwargs.update({key: value for key, value in log_options.items()
+                            if accepts_kwargs or key in parameters})
+
         # 显式绑定 SessionDB 到 profile 目录
         if self.hermes_home is not None:
             try:
@@ -407,6 +425,17 @@ class HermesAgent:
                 f"AIAgent 初始化失败 (检查 ~/.hermes/config.yaml 的 model 段): {e}"
             ) from e
 
+        # Hermes 提供实例级打印出口，保留强制打印的警告而不污染控制台。
+        if hasattr(self._agent, "_print_fn"):
+            self._agent._print_fn = self._logs.native_print
+
+        # 仅在 SDK 的单次 API 边界恢复，不重新执行已完成的浏览器/终端工具。
+        # 该上游曾对完全相同的合法工具定义交替返回 Schema 400 和 200。
+        for method_name in ("_interruptible_streaming_api_call", "_interruptible_api_call"):
+            original = getattr(self._agent, method_name, None)
+            if original is not None:
+                setattr(self._agent, method_name, self._schema_recovery_call(original))
+
         # per-session JSON snapshot
         try:
             self._agent._session_json_enabled = True
@@ -422,6 +451,31 @@ class HermesAgent:
         )
         return self._agent
 
+    def _schema_recovery_call(self, original):
+        def call(api_kwargs, *args, **kwargs):
+            try:
+                return original(api_kwargs, *args, **kwargs)
+            except Exception as error:
+                # 流式实现可能委托非流式方法，避免嵌套包装扩大重试次数。
+                if (getattr(self, "_schema_recovery_active", False)
+                        or getattr(error, "_hermes_schema_recovery_attempted", False)
+                        or not _is_object_schema_rejection(error, api_kwargs)):
+                    raise
+                logger.warning("%s 上游拒绝合法工具 Schema，仅重试本次模型请求一次，保留工具结果",
+                               self._logs.prefix)
+                self._logs.native("模型请求恢复", str(error))
+                self._schema_recovery_active = True
+                try:
+                    return original(api_kwargs, *args, **kwargs)
+                except Exception as retry_error:
+                    retry_error._hermes_schema_recovery_attempted = True
+                    raise
+                finally:
+                    self._schema_recovery_active = False
+
+        return call
+
+    @logged_execution("hermes")
     async def execute(
         self,
         query: str,
@@ -431,6 +485,8 @@ class HermesAgent:
         # cwd 切到 workspace: 保证 run_conversation 期间以相对路径生成的
         # 交付件都落在该 agent 的 workspace 下(与 HERMES_HOME 进出配对)。
         prev_cwd = self._enter_workspace_cwd()
+        sdk_logs = self._logs.route_sdk_logging(_hermes_agent_root())
+        sdk_logs.__enter__()
         try:
             agent = self._ensure_agent()
 
@@ -462,10 +518,8 @@ class HermesAgent:
                     error_message=f"AIAgent run timed out after {timeout}s",
                 )
             except Exception as e:
-                logger.exception(
-                    "AIAgent.run_conversation 异常 (agent=%s session=%s)",
-                    self.agent_name, self.session_name,
-                )
+                import traceback
+                self._logs.native("异常堆栈", traceback.format_exc())
                 return ExecutionResult(
                     success=False,
                     content="",
@@ -482,19 +536,30 @@ class HermesAgent:
                 )
 
             final_text = result_dict.get("final_response", "") or ""
+            error = result_dict.get("error")
+            stop_reason = result_dict.get("stop_reason") or "complete"
+            failed = bool(error or result_dict.get("failed") or result_dict.get("interrupted")
+                          or stop_reason in {"error", "timeout", "aborted", "interrupted"})
+            if failed:
+                error = str(error or final_text or f"Hermes stopped: {stop_reason}")
+            elif not final_text:
+                failed = True
+                error = "AIAgent returned empty content"
 
-            if final_text:
+            if final_text and not failed:
                 self._history.append({"role": "user", "content": query})
                 self._history.append({"role": "assistant", "content": final_text})
 
             return ExecutionResult(
-                success=True,
+                success=not failed,
                 content=final_text,
-                stop_reason=result_dict.get("stop_reason") or "complete",
+                stop_reason="error" if failed and stop_reason == "complete" else stop_reason,
+                error_message=error,
                 usage=result_dict.get("usage"),
                 messages=result_dict.get("messages") or [],
             )
         finally:
+            sdk_logs.__exit__(None, None, None)
             self._restore_cwd(prev_cwd)
             self._exit_hermes_home(handle)
 
@@ -519,9 +584,11 @@ class HermesClient:
         for ag in self._agents.values():
             if ag._agent is not None:
                 try:
-                    await asyncio.to_thread(ag._agent.close)
+                    with ag._logs.route_sdk_logging(_hermes_agent_root()):
+                        await asyncio.to_thread(ag._agent.close)
                 except Exception as e:
                     logger.debug("AIAgent.close 异常 (忽略): %s", e)
+            ag._logs.close()
         self._agents.clear()
 
     def get_agent(
@@ -552,6 +619,8 @@ class HermesClient:
 
 async def build_hermes_client() -> HermesClient:
     client = HermesClient()
+    # 项目已有自己的 handler，避免被 SDK 的 root handler 再输出一次。
+    logger.propagate = False
     logger.info(
         "Hermes 客户端 (进程内 AIAgent 模式) 就绪;模型与 provider 由 "
         "~/.hermes/config.yaml 决定。"
@@ -571,6 +640,38 @@ EXECUTION_MAX_ATTEMPTS = 5
 EXECUTION_RETRY_WAIT_SECONDS = 60
 
 
+def _is_object_schema_rejection(error: BaseException, request: dict) -> bool:
+    """只允许恢复上游误拒绝 object 类型工具参数这一种已观察到的错误。"""
+    message = str(error)
+    if "parameters must be a JSON Schema of type object" not in message:
+        return False
+    status = getattr(error, "status_code", None)
+    if status != 400 and not re.search(r"(?:HTTP\s*|Error code:\s*)400\b", message, re.I):
+        return False
+    tools = request.get("tools") if isinstance(request, dict) else None
+    if not isinstance(tools, list) or not tools:
+        return False
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        schema = function.get("parameters") if isinstance(function, dict) else None
+        if not isinstance(schema, dict) or schema.get("type") != "object":
+            return False
+    return True
+
+
+def _is_retryable_error(error: BaseException) -> bool:
+    """参数、认证等 4xx 错误不会因重复执行整个任务而恢复。"""
+    status = getattr(error, "status_code", None)
+    if status is None:
+        status = getattr(getattr(error, "response", None), "status_code", None)
+    if status is None:
+        match = re.search(r"(?:HTTP\s*|Error code:\s*|status_code[=:]\s*)(\d{3})\b",
+                          str(error), re.IGNORECASE)
+        status = int(match.group(1)) if match else None
+    return not (isinstance(status, int) and 400 <= status < 500
+                and status not in (408, 409, 429))
+
+
 async def with_backoff_retry(
     coro_fn,
     *args,
@@ -587,6 +688,9 @@ async def with_backoff_retry(
             return await coro_fn(*args, **kwargs)
         except exceptions as e:
             last_exc = e
+            if not _is_retryable_error(e):
+                logger.error("不可重试错误，停止调用: %s", e)
+                raise
             if attempt >= max_attempts:
                 raise
             jitter = random.uniform(-_BACKOFF_JITTER * delay, _BACKOFF_JITTER * delay)
@@ -733,6 +837,9 @@ def make_hermes_execute_with_retry(client: HermesClient):
                 raise HermesError("AIAgent returned empty content")
             except (HermesError, asyncio.TimeoutError) as e:
                 last_exc = e
+                if not _is_retryable_error(e):
+                    logger.error("不可重试错误，停止执行任务: %s", e)
+                    raise
                 if attempt >= EXECUTION_MAX_ATTEMPTS:
                     raise
                 logger.warning(

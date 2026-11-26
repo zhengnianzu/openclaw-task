@@ -31,6 +31,8 @@ from typing import Any, Dict, List, Optional
 from src.config import AgentModelConfig, warn_agent_model_conflict
 from src.workspace import BaseWorkspaceManager, copy_path
 
+from src.agent_logging import logged_execution, log_native, log_tool_record
+
 logger = logging.getLogger("harness_automation")
 
 EXECUTION_MAX_ATTEMPTS = 5
@@ -173,6 +175,8 @@ def _parse_run_output(stdout: str) -> Dict[str, Any]:
                 "name": tool_name,
                 "input": tool_input,
                 "output": tool_output,
+                "status": state.get("status"),
+                "error": state.get("error"),
             }
         elif event_type == "step_finish":
             tokens = part.get("tokens")
@@ -197,6 +201,8 @@ def _parse_run_output(stdout: str) -> Dict[str, Any]:
     messages.append({"role": "assistant", "content": content})
     for call_id in tool_order:
         tc = tool_by_id[call_id]
+        output = {"error": tc["error"] or "工具返回失败", "output": tc["output"]} if tc["status"] == "error" else tc["output"]
+        log_tool_record(tc["name"], tc["input"], output)
         messages.append({
             "role": "assistant",
             "tool_calls": [{
@@ -300,6 +306,7 @@ class OpenCodeAgent:
             await self._stop_process(process)
         self._process = None
 
+    @logged_execution("opencode")
     async def execute(
         self,
         query: str,
@@ -372,6 +379,8 @@ class OpenCodeAgent:
             self._process = None
 
         stdout = stdout_bytes.decode("utf-8", errors="replace")
+        log_native("CLI stdout", stdout)
+        log_native("CLI stderr", stderr_bytes.decode("utf-8", errors="replace"))
         stderr = _redact_error_text(
             stderr_bytes.decode("utf-8", errors="replace")
         )

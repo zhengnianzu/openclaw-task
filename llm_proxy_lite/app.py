@@ -25,6 +25,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import ClientDisconnect
 
 from print_stats_summary import TRAJECTORY_DIR, statistic_tokens
+from sandbox_identity import get_sandbox_id
 
 load_dotenv(override=True)
 
@@ -39,6 +40,7 @@ MAX_RETRIES = 20
 
 # 转发、解析及重试基于 llm-proxy-lite 的 app.py（f88838f）。
 app = FastAPI(title="模型 API 转发网关")
+_GATEWAY_LOGGER = logging.getLogger("llm_proxy_gateway")
 _MODEL_PATHS = {
     "/v1/messages": "anthropic",
     "/v1/chat/completions": "openai",
@@ -150,13 +152,14 @@ def build_upstream_headers(x_auth_token: str, model_id: str, req: Request) -> Di
     return {
         **dict(_forward_headers(req.headers, (
             "host", "content-length", "content-encoding", "content-type", "authorization",
-            "x-api-key", "model-id", "session-id", "accept-encoding",
+            "x-api-key", "model-id", "session-id", "accept-encoding", "x-sandbox-id",
         ))),
         "Content-Type": "application/json",
         "Authorization": f"Bearer {ack}",
         "x-api-key": ack,
         "Model-Id": os.environ.get("MODEL_ID") or model_id,
         "session-id": req.state.session_id,
+        "X-Sandbox-Id": req.state.sandbox_id,
     }
 
 
@@ -217,6 +220,7 @@ def _upstream_failure(req: Request, exc: Exception) -> int:
     """记录连接异常或超时，并返回适当的 HTTP 状态码。"""
     timeout = isinstance(exc, httpx.TimeoutException)
     req.state.error = "upstream_timeout" if timeout else "upstream_error"
+    req.state.error_message = _redact_gateway_text(req, f"{type(exc).__name__}: {exc}")
     logging.warning("供应商 %s 转发失败（%s）: %s", req.state.provider, req.state.request_id, type(exc).__name__)
     return 504 if timeout else 502
 
@@ -228,6 +232,7 @@ async def _stream_response(req: Request, source: AsyncIterator[bytes]) -> Stream
     status = state.status
     headers = httpx.Headers(state.response_headers)
     headers["session-id"] = state.session_id
+    headers["X-Sandbox-Id"] = state.sandbox_id
     state.response_started = True
 
     async def body():
@@ -319,10 +324,10 @@ async def anthropic_messages(req: Request):
                         if r.status_code == 200:
                             success = True
                             break
-                        logging.warning(f"Attempt {attempt} non-200 (anthropic non-stream): {r.status_code} {r.text[:200]}")
+                        _gateway_debug(req, f"Attempt {attempt} non-200 (anthropic non-stream): {r.status_code} {r.text[:200]}")
                     except Exception as e:
                         last_exception = e
-                        logging.warning(f"Attempt {attempt} upstream error (anthropic non-stream): {e}")
+                        _gateway_debug(req, f"Attempt {attempt} upstream error (anthropic non-stream): {e}")
 
                     if attempt < MAX_RETRIES - 1:
                         await asyncio.sleep(0.5)
@@ -365,7 +370,8 @@ async def anthropic_messages(req: Request):
         ))
 
     # ---- stream SSE (pure pass-through) ----
-    response_headers = {**_SSE_HEADERS, "session-id": req.state.session_id}
+    response_headers = {**_SSE_HEADERS, "session-id": req.state.session_id,
+                        "X-Sandbox-Id": req.state.sandbox_id}
     async def anthropic_sse_passthrough() -> AsyncIterator[bytes]:
         """沿用 Lite 的 SSE 透传和重试循环。"""
         up_chunks: List[Any] = []
@@ -400,7 +406,7 @@ async def anthropic_messages(req: Request):
                                 last_retry_err_text = err.decode("utf-8", errors="replace")
                                 last_retry_status = r.status_code
                                 up_chunks.append({"type": "error_body", "body": last_retry_err_text})
-                                logging.warning(f"Attempt {attempt} rate limit (anthropic stream): {r.status_code}")
+                                _gateway_debug(req, f"Attempt {attempt} rate limit (anthropic stream): {r.status_code}")
                                 if attempt < MAX_RETRIES - 1:
                                     await asyncio.sleep(0.5)
                                     retry_token = await get_x_auth_token(req)
@@ -447,7 +453,7 @@ async def anthropic_messages(req: Request):
 
                             if not committed:
                                 if attempt < MAX_RETRIES - 1:
-                                    logging.warning(f"Attempt {attempt} no message_start in SSE (anthropic stream), retrying")
+                                    _gateway_debug(req, f"Attempt {attempt} no message_start in SSE (anthropic stream), retrying")
                                     connection_established = False
                                     up_chunks.clear()
                                     await asyncio.sleep(0.5)
@@ -458,23 +464,15 @@ async def anthropic_messages(req: Request):
                                     connection_established = True
                                     yield bytes(raw_buf)
 
-                            for line in log_buf.decode("utf-8", errors="replace").splitlines():
-                                if line.startswith("data:"):
-                                    data_part = line[5:].strip()
-                                    if data_part and data_part != "[DONE]":
-                                        try:
-                                            up_chunks.append(json.loads(data_part))
-                                        except json.JSONDecodeError:
-                                            pass
                             return
 
                     except Exception as e:
                         if connection_established:
                             req.state.error = "upstream_stream_error"
-                            logging.warning(f"Stream interrupted (anthropic stream): {e}")
+                            _gateway_debug(req, f"Stream interrupted (anthropic stream): {e}")
                             return
                         last_exception = e
-                        logging.warning(f"Attempt {attempt} upstream error (anthropic stream): {e}")
+                        _gateway_debug(req, f"Attempt {attempt} upstream error (anthropic stream): {e}")
                         if attempt < MAX_RETRIES - 1:
                             await asyncio.sleep(0.5)
                             retry_token = await get_x_auth_token(req)
@@ -483,7 +481,7 @@ async def anthropic_messages(req: Request):
                 # All retries exhausted
                 req.state.error = "max_retries_exceeded"
                 error_msg = str(last_exception) if last_exception else (f"HTTP {last_retry_status}" if last_retry_status else "unknown")
-                logging.error(f"All retries exhausted (anthropic stream): {error_msg}")
+                _gateway_debug(req, f"All retries exhausted (anthropic stream): {error_msg}")
                 err_event = {"type": "error", "error": {"type": "max_retries_exceeded", "message": f"上游多次失败({MAX_RETRIES}次): {error_msg}"}}
                 payload = f"event: error\ndata: {json.dumps(err_event, ensure_ascii=False)}\n\n".encode("utf-8")
                 log_buf.extend(payload)
@@ -500,17 +498,7 @@ async def anthropic_messages(req: Request):
             log_buf.extend(payload)
             yield payload
         finally:
-            req.state.chunks = up_chunks
-            req.state.success = connection_established
-            req.state.total_attempts = upstream_attempts
-            _tok_in, _tok_out = 0, 0
-            for _c in up_chunks:
-                if isinstance(_c, dict):
-                    _u = _c.get("message", {}).get("usage") or _c.get("usage") or {}
-                    if _u:
-                        _tok_in = (_u.get("input_tokens") or 0) + (_u.get("cache_creation_input_tokens") or 0) + (_u.get("cache_read_input_tokens") or 0)
-                        _tok_out = _u.get("output_tokens") or 0
-            req.state.tokens = _tok_in, _tok_out
+            _finalize_stream(req, log_buf, up_chunks, connection_established, upstream_attempts)
             _record_trajectory(req, 200, httpx.Headers(response_headers), log_buf)
 
     return StreamingResponse(
@@ -583,10 +571,10 @@ async def openai_chat_completions(req: Request):
                         if r.status_code == 200:
                             success = True
                             break
-                        logging.warning(f"Attempt {attempt} non-200 (openai non-stream): {r.status_code} {r.text[:200]}")
+                        _gateway_debug(req, f"Attempt {attempt} non-200 (openai non-stream): {r.status_code} {r.text[:200]}")
                     except Exception as e:
                         last_exception = e
-                        logging.warning(f"Attempt {attempt} upstream error (openai non-stream): {e}")
+                        _gateway_debug(req, f"Attempt {attempt} upstream error (openai non-stream): {e}")
 
                     if attempt < MAX_RETRIES - 1:
                         await asyncio.sleep(0.5)
@@ -629,7 +617,8 @@ async def openai_chat_completions(req: Request):
         ))
 
     # ---- stream SSE (OpenAI SSE pass-through) ----
-    response_headers = {**_SSE_HEADERS, "session-id": req.state.session_id}
+    response_headers = {**_SSE_HEADERS, "session-id": req.state.session_id,
+                        "X-Sandbox-Id": req.state.sandbox_id}
     async def sse_passthrough() -> AsyncIterator[bytes]:
         """沿用 Lite 的 SSE 透传和重试循环。"""
         up_chunks: List[Any] = []
@@ -638,6 +627,7 @@ async def openai_chat_completions(req: Request):
         upstream_attempts = 0
         last_exception = None
         last_retry_status = None
+        maas_retries = 0
         retry_headers = upstream_headers
         retry_token = x_auth_token
 
@@ -664,47 +654,58 @@ async def openai_chat_completions(req: Request):
                                 last_retry_err_text = err.decode("utf-8", errors="replace")
                                 last_retry_status = r.status_code
                                 up_chunks.append({"type": "error_body", "body": last_retry_err_text})
-                                logging.warning(f"Attempt {attempt} rate limit (openai stream): {r.status_code}")
+                                _gateway_debug(req, f"Attempt {attempt} rate limit (openai stream): {r.status_code}")
                                 if attempt < MAX_RETRIES - 1:
                                     await asyncio.sleep(0.5)
                                     retry_token = await get_x_auth_token(req)
                                     retry_headers = build_upstream_headers(retry_token, model, req)
                                 continue
 
-                            connection_established = True
-
                             if r.status_code >= 400:
-                                req.state.error = "upstream_http_error"
                                 err = await r.aread()
                                 err_text = err.decode("utf-8", errors="replace")
                                 up_chunks.append({"type": "error_body", "body": err_text})
-                                payload = err_text.encode("utf-8")
+                                try:
+                                    error_data = json.loads(err_text)
+                                except ValueError:
+                                    error_data = {"error": {"type": "upstream_http_error", "message": f"HTTP {r.status_code}"}}
+                                error = error_data.get("error") if isinstance(error_data, dict) else None
+                                # 已用真实失败请求验证：MaaS 400001 可能在原样重放后恢复。
+                                # 只对这个错误补一次重试，普通 400/401 不重试。
+                                if (r.status_code == 400 and isinstance(error, dict)
+                                        and str(error.get("code")) == "400001"
+                                        and maas_retries < 1
+                                        and attempt < MAX_RETRIES - 1):
+                                    maas_retries += 1
+                                    _GATEWAY_LOGGER.warning("模型上游 HTTP400 code=400001，原样重试 %s/%s request=%s",
+                                                           maas_retries, 1, req.state.request_id)
+                                    await asyncio.sleep(1)
+                                    continue
+                                connection_established = True
+                                req.state.error = "upstream_http_error"
+                                if not error:
+                                    error_data = {"error": {"type": "upstream_http_error", "message": f"HTTP {r.status_code}"}}
+                                # 流式响应必须返回 SSE 错误事件；裸 JSON 会被 SDK 当成空流。
+                                payload = f"data: {json.dumps(error_data, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
                                 log_buf.extend(payload)
                                 yield payload
                                 return
 
+                            connection_established = True
                             async for raw in r.aiter_bytes():
                                 log_buf.extend(raw)
                                 yield raw
 
                             # Parse log_buf for logging
-                            for line in log_buf.decode("utf-8", errors="replace").splitlines():
-                                if line.startswith("data:"):
-                                    data_part = line[5:].strip()
-                                    if data_part and data_part != "[DONE]":
-                                        try:
-                                            up_chunks.append(json.loads(data_part))
-                                        except json.JSONDecodeError:
-                                            pass
                             return
 
                     except Exception as e:
                         if connection_established:
                             req.state.error = "upstream_stream_error"
-                            logging.warning(f"Stream interrupted (openai stream): {e}")
+                            _gateway_debug(req, f"Stream interrupted (openai stream): {e}")
                             return
                         last_exception = e
-                        logging.warning(f"Attempt {attempt} upstream error (openai stream): {e}")
+                        _gateway_debug(req, f"Attempt {attempt} upstream error (openai stream): {e}")
                         if attempt < MAX_RETRIES - 1:
                             await asyncio.sleep(0.5)
                             retry_token = await get_x_auth_token(req)
@@ -713,8 +714,8 @@ async def openai_chat_completions(req: Request):
                 # All retries exhausted
                 req.state.error = "max_retries_exceeded"
                 error_msg = str(last_exception) if last_exception else (f"HTTP {last_retry_status}" if last_retry_status else "unknown")
-                logging.error(f"All retries exhausted (openai stream): {error_msg}")
-                error_data = {"error": {"message": f"\u4e0a\u6e38\u591a\u6b21\u5931\u8d25({MAX_RETRIES}\u6b21): {error_msg}", "type": "max_retries_exceeded"}}
+                _gateway_debug(req, f"All retries exhausted (openai stream): {error_msg}")
+                error_data = {"error": {"message": f"上游多次失败({MAX_RETRIES}次): {error_msg}", "type": "max_retries_exceeded"}}
                 payload = f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode("utf-8")
                 log_buf.extend(payload)
                 yield payload
@@ -734,20 +735,7 @@ async def openai_chat_completions(req: Request):
             log_buf.extend(b"data: [DONE]\n\n")
             yield b"data: [DONE]\n\n"
         finally:
-            req.state.chunks = up_chunks
-            req.state.success = connection_established
-            req.state.total_attempts = upstream_attempts
-            _tok_in, _tok_out = 0, 0
-            for _c in up_chunks:
-                if isinstance(_c, dict):
-                    _u = _c.get("usage") or {}
-                    response = _c.get("response")
-                    if req.state.protocol == "responses" and isinstance(response, dict):
-                        _u = response.get("usage") or _u
-                    if _u:
-                        _tok_in = _tok_in or (_u.get("input_tokens") or _u.get("prompt_tokens") or 0)
-                        _tok_out = _tok_out or (_u.get("output_tokens") or _u.get("completion_tokens") or 0)
-            req.state.tokens = _tok_in, _tok_out
+            _finalize_stream(req, log_buf, up_chunks, connection_established, upstream_attempts)
             _record_trajectory(req, 200, httpx.Headers(response_headers), log_buf)
 
     return StreamingResponse(
@@ -778,8 +766,9 @@ async def record_http_error(req: Request, exc: StarletteHTTPException):
 async def passthrough(req: Request):
     """将其他 HTTP 请求直接发往当前监听地址对应的供应商。"""
     await _prepare_request(req)
-    headers = dict(_forward_headers(req.headers, ("host", "content-length")))
+    headers = dict(_forward_headers(req.headers, ("host", "content-length", "x-sandbox-id")))
     headers["session-id"] = req.state.session_id
+    headers["X-Sandbox-Id"] = req.state.sandbox_id
     url = _upstream_url(req)
 
     async def forward():
@@ -915,6 +904,86 @@ def _append_trajectory(trace: dict, index: dict) -> None:
             output.write(_jsonl(index))
 
 
+def _stream_events(raw: bytes | bytearray) -> tuple[list[dict], bool]:
+    events, done = [], False
+    for line in bytes(raw).decode("utf-8", errors="replace").splitlines():
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            done = True
+            continue
+        try:
+            value = json.loads(data)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(value, dict):
+            events.append(value)
+    return events, done
+
+
+def _finalize_stream(req: Request, raw, chunks, connected: bool, attempts: int) -> None:
+    """即使下游提前关闭，也从已转发内容判断流是否已正常结束。"""
+    state = req.state
+    events, done = _stream_events(raw)
+    chunks.extend(events)
+    terminal = any(event.get("type") in ("message_stop", "response.completed")
+                   or any(choice.get("finish_reason") is not None
+                          for choice in (event.get("choices") or []) if isinstance(choice, dict))
+                   for event in events)
+    error_event = any(event.get("error") or event.get("type") in
+                      ("error", "response.failed", "response.incomplete") for event in events)
+    upstream_status = getattr(state, "upstream_status", 200)
+    if (getattr(state, "error", None) == "client_disconnected" and terminal
+            and not error_event and upstream_status < 400):
+        del state.error
+        state.client_closed_after_completion = True
+    if error_event:
+        state.error = getattr(state, "error", None) or "upstream_sse_error"
+    elif connected and not terminal and not getattr(state, "error", None):
+        state.error = "incomplete_stream"
+    state.chunks = chunks
+    state.stream_completed = terminal
+    state.stream_done_marker = done
+    state.total_attempts = attempts
+    state.success = connected and terminal and upstream_status < 400 and not getattr(state, "error", None)
+    tok_in, tok_out = 0, 0
+    for event in events:
+        usage = event.get("usage") or (event.get("message") or {}).get("usage") or (event.get("response") or {}).get("usage") or {}
+        tok_in = max(tok_in, usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+        tok_out = max(tok_out, usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+    state.tokens = tok_in, tok_out
+
+
+def _request_kind(req: Request) -> str:
+    path = req.url.path
+    if path in _MODEL_PATHS:
+        return "model"
+    if path == "/hi":
+        return "health"
+    if path in ("/api/v1/models", "/api/tags", "/api/show", "/v1/props", "/props", "/version", "/v1/models", "/models") or path.startswith("/v1/models/"):
+        return "probe"
+    return "http"
+
+
+def _redact_gateway_text(req: Request, message: str) -> str:
+    secrets = [os.getenv("UPSTREAM_API_KEY", "")]
+    for key in _SECRET_HEADERS:
+        value = req.headers.get(key, "")
+        secrets.extend((value, value.removeprefix("Bearer ")))
+    for secret in sorted(filter(None, secrets), key=len, reverse=True):
+        message = message.replace(secret, "[已隐藏]")
+    message = re.sub(r"\bsk-[\w-]{8,}", "[已隐藏]", message)
+    message = re.sub(r"(?i)\bBearer\s+[^\s\"']+", "Bearer [已隐藏]", message)
+    return message
+
+
+def _gateway_debug(req: Request, message: str) -> None:
+    message = _redact_gateway_text(req, message)
+    _GATEWAY_LOGGER.debug("[gateway request=%s session=%s] %s", req.state.request_id,
+                         req.state.session_id, message)
+
+
 def _response_record(state, status: int, headers: httpx.Headers, raw: bytes | bytearray) -> dict:
     """合并路由解析结果与实际下发的响应，补充失败状态。"""
     result = getattr(state, "parsed_response", None) or {"headers": _log_headers(headers)}
@@ -922,6 +991,10 @@ def _response_record(state, status: int, headers: httpx.Headers, raw: bytes | by
     upstream_status = getattr(state, "upstream_status", status)
     if upstream_status != status:
         result["upstream_status_code"] = upstream_status
+    if hasattr(state, "stream_completed"):
+        result["stream_completed"] = state.stream_completed
+    if getattr(state, "client_closed_after_completion", False):
+        result["client_closed_after_completion"] = True
     if "json" not in result and "text" not in result:
         kind, parsed = _parse_body(bytes(raw), headers)
         result[kind] = parsed
@@ -934,12 +1007,15 @@ def _response_record(state, status: int, headers: httpx.Headers, raw: bytes | by
             state.error = getattr(state, "error", None) or "upstream_sse_error"
     if getattr(state, "error", None):
         result["error"] = state.error
+    if getattr(state, "error_message", None):
+        result["error_message"] = state.error_message
     return result
 
 
 async def _prepare_request(req: Request) -> None:
     """为当前路由确定供应商、请求标识和会话标识。"""
     state = req.state
+    state.sandbox_id = get_sandbox_id()
     host, port = req.scope["server"][:2]
     wildcard = "::" if ":" in host else "0.0.0.0"
     listeners = req.app.state.listeners
@@ -963,37 +1039,107 @@ async def _prepare_request(req: Request) -> None:
 def _record_response(req: Request, response: Response) -> Response:
     """为普通响应补上会话标识，并在返回前写入轨迹。"""
     response.headers["session-id"] = req.state.session_id
+    response.headers["X-Sandbox-Id"] = req.state.sandbox_id
     _record_trajectory(req, response.status_code, httpx.Headers(response.headers.raw), response.body)
     return response
+
+
+def _failure_text(response: dict) -> str:
+    """提取上游失败文本；兼容 Anthropic SSE 中嵌套的 JSON 错误消息。"""
+    def message(value, depth=0):
+        if depth > 5:
+            return ""
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                return value
+            return message(parsed, depth + 1) if isinstance(parsed, (dict, list)) else value
+        if isinstance(value, list):
+            return "; ".join(filter(None, (message(item, depth + 1) for item in value)))
+        if isinstance(value, dict):
+            for key in ("message", "detail", "error_message", "msg", "error", "incomplete_details", "reason"):
+                text = message(value.get(key), depth + 1)
+                if text:
+                    return text
+            return str(value.get("type") or value.get("code") or "")
+        return ""
+
+    text = message(response.get("json"))
+    if not text:
+        for chunk in reversed(response.get("chunks") or []):
+            if not isinstance(chunk, dict):
+                continue
+            if chunk.get("error"):
+                text = message(chunk["error"])
+            elif chunk.get("type") in ("response.failed", "response.incomplete"):
+                text = message(chunk.get("response") or chunk)
+            elif chunk.get("type") == "error_body":
+                text = message(chunk.get("body"))
+            if text:
+                break
+    if not text:
+        text = message(response.get("error_message") or response.get("detail"))
+    if not text:
+        code = response.get("error")
+        text = {"client_disconnected": "客户端在响应完成前断开连接",
+                "incomplete_stream": "响应流未收到正常结束事件",
+                "upstream_stream_error": "上游响应流传输中断"}.get(code, "")
+        status = response.get("upstream_status_code", response.get("status_code"))
+        if not text and status and status >= 400:
+            text = response.get("text") or f"上游返回 HTTP {status}"
+        text = text or str(code or "请求未成功完成")
+    return " ".join(text.split())
 
 
 def _record_trajectory(req: Request, status: int, headers: httpx.Headers,
                        raw: bytes | bytearray = b"") -> None:
     """由各路由收尾直接写入小时数据和索引。"""
     state = req.state
+    sandbox_id = getattr(state, "sandbox_id", None) or get_sandbox_id()
     ts = state.started.strftime("%Y%m%d%H%M%S%f")[:-3]
+    kind = _request_kind(req)
+    elapsed_ms = max(0, int((datetime.now() - state.started).total_seconds() * 1000))
     trace = {
         "ts": ts, "id": state.request_id, "session-id": state.session_id,
+        "sandbox_id": sandbox_id,
         "provider": state.provider, "protocol": state.protocol,
         "method": req.method, "path": _request_path(req),
-        "headers": _log_headers(req.headers),
+        "headers": {**_log_headers(req.headers), "x-sandbox-id": sandbox_id},
         "req": {"base64": state.body} if state.body_kind == "base64" else state.body,
         "res": _response_record(state, status, headers, raw),
+        "request_kind": kind, "duration_ms": elapsed_ms,
     }
     tok_in, tok_out = getattr(state, "tokens", (0, 0))
     success = getattr(state, "success", 200 <= status < 400)
     index = {
         "ts": ts, "id": state.request_id, "session-id": state.session_id, "provider": state.provider,
+        "sandbox_id": sandbox_id,
         "model": getattr(state, "model", ""), "tok_in": tok_in, "tok_out": tok_out,
         "status_code": status, "success": success and "error" not in trace["res"],
         "file": f"data/{ts[:10]}.jsonl",
+        "request_kind": kind, "duration_ms": elapsed_ms,
     }
     if hasattr(state, "total_attempts"):
         index["total_attempts"] = state.total_attempts
+    if not index["success"]:
+        index["error_message"] = _redact_gateway_text(req, _failure_text(trace["res"]))[:1000]
+        if "upstream_status_code" in trace["res"]:
+            index["upstream_status_code"] = trace["res"]["upstream_status_code"]
     try:
         _append_trajectory(trace, index)
     except OSError:
         logging.exception("写入轨迹失败（%s）", state.request_id)
+    attempts = getattr(state, "total_attempts", 1)
+    success = index["success"]
+    level = (logging.DEBUG if kind in ("probe", "health") else
+             logging.WARNING if not success or attempts > 1 else logging.INFO)
+    label = "接口探测" if kind in ("probe", "health") else ("请求完成" if success else "请求失败")
+    _GATEWAY_LOGGER.log(level, "[gateway provider=%s session=%s request=%s] %s kind=%s method=%s path=%s "
+                "status=%s upstream=%s attempts=%s 耗时=%.2f秒 tokens=%s/%s error=%s sandbox=%s",
+                state.provider, state.session_id, state.request_id, label, kind, req.method,
+                _request_path(req), status, getattr(state, "upstream_status", status), attempts,
+                elapsed_ms / 1000, tok_in, tok_out, index.get("error_message") or "无", sandbox_id)
 
 
 def load_config(path: Path) -> list[tuple[str, str, int, str]]:
@@ -1047,7 +1193,21 @@ def main() -> None:
     args = parser.parse_args()
     if args.ban_explore:
         BAN_EXPLORE = True
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    os.environ["SANDBOX_ID"] = get_sandbox_id()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    if not _GATEWAY_LOGGER.handlers:
+        TRAJECTORY_DIR.parent.mkdir(parents=True, exist_ok=True)
+        detail = logging.FileHandler(TRAJECTORY_DIR.parent / "gateway.log", encoding="utf-8")
+        detail.setLevel(logging.DEBUG)
+        console = logging.StreamHandler()
+        console.setLevel(logging.INFO)
+        formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        for handler in (detail, console):
+            handler.setFormatter(formatter)
+            _GATEWAY_LOGGER.addHandler(handler)
+        _GATEWAY_LOGGER.setLevel(logging.DEBUG)
+        _GATEWAY_LOGGER.propagate = False
     try:
         providers = load_config(args.config)
         with ExitStack() as stack:
@@ -1070,7 +1230,7 @@ def main() -> None:
                 listeners[listener.getsockname()[:2]] = (name, target)
                 logging.info("%s 监听 %s:%s，转发至 %s", name, host, port, target)
             app.state.listeners = listeners
-            uvicorn.Server(uvicorn.Config(app, proxy_headers=False)).run(sockets=sockets)
+            uvicorn.Server(uvicorn.Config(app, proxy_headers=False, access_log=False)).run(sockets=sockets)
     except (OSError, ValueError) as exc:
         parser.exit(1, f"网关启动失败：{exc}\n")
 

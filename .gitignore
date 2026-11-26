@@ -2,3 +2,5 @@ __pycache__/*
 /logs_proxy/
 /llm_proxy_lite/__pycache__/
 /llm_proxy_lite/logs_proxy/
+/cache/
+/logs/

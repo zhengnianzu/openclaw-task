@@ -68,6 +68,8 @@ from openjiuwen.core.foundation.store.base_embedding import EmbeddingConfig
 from src.config import AgentModelConfig, warn_agent_model_conflict
 from src.workspace import BaseWorkspaceManager, copy_path
 
+from src.agent_logging import logged_execution, log_native
+
 logger = logging.getLogger("harness_automation")
 
 # ============================================================================
@@ -417,6 +419,8 @@ class OpenjiuwenAgent:
             agen = self._agent.stream(inputs)
             try:
                 async for chunk in agen:
+                    log_native("SDK流事件", {"type": getattr(chunk, "type", None),
+                                             "payload": getattr(chunk, "payload", None)})
                     if getattr(chunk, "type", None) != "answer":
                         continue
                     payload = getattr(chunk, "payload", None)
@@ -432,6 +436,7 @@ class OpenjiuwenAgent:
             await _drain()
         return answer or {}
 
+    @logged_execution("openjiuwen")
     async def execute(
         self, query: str, options: Optional[ExecutionOptions] = None
     ) -> ExecutionResult:
@@ -467,6 +472,7 @@ class OpenjiuwenAgent:
                 messages=self._collect_new_messages(before_msgs),
             )
 
+        log_native("SDK响应", response)
         messages = self._collect_new_messages(before_msgs)
 
         if isinstance(response, dict):

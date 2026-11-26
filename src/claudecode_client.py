@@ -35,6 +35,8 @@ from claude_agent_sdk import (
 from src.workspace import BaseWorkspaceManager, copy_path
 from src.config import AgentModelConfig, warn_agent_model_conflict
 
+from src.agent_logging import logged_execution, log_native, log_tool_start, log_tool_complete
+
 logger = logging.getLogger("harness_automation")
 # SDK 对 `claude` CLI 子进程的 stdout 做了 单条 JSON 消息 1 MiB 上限
 _claude_code_max_buffer_size = 32 * 1024 * 1024  # 32 MiB
@@ -384,6 +386,7 @@ class ClaudecodeAgent:
         except BaseException as e:  # noqa: BLE001
             logger.debug("kill 异常 (忽略): %s: %s", type(e).__name__, e)
 
+    @logged_execution("claude-code")
     async def execute(
         self,
         query: str,
@@ -422,6 +425,7 @@ class ClaudecodeAgent:
                 tool_started_at: Dict[str, float] = {}
 
                 async for msg in sdk.receive_response():
+                    log_native("SDK消息", msg)
                     if isinstance(msg, AssistantMessage):
                         assistant_text = _extract_assistant_text(msg)
                         text_parts.append(assistant_text)
@@ -439,6 +443,7 @@ class ClaudecodeAgent:
                                 )
                                 tool_calls_order.append(block.id)
                                 tool_started_at[block.id] = time.monotonic()
+                                log_tool_start(block.id, block.name, block.input)
                     elif isinstance(msg, UserMessage):
                         # UserMessage.content 在含工具结果时是 list;子代理返回的用户消息才走这条
                         if isinstance(msg.content, list):
@@ -449,6 +454,8 @@ class ClaudecodeAgent:
                                 if tc is None:
                                     continue
                                 tc.output = _tool_result_text(block.content)
+                                log_tool_complete(block.tool_use_id, tc.tool, tc.input,
+                                                  {"error": tc.output if block.is_error else None, "output": tc.output})
                                 if block.is_error:
                                     tc.output = f"[error] {tc.output or ''}"
                                 started = tool_started_at.pop(block.tool_use_id, None)

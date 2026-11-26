@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from src.workspace import BaseWorkspaceManager, copy_path
+from src.agent_logging import logged_execution, log_native, register_secrets
 
 logger = logging.getLogger("harness_automation")
 
@@ -411,6 +412,7 @@ class TaichuAgent:
         return command
 
     # -- 执行 ---------------------------------------------------------------
+    @logged_execution("taichu")
     async def execute(self, query_text: str, options=None) -> ExecutionResult:
         async with self.client.execution_lock():
             if self._unusable:
@@ -458,6 +460,7 @@ class TaichuAgent:
                 self._process = None
 
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
+            log_native("CLI stdout", stdout.decode("utf-8", errors="replace"))
             if stderr_text:
                 logger.debug("[taichu stderr] agent=%s session=%s %s",
                              self.agent_name, self.session_name, stderr_text)
@@ -564,6 +567,8 @@ class TaichuClient:
         self.paths.ensure()
         await self.check_runtime()
         self.base_config = json.loads(self.paths.config_file.read_text(encoding="utf-8"))
+        for provider in self.base_config.get("providers", []):
+            register_secrets(provider)
         return self
 
     async def __aexit__(self, *args):

@@ -35,6 +35,8 @@ from openclaw_sdk.gateway.protocol import ProtocolGateway
 from src.workspace import BaseWorkspaceManager, copy_path
 from src.config import AgentModelConfig, warn_agent_model_conflict
 
+from src.agent_logging import logged_execution
+
 logger = logging.getLogger("harness_automation")
 
 # ============================================================================
@@ -579,6 +581,7 @@ async def openclaw_check_readyz(client: OpenClawClient) -> None:
 def make_openclaw_execute_with_retry(client: OpenClawClient):
     """返回 openclaw 专用的 execute_with_retry 闭包 (含 history fallback + gateway 重连)"""
 
+    @logged_execution("openclaw")
     async def execute_with_retry(agent, query_text: str, options):
         max_attempts = EXECUTION_MAX_ATTEMPTS
 
@@ -756,6 +759,13 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                     raise_if_unrecoverable_compaction(content)
                     return result, continued_after_empty
 
+                error_message = getattr(result, "error_message", None)
+                raise_if_unrecoverable_compaction(error_message)
+                if error_message and not str(error_message).startswith(
+                    "Agent completed with no response"
+                ):
+                    raise RuntimeError(error_message)
+
                 # 空回复: 只轮询 history, 不补发"继续"催 agent 重跑。
                 polled = await poll_after_empty(before_history)
                 if polled:
@@ -768,13 +778,6 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                             "error_message": None,
                         }
                     ), True
-
-                error_message = getattr(result, "error_message", None)
-                raise_if_unrecoverable_compaction(error_message)
-                if error_message and not str(error_message).startswith(
-                    "Agent completed with no response"
-                ):
-                    raise RuntimeError(error_message)
 
                 raise RuntimeError(
                     "Agent returned empty content and chat.history had no new assistant reply"

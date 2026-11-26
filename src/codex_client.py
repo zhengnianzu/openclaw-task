@@ -21,6 +21,8 @@ from openai_codex import ApprovalMode, AsyncCodex, CodexConfig, Sandbox
 from src.config import AgentModelConfig, warn_agent_model_conflict
 from src.workspace import BaseWorkspaceManager, copy_path
 
+from src.agent_logging import logged_execution, log_native
+
 logger = logging.getLogger("harness_automation")
 
 
@@ -298,6 +300,7 @@ class CodexAgent:
                 exc,
             )
 
+    @logged_execution("codex")
     async def execute(
         self,
         query: str,
@@ -349,6 +352,7 @@ class CodexAgent:
                 model_provider=self._defaults.model_provider,
             )
 
+        log_native("SDK结果", result)
         content = (result.final_response or "").strip()
         error = getattr(result, "error", None)
         status = getattr(result, "status", None)

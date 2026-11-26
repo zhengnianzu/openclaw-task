@@ -30,6 +30,8 @@ from src.grok_client import ExecutionOptions, ExecutionResult
 from src.opencode_client import _redact_error_text
 from src.workspace import BaseWorkspaceManager, copy_path
 
+from src.agent_logging import logged_execution, log_native
+
 logger = logging.getLogger("harness_automation")
 
 
@@ -262,6 +264,8 @@ class OpenclawLocalClient:
         finally:
             await self._stop(process)
             self._processes.discard(process)
+        log_native("CLI stdout", stdout.decode("utf-8", errors="replace"))
+        log_native("CLI stderr", stderr.decode("utf-8", errors="replace"))
         diagnostic = _redact_error_text(stderr.decode("utf-8", errors="replace"))
         if process.returncode:
             raise OpenclawLocalError(
@@ -513,6 +517,7 @@ class OpenclawLocalAgent:
             logger.debug("OpenClaw 本轮工具证据读取失败: %s", exc)
             return []
 
+    @logged_execution("openclaw-local")
     async def execute(
         self,
         query: str,

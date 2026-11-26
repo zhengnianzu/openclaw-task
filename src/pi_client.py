@@ -19,6 +19,8 @@ from typing import Any, Dict, List, Optional
 from src.config import AgentModelConfig, warn_agent_model_conflict
 from src.workspace import BaseWorkspaceManager, copy_path
 
+from src.agent_logging import logged_execution, log_native, log_tool_start, log_tool_complete
+
 logger = logging.getLogger("harness_automation")
 
 # 工具结果可能形成较长的单行 JSONL，扩大 asyncio 默认的流读取上限。
@@ -263,6 +265,7 @@ class PiAgent:
         # response 和 event 可能交错到达，必须同时等到“已接受”和“完全结束”。
         while not (accepted and settled):
             event = await self._read_event()
+            log_native("RPC事件", event)
             event_type = event.get("type")
 
             if event_type == "response" and event.get("id") == request_id:
@@ -278,7 +281,7 @@ class PiAgent:
                     final_message = message
                     # 诊断:pi 报 error/aborted 时把整条 message 和最近 stderr 打出
                     if message.get("stopReason") in ("error", "aborted"):
-                        logger.error(
+                        logger.debug(
                             "Pi 异常 stopReason=%s message=%s stderr_tail=%s",
                             message.get("stopReason"),
                             json.dumps(message, ensure_ascii=False)[:2000],
@@ -287,6 +290,7 @@ class PiAgent:
             elif event_type == "tool_execution_start":
                 tool_call_id = str(event.get("toolCallId") or "")
                 if tool_call_id:
+                    log_tool_start(tool_call_id, str(event.get("toolName") or ""), event.get("args", {}))
                     tool_starts[tool_call_id] = {
                         "tool": str(event.get("toolName") or ""),
                         "input": event.get("args", ""),
@@ -302,6 +306,9 @@ class PiAgent:
                 )
                 if event.get("isError"):
                     output = f"[error] {output}"
+                log_tool_complete(tool_call_id, start.get("tool") or event.get("toolName") or "unknown",
+                                  start.get("input"), {"error": output if event.get("isError") else None,
+                                                       "result": result})
                 started = start.get("started")
                 duration_ms = (
                     round((time.monotonic() - started) * 1000)
@@ -365,6 +372,7 @@ class PiAgent:
                 logger.debug("Pi abort 发送失败: %s", exc)
         await self.close()
 
+    @logged_execution("pi")
     async def execute(
         self,
         query: str,

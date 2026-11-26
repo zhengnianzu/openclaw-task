@@ -364,7 +364,7 @@ async def execute_queries(
 
         if not success:
             logger.error("任务 %d 失败,终止后续 %d 个任务", idx, len(queries) - idx)
-            break
+            raise RuntimeError(f"任务 {idx} 执行失败，终止后续 {len(queries) - idx} 个任务")
 
     return results
 
@@ -394,6 +394,7 @@ def _make_options(timeout: int, client: Any):
 
     # 其余 harness:模块 → ExecutionOptions 直接映射
     harness_options = {
+        "src.taichu_client":     ("src.taichu_client", "ExecutionOptions"),
         "src.hermes_client":     ("src.hermes_client",     "ExecutionOptions"),
         "src.claudecode_client": ("src.claudecode_client", "ExecutionOptions"),
         "src.openjiuwen_client": ("src.openjiuwen_client", "ExecutionOptions"),

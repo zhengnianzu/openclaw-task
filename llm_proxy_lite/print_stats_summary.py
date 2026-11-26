@@ -111,6 +111,8 @@ def _matches_model(model: str, model_filter: str) -> bool:
 def _aggregate_index_entries(entries, model_filter, date_start, date_end, status, model_count_data):
     """将 index 条目聚合到 model_count_data 字典中。"""
     for entry in entries:
+        if entry.get("request_kind") in ("probe", "health"):
+            continue
         ts = entry.get("ts", "")
         entry_date = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}" if ts.isdigit() else ts[:10]
         if not (date_start <= entry_date <= date_end):

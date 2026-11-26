@@ -31,6 +31,7 @@ from typing import Any, Dict, Optional
 from user_simulator import User_simulator
 
 from src.config import AutomationConfig, ConfigLoader, load_agent_model_configs
+from src.agent_logging import install_log_filter, register_secrets
 from scripts.task_status import run_stats
 
 import time as _time
@@ -63,9 +64,20 @@ def _configure_windows_utf8_stdio() -> None:
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 
+class TaskConsoleFormatter(logging.Formatter):
+    """把整份任务的成功标记与单轮对话中的同名文本区分开。"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        if not getattr(record, "task_final_status", False):
+            text = text.replace("【Task_Done】", "【Session_Done】")
+        return text
+
+
 def setup_logger(config_file: Optional[str] = None) -> logging.Logger:
     logger = logging.getLogger("harness_automation")
     logger.setLevel(logging.DEBUG)
+    install_log_filter()
 
     if logger.handlers:
         return logger
@@ -82,11 +94,11 @@ def setup_logger(config_file: Optional[str] = None) -> logging.Logger:
     fh.setLevel(logging.DEBUG)
 
     ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
+    ch.setLevel(logging.INFO)
 
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    fh.setFormatter(fmt)
-    ch.setFormatter(fmt)
+    fmt = "%(asctime)s [%(levelname)s] %(message)s"
+    fh.setFormatter(logging.Formatter(fmt, datefmt="%Y-%m-%d %H:%M:%S"))
+    ch.setFormatter(TaskConsoleFormatter(fmt, datefmt="%Y-%m-%d %H:%M:%S"))
 
     logger.addHandler(fh)
     logger.addHandler(ch)
@@ -181,6 +193,7 @@ class HarnessAutomation:
         self.harness_type = config.harness_type
         # 从 simulator_config JSON 一次加载全部:{"user_simulator": AgentModelConfig, "<agent>": ...}
         all_cfgs = load_agent_model_configs(config.simulator_config)
+        register_secrets(all_cfgs)
         # user_simulator 段单独取出给 create_simulator 用;剩下的按 agent_name 传给 harness
         self.simulator_model_cfg = all_cfgs.pop("user_simulator", None)
         self.agent_overrides = all_cfgs
@@ -758,6 +771,9 @@ async def main(
 ) -> None:
     """主入口函数"""
     setup_logger(config_file)
+    from llm_proxy_lite.sandbox_identity import get_sandbox_id
+    os.environ["SANDBOX_ID"] = get_sandbox_id()
+    logger.info("沙箱ID=%s", os.environ["SANDBOX_ID"])
 
     if config_file:
         config = ConfigLoader.load_from_file(config_file)
@@ -780,6 +796,8 @@ async def main(
         run_stats(config_file=config_file, traj_stats_result=traj_stats_result, harness_type=config.harness_type)
         logger.info("任务统计已写入: %s", traj_stats_result)
 
+    # 仅在全部查询和统计均正常结束后发出平台约定的成功信号。
+    logger.info("【Task_Done】", extra={"task_final_status": True})
     return results
 
 

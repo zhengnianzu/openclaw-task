@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional
 from src.config import AgentModelConfig, warn_agent_model_conflict
 from src.workspace import BaseWorkspaceManager, copy_path
 
+from src.agent_logging import logged_execution, log_native
+
 logger = logging.getLogger("harness_automation")
 
 
@@ -297,6 +299,7 @@ class GrokAgent:
             process.kill()
             await process.wait()
 
+    @logged_execution("grok")
     async def execute(
         self,
         query: str,
@@ -373,6 +376,8 @@ class GrokAgent:
 
         stdout = stdout_bytes.decode("utf-8", errors="replace")
         stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+        log_native("CLI stdout", stdout)
+        log_native("CLI stderr", stderr)
         if stderr:
             logger.debug(
                 "[grok stderr] agent=%s session=%s %s",
