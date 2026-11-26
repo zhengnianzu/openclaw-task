@@ -364,7 +364,7 @@ async def execute_queries(
 
         if not success:
             logger.error("任务 %d 失败,终止后续 %d 个任务", idx, len(queries) - idx)
-            break
+            raise RuntimeError(f"任务 {idx} 执行失败，终止后续 {len(queries) - idx} 个任务")
 
     return results
 

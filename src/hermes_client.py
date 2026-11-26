@@ -19,6 +19,7 @@ import os
 import random
 import shutil
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
@@ -337,6 +338,17 @@ class HermesAgent:
         except Exception as e:
             logger.warning("恢复 cwd 失败 (忽略): %s", e)
 
+    def _log_tool_progress(self, event, name, *args, **details):
+        if event == "tool.started":
+            logger.info("工具开始 tool=%s%s", name,
+                        f" 调用={args[0]}" if args and args[0] else "")  # 展示 SDK 提供的调用预览；没有预览时省略。
+        elif event == "tool.completed":
+            failed = details.get("is_error", False)
+            reason = details.get("result") if failed else None  # 失败返回原样保留，不压缩空白或截断内容。
+            logger.log(logging.WARNING if failed else logging.INFO,
+                       "工具%s tool=%s 耗时=%.2f秒%s", "失败" if failed else "完成", name,
+                       details.get("duration") or 0, f"\n工具返回:\n{reason}" if reason is not None else "")  # 失败详情另起一行，成功只打印摘要。
+
     def _ensure_agent(self):
         if self._agent is not None:
             return self._agent
@@ -400,8 +412,19 @@ class HermesAgent:
                     self.agent_name, e,
                 )
 
+        ctor_kwargs.update(
+            quiet_mode=True, verbose_logging=False,
+            tool_progress_callback=self._log_tool_progress,
+            status_callback=lambda kind, message: logger.log(
+                logging.WARNING if kind in ("warn", "warning", "error") else logging.INFO,
+                "%s", " ".join(str(message).split())[:240],
+            ),
+        )
         try:
             self._agent = AIAgent(**ctor_kwargs)
+            self._agent.suppress_status_output = True
+            self._agent._skill_nudge_interval = 0  # 关闭自动技能复盘，避免主任务结束后继续发起后台请求。
+            self._agent._memory_nudge_interval = 0  # 关闭自动记忆复盘；任务主动调用记忆工具不受影响。
         except Exception as e:
             raise HermesError(
                 f"AIAgent 初始化失败 (检查 ~/.hermes/config.yaml 的 model 段): {e}"
@@ -446,6 +469,8 @@ class HermesAgent:
                 if options and options.timeout_seconds
                 else None
             )
+            started = time.monotonic()
+            logger.info("开始执行 timeout=%s秒", timeout or "未设置")
 
             try:
                 if timeout is not None:
@@ -455,6 +480,7 @@ class HermesAgent:
                 else:
                     result_dict = await asyncio.to_thread(_call)
             except asyncio.TimeoutError:
+                logger.error("执行超时 timeout=%s秒", timeout)
                 return ExecutionResult(
                     success=False,
                     content="",
@@ -462,10 +488,7 @@ class HermesAgent:
                     error_message=f"AIAgent run timed out after {timeout}s",
                 )
             except Exception as e:
-                logger.exception(
-                    "AIAgent.run_conversation 异常 (agent=%s session=%s)",
-                    self.agent_name, self.session_name,
-                )
+                logger.exception("执行失败: %s", e)
                 return ExecutionResult(
                     success=False,
                     content="",
@@ -474,6 +497,7 @@ class HermesAgent:
                 )
 
             if not isinstance(result_dict, dict):
+                logger.error("执行失败: AIAgent 返回类型为 %s", type(result_dict).__name__)
                 return ExecutionResult(
                     success=False,
                     content="",
@@ -482,15 +506,33 @@ class HermesAgent:
                 )
 
             final_text = result_dict.get("final_response", "") or ""
+            error = result_dict.get("error")
+            failed = bool(result_dict.get("failed") or result_dict.get("interrupted")
+                          or (error and not result_dict.get("partial")))
+            stop_reason = result_dict.get("stop_reason") or "complete"
+            if failed:
+                error = str(error or final_text or "Hermes 执行失败")
+                stop_reason = "error" if stop_reason == "complete" else stop_reason
+            elif result_dict.get("partial") or result_dict.get("completed") is False:
+                stop_reason = "partial" if stop_reason == "complete" else stop_reason
 
-            if final_text:
+            if final_text and not failed:
                 self._history.append({"role": "user", "content": query})
                 self._history.append({"role": "assistant", "content": final_text})
 
+            logger.info("执行结束 stop_reason=%s 耗时=%.2f秒",
+                        stop_reason, time.monotonic() - started)
+            if not failed and stop_reason == "complete" and final_text and isinstance(result_dict.get("api_calls"), int):
+                logger.info("🎉 Conversation completed after %d OpenAI-compatible API call(s)",
+                            result_dict["api_calls"])
+            if error:
+                logger.log(logging.ERROR if failed else logging.WARNING,
+                           "执行%s: %s", "失败" if failed else "未完整结束", error)
             return ExecutionResult(
-                success=True,
+                success=not failed,
                 content=final_text,
-                stop_reason=result_dict.get("stop_reason") or "complete",
+                stop_reason=stop_reason,
+                error_message=str(error) if error else None,
                 usage=result_dict.get("usage"),
                 messages=result_dict.get("messages") or [],
             )
@@ -508,14 +550,23 @@ class HermesClient:
 
     def __init__(self):
         self._agents: Dict[tuple, HermesAgent] = {}
+        self._logged_query = None
+
+    def _filter_duplicate_query(self, record):
+        if record.levelno == logging.INFO and record.msg == "[Q] %s":
+            self._logged_query = record.args[0]
+        return not (record.levelno == logging.DEBUG and record.msg == "[Q%d] %s"
+                    and record.args[0] == 1 and record.args[1] == self._logged_query)
 
     async def __aenter__(self) -> "HermesClient":
+        logger.addFilter(self._filter_duplicate_query)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.close()
 
     async def close(self) -> None:
+        logger.removeFilter(self._filter_duplicate_query)
         for ag in self._agents.values():
             if ag._agent is not None:
                 try:
@@ -551,6 +602,7 @@ class HermesClient:
 # ============================================================================
 
 async def build_hermes_client() -> HermesClient:
+    os.environ["HERMES_FILE_MUTATION_VERIFIER"] = "false"
     client = HermesClient()
     logger.info(
         "Hermes 客户端 (进程内 AIAgent 模式) 就绪;模型与 provider 由 "

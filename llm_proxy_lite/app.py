@@ -1,32 +1,33 @@
-import re
 import os
 import json
 import httpx
 import asyncio
 import logging
-import base64
-import ipaddress
-import math
+import sys
+import traceback
 import socket
 from contextlib import ExitStack
 from pathlib import Path
-from threading import Lock
 from uuid import uuid4
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
-from fastapi.exception_handlers import http_exception_handler
 from typing import Any, Dict, List, Optional, AsyncIterator
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 
-from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.requests import ClientDisconnect
-
 from print_stats_summary import TRAJECTORY_DIR, statistic_tokens
 
+# 控制台和重定向输出统一使用 UTF-8，兼容 Linux 和 Windows。
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+
 load_dotenv(override=True)
+
+# 同一网关中的所有任务共用，启动时可通过 --sandbox-id 指定。
+SANDBOX_ID = uuid4().hex
 
 # 全局默认：是否屏蔽 Task 工具里的 "- Explore:" 行
 BAN_EXPLORE = os.getenv("BAN_EXPLORE", "false").lower() == "true"
@@ -37,32 +38,19 @@ TRUST_ENV = os.getenv("TRUST_ENV", "true").lower() == "true"
 # 全局默认：重试次数（不从环境变量读取）
 MAX_RETRIES = 20
 
-# 转发、解析及重试基于 llm-proxy-lite 的 app.py（f88838f）。
-app = FastAPI(title="模型 API 转发网关")
-_MODEL_PATHS = {
-    "/v1/messages": "anthropic",
-    "/v1/chat/completions": "openai",
-    "/chat/completions": "openai",
-    "/v1/responses": "responses",
-}
-_HOP_HEADERS = {
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
-}
-_SECRET_HEADERS = {"authorization", "proxy-authorization", "x-api-key", "api-key", "cookie", "set-cookie"}
-_LOG_LOCK = Lock()
-_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+app = FastAPI(title="Anthropic+OpenAI Proxy (FastAPI)")
+
+
 
 
 async def get_x_auth_token(request) -> str:
-    """沿用 Lite 的 Bearer 提取，并兼容 Anthropic 的原始 x-api-key。"""
     keys = ['authorization', 'x-api-key']
     for key in keys:
         ack = request.headers.get(key)
         if isinstance(ack, str) and ack.startswith('Bearer '):
             ack = ack.split('Bearer ')[1].strip()
             return ack
-    return request.headers.get('x-api-key') or ''
+    return ''
 
 
 def _resolve_model_name(raw_model: Any) -> str:
@@ -86,7 +74,6 @@ def _strip_task_explore_line(
     """
 
     def _remove_explore_from_desc(desc: Any) -> Optional[str]:
-        """从工具描述中去掉 Explore 项，保留其他文字。"""
         if not isinstance(desc, str):
             return None
         lines = desc.splitlines()
@@ -135,33 +122,23 @@ def _strip_task_explore_line(
     return cleaned
 
 
-def _forward_headers(headers, exclude=()) -> list:
-    """过滤逐跳请求头和本次转发需要重设的字段。"""
-    connection = {name.strip().lower() for name in headers.get("connection", "").split(",")}
-    blocked = _HOP_HEADERS | connection | set(exclude)
-    return [(name, value) for name, value in headers.items() if name.lower() not in blocked]
-
-
 def build_upstream_headers(x_auth_token: str, model_id: str, req: Request) -> Dict[str, str]:
     """
-    保留 Lite 的鉴权与模型头设置，并带上会话和客户端协议头。
+    你网关/后端需要的 headers 全放这。
+    如果你还需要额外的（比如 X-ID / X-APPKEY），也在这里加。
     """
     ack = os.getenv('UPSTREAM_API_KEY') or x_auth_token
     return {
-        **dict(_forward_headers(req.headers, (
-            "host", "content-length", "content-encoding", "content-type", "authorization",
-            "x-api-key", "model-id", "session-id", "accept-encoding",
-        ))),
         "Content-Type": "application/json",
         "Authorization": f"Bearer {ack}",
         "x-api-key": ack,
         "Model-Id": os.environ.get("MODEL_ID") or model_id,
-        "session-id": req.state.session_id,
+        "X-Sandbox-Id": SANDBOX_ID,
+        **{key: value for key, value in req.headers.items() if key in ("session-id", "x-session-id")},
     }
 
 
 def _ssl_verify() -> bool:
-    """读取上游 TLS 证书校验开关，默认开启。"""
     return os.getenv("SSL_VERIFY", "true").lower() != "false"
 
 
@@ -180,32 +157,26 @@ def is_rate_limit_status(status_code: int) -> bool:
     return status_code in RATE_LIMIT_STATUS_CODES
 
 
-def _upstream_url(req: Request) -> str:
-    """直接拼接目标基础地址、原始路径和查询参数。"""
-    return req.state.target + _request_path(req)
+# -----------------------------
+# Endpoints
+# -----------------------------
+@app.get("/hi")
+async def health():
+    return {"LLM_PROXY": "hello !!!"}
 
 
-def _request_path(req: Request) -> str:
-    """读取转发和轨迹使用的原始路径与查询参数。"""
-    raw_path = req.scope.get("raw_path")
-    path = raw_path.decode("ascii") if raw_path else quote(req.url.path)
-    return path + ("?" + req.url.query if req.url.query else "")
-
-
-def _json_float(value: str) -> float | str:
-    """以字符串保留超出浮点数范围的数字，避免写出非法 JSON。"""
-    number = float(value)
-    return number if math.isfinite(number) else value
-
-
-def _parse_json(raw: bytes | str):
-    """解析可安全保存为 JSONL 的 JSON 值。"""
-    return json.loads(raw, parse_float=_json_float, parse_constant=str)
+# ---------- Anthropic Messages ----------
+def _dump_json(path: str, obj):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    line = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+    with open(path, "ab") as f:
+        offset = f.tell()
+        f.write(line)
+    return offset, len(line)
 
 
 def _resp_to_obj(r):  # httpx.Response -> dict
-    """沿用 Lite 的 JSON 或文本响应解析，保存时隐藏凭据。"""
-    base = {"status_code": r.status_code, "headers": _log_headers(r.headers)}
+    base = {"status_code": r.status_code, "headers": dict(r.headers)}
     try:
         base["json"] = r.json()
     except Exception:
@@ -213,65 +184,56 @@ def _resp_to_obj(r):  # httpx.Response -> dict
     return base
 
 
-def _upstream_failure(req: Request, exc: Exception) -> int:
-    """记录连接异常或超时，并返回适当的 HTTP 状态码。"""
-    timeout = isinstance(exc, httpx.TimeoutException)
-    req.state.error = "upstream_timeout" if timeout else "upstream_error"
-    logging.warning("供应商 %s 转发失败（%s）: %s", req.state.provider, req.state.request_id, type(exc).__name__)
-    return 504 if timeout else 502
-
-
-async def _stream_response(req: Request, source: AsyncIterator[bytes]) -> StreamingResponse:
-    """通用转发拿到上游状态后回传响应，并在流结束时落盘。"""
-    first = await anext(source, None)
+def _append_index(req: Request, protocol: str, model: str, response: dict,
+                  tok_in: int = 0, tok_out: int = 0, success: bool = True,
+                  total_attempts: int = 1, error_message: Any = None,
+                  stream_done: Optional[bool] = None):
+    """将本次请求、响应写入小时 JSONL，并追加字节位置索引。"""
     state = req.state
-    status = state.status
-    headers = httpx.Headers(state.response_headers)
-    headers["session-id"] = state.session_id
-    state.response_started = True
-
-    async def body():
-        """逐块返回原始内容，保留收尾时已读到的响应字节。"""
-        raw = bytearray()
-        try:
-            if first is not None:
-                raw.extend(first)
-                yield first
-            async for chunk in source:
-                raw.extend(chunk)
-                yield chunk
-        except (asyncio.CancelledError, GeneratorExit):
-            state.error = "client_disconnected"
-            raise
-        finally:
-            try:
-                await source.aclose()
-            finally:
-                _record_trajectory(req, status, headers, raw)
-
-    return StreamingResponse(body(), status_code=status, headers=dict(headers))
-
-
-# -----------------------------
-# Endpoints
-# -----------------------------
-@app.get("/hi")
-async def health(req: Request):
-    """返回 Lite 的本地健康检查响应。"""
-    await _prepare_request(req)
-    return _record_response(req, JSONResponse({"LLM_PROXY": "hello !!!"}))
+    ts = state.started.strftime("%Y%m%d%H%M%S%f")[:-3]
+    status = response.get("status_code")
+    # 只对流式请求按结束标记和关闭异常分类，明确的 HTTP/SSE 错误仍优先判失败。
+    stream_status = None
+    if stream_done is not None:
+        cancelled = isinstance(error_message, (asyncio.CancelledError, GeneratorExit))
+        if (status or 0) < 400 and (error_message is None or cancelled):
+            if stream_done:
+                stream_status = "SUCCESS_CLIENT_CLOSED" if cancelled else "SUCCESS"
+            else:
+                stream_status = "STREAM_CANCELLED" if cancelled else "INCOMPLETE_STREAM"
+        success = success and stream_status in ("SUCCESS", "SUCCESS_CLIENT_CLOSED")
+    trace = {
+        "ts": ts, "id": state.request_id,
+        "sandbox_id": SANDBOX_ID,
+        "provider": state.provider, "protocol": protocol,
+        "method": req.method, "path": req.url.path + ("?" + req.url.query if req.url.query else ""),
+        "headers": dict(req.headers), "req": state.body, "res": response,
+    }
+    index = {
+        "ts": ts, "id": state.request_id,
+        "sandbox_id": SANDBOX_ID,
+        "provider": state.provider, "model": model, "tok_in": tok_in, "tok_out": tok_out,
+        "status_code": status, "success": success,
+        "file": f"data/{ts[:10]}.jsonl", "total_attempts": total_attempts,
+    }
+    if stream_status:
+        index["stream_status"] = stream_status
+    if not success:
+        index["error_message"] = str(error_message) if error_message is not None else stream_status
+        trace["error_message"] = index["error_message"]
+        if isinstance(error_message, BaseException):
+            index["error_type"] = type(error_message).__name__
+            trace["exception"] = traceback.format_exception(error_message)
+    elif stream_status == "SUCCESS_CLIENT_CLOSED":
+        trace["exception"] = traceback.format_exception(error_message)
+    index["offset"], index["length"] = _dump_json(TRAJECTORY_DIR / index["file"], trace)
+    _dump_json(TRAJECTORY_DIR / "index.jsonl", index)
 
 
 @app.post("/v1/messages")
 async def anthropic_messages(req: Request):
-    """按 Lite 的普通和 SSE 分支转发 Anthropic Messages。"""
-    await _prepare_request(req)
-    try:
-        body = await req.json()
-    except (ValueError, RecursionError):
-        body = None
-    if not isinstance(body, dict):
-        return _record_response(req, JSONResponse({"error": {"type": "invalid_json"}}, status_code=400))
+    """anthropic透传"""
+    body = await req.json()
     stream = bool(body.get("stream", False))
     body_model = body.get("model")
     ban_explore = BAN_EXPLORE
@@ -285,12 +247,18 @@ async def anthropic_messages(req: Request):
         model = _resolve_model_name(base_model or "byenv")
     else:
         model = _resolve_model_name(body_model)
-    upstream_url = _upstream_url(req)
+    req.state.request_id = uuid4().hex
+    req.state.started = datetime.now()
+    req.state.body = dict(body)
+    host, port = req.scope["server"][:2]
+    listeners = req.app.state.listeners
+    req.state.provider, target = listeners.get((host, port)) or listeners[("0.0.0.0", port)]
+    upstream_url = target + req.url.path + ("?" + req.url.query if req.url.query else "")
     verify = _ssl_verify()
 
     x_auth_token = await get_x_auth_token(req)
     upstream_headers = build_upstream_headers(x_auth_token, model, req)
-    body["model"] = req.state.model = upstream_headers['Model-Id']
+    body["model"] = upstream_headers['Model-Id']
 
     # 根据当前请求是否开启 ban_explore 来处理 Task 工具描述
     tools = _strip_task_explore_line(body.get("tools"), ban_explore=ban_explore)
@@ -328,49 +296,48 @@ async def anthropic_messages(req: Request):
                         await asyncio.sleep(0.5)
                         x_auth_token = await get_x_auth_token(req)
                         upstream_headers = build_upstream_headers(x_auth_token, model, req)
-        except asyncio.CancelledError:
-            req.state.error = "client_disconnected"
-            req.state.total_attempts = upstream_attempts
-            _record_trajectory(req, 499, httpx.Headers())
-            raise
         except Exception as e:
             last_exception = e
             logging.error(f"Failed to create httpx client (anthropic non-stream): {e}")
 
-        req.state.success = success
-        req.state.total_attempts = upstream_attempts
-        if r is None:
-            error_msg = str(last_exception) if last_exception else "unknown"
-            req.state.parsed_response = {"error": "max_retries_exceeded", "detail": error_msg}
-            return _record_response(req, JSONResponse(
-                status_code=502,
-                content={"type": "error", "error": {"type": "max_retries_exceeded", "message": f"上游多次失败({MAX_RETRIES}次): {error_msg}"}},
-            ))
+        if not success:
+            if r is not None:
+                _append_index(req, "anthropic", model, _resp_to_obj(r), 0, 0, success=False, total_attempts=upstream_attempts, error_message=last_exception if last_exception is not None else r.text)
+                return Response(
+                    content=r.content,
+                    status_code=r.status_code,
+                    media_type=r.headers.get("content-type", "application/json"),
+                )
+            else:
+                error_msg = str(last_exception) if last_exception else "unknown"
+                _append_index(req, "anthropic", model, {"error": "max_retries_exceeded", "detail": error_msg}, 0, 0, success=False, total_attempts=upstream_attempts, error_message=last_exception)
+                return JSONResponse(
+                    status_code=502,
+                    content={"type": "error", "error": {"type": "max_retries_exceeded", "message": f"上游多次失败({MAX_RETRIES}次): {error_msg}"}},
+                )
 
-        req.state.parsed_response = _resp_to_obj(r)
-        if success:
-            tok_in, tok_out = 0, 0
-            try:
-                resp_json = r.json()
-                usage = resp_json.get("usage", {})
-                tok_in = (usage.get("input_tokens") or 0) + (usage.get("cache_creation_input_tokens") or 0) + (usage.get("cache_read_input_tokens") or 0)
-                tok_out = usage.get("output_tokens") or 0
-            except Exception:
-                pass
-            req.state.tokens = tok_in, tok_out
-        return _record_response(req, Response(
+        tok_in, tok_out = 0, 0
+        try:
+            resp_json = r.json()
+            usage = resp_json.get("usage", {})
+            tok_in = (usage.get("input_tokens") or 0) + (usage.get("cache_creation_input_tokens") or 0) + (usage.get("cache_read_input_tokens") or 0)
+            tok_out = usage.get("output_tokens") or 0
+        except Exception:
+            pass
+        _append_index(req, "anthropic", model, _resp_to_obj(r), tok_in, tok_out, success=True, total_attempts=upstream_attempts)
+        return Response(
             content=r.content,
             status_code=r.status_code,
             media_type=r.headers.get("content-type", "application/json"),
-        ))
+        )
 
     # ---- stream SSE (pure pass-through) ----
-    response_headers = {**_SSE_HEADERS, "session-id": req.state.session_id}
     async def anthropic_sse_passthrough() -> AsyncIterator[bytes]:
-        """沿用 Lite 的 SSE 透传和重试循环。"""
         up_chunks: List[Any] = []
         log_buf = bytearray()
         connection_established = False
+        upstream_status = None
+        log_error = None
         upstream_attempts = 0
         last_exception = None
         last_retry_status = None
@@ -385,20 +352,23 @@ async def anthropic_messages(req: Request):
             ) as client:
                 for attempt in range(MAX_RETRIES):
                     upstream_attempts += 1
-                    log_buf.clear()
+                    upstream_status = None
+                    log_error = None
+                    log_buf = bytearray()
                     try:
                         async with client.stream("POST", upstream_url, headers=retry_headers, json=body) as r:
-                            req.state.upstream_status = r.status_code
+                            upstream_status = r.status_code
                             up_chunks.append({
                                 "type": "anthropic_passthrough_sse_meta",
                                 "status_code": r.status_code,
-                                "headers": _log_headers(r.headers),
+                                "headers": dict(r.headers),
                             })
 
                             if is_rate_limit_status(r.status_code):
                                 err = await r.aread()
                                 last_retry_err_text = err.decode("utf-8", errors="replace")
                                 last_retry_status = r.status_code
+                                log_error = last_retry_err_text
                                 up_chunks.append({"type": "error_body", "body": last_retry_err_text})
                                 logging.warning(f"Attempt {attempt} rate limit (anthropic stream): {r.status_code}")
                                 if attempt < MAX_RETRIES - 1:
@@ -410,14 +380,12 @@ async def anthropic_messages(req: Request):
                             connection_established = True
 
                             if r.status_code >= 400:
-                                req.state.error = "upstream_http_error"
                                 err = await r.aread()
                                 err_text = err.decode("utf-8", errors="replace")
+                                log_error = err_text
                                 up_chunks.append({"type": "error_body", "body": err_text})
                                 error_data = {"type": "error", "error": {"type": "api_error", "message": err_text}}
-                                payload = f"event: error\ndata: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode("utf-8")
-                                log_buf.extend(payload)
-                                yield payload
+                                yield f"event: error\ndata: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode("utf-8")
                                 return
 
                             raw_buf = bytearray()
@@ -458,19 +426,11 @@ async def anthropic_messages(req: Request):
                                     connection_established = True
                                     yield bytes(raw_buf)
 
-                            for line in log_buf.decode("utf-8", errors="replace").splitlines():
-                                if line.startswith("data:"):
-                                    data_part = line[5:].strip()
-                                    if data_part and data_part != "[DONE]":
-                                        try:
-                                            up_chunks.append(json.loads(data_part))
-                                        except json.JSONDecodeError:
-                                            pass
                             return
 
                     except Exception as e:
+                        log_error = e
                         if connection_established:
-                            req.state.error = "upstream_stream_error"
                             logging.warning(f"Stream interrupted (anthropic stream): {e}")
                             return
                         last_exception = e
@@ -481,42 +441,57 @@ async def anthropic_messages(req: Request):
                             retry_headers = build_upstream_headers(retry_token, model, req)
 
                 # All retries exhausted
-                req.state.error = "max_retries_exceeded"
                 error_msg = str(last_exception) if last_exception else (f"HTTP {last_retry_status}" if last_retry_status else "unknown")
                 logging.error(f"All retries exhausted (anthropic stream): {error_msg}")
                 err_event = {"type": "error", "error": {"type": "max_retries_exceeded", "message": f"上游多次失败({MAX_RETRIES}次): {error_msg}"}}
-                payload = f"event: error\ndata: {json.dumps(err_event, ensure_ascii=False)}\n\n".encode("utf-8")
-                log_buf.extend(payload)
-                yield payload
+                yield f"event: error\ndata: {json.dumps(err_event, ensure_ascii=False)}\n\n".encode("utf-8")
 
-        except (asyncio.CancelledError, GeneratorExit):
-            req.state.error = "client_disconnected"
-            raise
         except Exception as e:
-            req.state.error = "connection_error"
             logging.error(f"Failed to create httpx client (anthropic stream): {e}")
+            last_exception = e
+            log_error = e
             err_event = {"type": "error", "error": {"type": "connection_error", "message": str(e)}}
-            payload = f"event: error\ndata: {json.dumps(err_event, ensure_ascii=False)}\n\n".encode("utf-8")
-            log_buf.extend(payload)
-            yield payload
+            yield f"event: error\ndata: {json.dumps(err_event, ensure_ascii=False)}\n\n".encode("utf-8")
         finally:
-            req.state.chunks = up_chunks
-            req.state.success = connection_established
-            req.state.total_attempts = upstream_attempts
+            log_error = sys.exc_info()[1] or log_error
+
+            # 按完整 SSE 事件合并多行 data；LF、CRLF、CR 均支持，末尾半条事件不解析。
+            sse_text = log_buf.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+            for event in sse_text.split("\n\n")[:-1]:
+                data_part = "\n".join(line[5:].removeprefix(" ") for line in event.split("\n")
+                                      if line == "data" or line.startswith("data:"))
+                if data_part and data_part != "[DONE]":
+                    try:
+                        chunk = json.loads(data_part)
+                        up_chunks.append(chunk)
+                        if isinstance(chunk, dict) and chunk.get("type") == "error":
+                            log_error = data_part
+                    except json.JSONDecodeError:
+                        log_error = data_part
+
+            # 同次遍历读取上游 usage 和 Anthropic 的 message_stop，不估算 Token。
+            stream_done = False
             _tok_in, _tok_out = 0, 0
             for _c in up_chunks:
                 if isinstance(_c, dict):
+                    stream_done = stream_done or _c.get("type") == "message_stop"
                     _u = _c.get("message", {}).get("usage") or _c.get("usage") or {}
                     if _u:
-                        _tok_in = (_u.get("input_tokens") or 0) + (_u.get("cache_creation_input_tokens") or 0) + (_u.get("cache_read_input_tokens") or 0)
-                        _tok_out = _u.get("output_tokens") or 0
-            req.state.tokens = _tok_in, _tok_out
-            _record_trajectory(req, 200, httpx.Headers(response_headers), log_buf)
+                        _tok_in = ((_u.get("input_tokens") or 0) + (_u.get("cache_creation_input_tokens") or 0) + (_u.get("cache_read_input_tokens") or 0)) or _tok_in
+                        _tok_out = _u.get("output_tokens") or _tok_out
+
+            # 统一分类时保留关闭异常原文；成功与否由协议完成状态决定。
+            _append_index(req, "anthropic", model, {
+                "type": "anthropic_passthrough_sse_capture", "chunks": up_chunks,
+                "headers": {"content-type": "text/event-stream"},
+                "status_code": upstream_status,
+            }, _tok_in, _tok_out, success=connection_established,
+                total_attempts=upstream_attempts, error_message=log_error, stream_done=stream_done)
 
     return StreamingResponse(
         anthropic_sse_passthrough(),
         media_type="text/event-stream",
-        headers=response_headers,
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -526,15 +501,11 @@ async def anthropic_messages(req: Request):
 @app.post("/chat/completions")
 async def openai_chat_completions(req: Request):
     """
-    按 Lite 的普通和 SSE 分支转发 OpenAI Chat Completions 和 Responses。
+    OpenAI-compatible endpoint:
+      - non-stream: upstream JSON pass-through
+      - stream: upstream OpenAI SSE pass-through
     """
-    await _prepare_request(req)
-    try:
-        body = await req.json()
-    except (ValueError, RecursionError):
-        body = None
-    if not isinstance(body, dict):
-        return _record_response(req, JSONResponse({"error": {"type": "invalid_json"}}, status_code=400))
+    body = await req.json()
     stream = bool(body.get("stream", False))
     body_model = body.get("model")
     ban_explore = BAN_EXPLORE
@@ -549,12 +520,18 @@ async def openai_chat_completions(req: Request):
     else:
         model = _resolve_model_name(body_model)
 
-    upstream_url = _upstream_url(req)
+    req.state.request_id = uuid4().hex
+    req.state.started = datetime.now()
+    req.state.body = dict(body)
+    host, port = req.scope["server"][:2]
+    listeners = req.app.state.listeners
+    req.state.provider, target = listeners.get((host, port)) or listeners[("0.0.0.0", port)]
+    upstream_url = target + req.url.path + ("?" + req.url.query if req.url.query else "")
     verify = _ssl_verify()
 
     x_auth_token = await get_x_auth_token(req)
     upstream_headers = build_upstream_headers(x_auth_token, model, req)
-    body["model"] = req.state.model = upstream_headers['Model-Id']
+    body["model"] = upstream_headers['Model-Id']
     # 根据当前请求是否开启 ban_explore 来处理 Task 工具描述
     tools = _strip_task_explore_line(body.get("tools"), ban_explore=ban_explore)
     if tools is not None:
@@ -592,49 +569,49 @@ async def openai_chat_completions(req: Request):
                         await asyncio.sleep(0.5)
                         x_auth_token = await get_x_auth_token(req)
                         upstream_headers = build_upstream_headers(x_auth_token, model, req)
-        except asyncio.CancelledError:
-            req.state.error = "client_disconnected"
-            req.state.total_attempts = upstream_attempts
-            _record_trajectory(req, 499, httpx.Headers())
-            raise
         except Exception as e:
             last_exception = e
             logging.error(f"Failed to create httpx client (openai non-stream): {e}")
 
-        req.state.success = success
-        req.state.total_attempts = upstream_attempts
-        if r is None:
-            error_msg = str(last_exception) if last_exception else "unknown"
-            req.state.parsed_response = {"error": "max_retries_exceeded", "detail": error_msg}
-            return _record_response(req, JSONResponse(
-                status_code=502,
-                content={"error": {"message": f"\u4e0a\u6e38\u591a\u6b21\u5931\u8d25({MAX_RETRIES}\u6b21): {error_msg}", "type": "max_retries_exceeded"}},
-            ))
+        if not success:
+            if r is not None:
+                _append_index(req, "openai", model, _resp_to_obj(r), 0, 0, success=False, total_attempts=upstream_attempts, error_message=last_exception if last_exception is not None else r.text)
+                return Response(
+                    content=r.content,
+                    status_code=r.status_code,
+                    media_type=r.headers.get("content-type", "application/json"),
+                )
+            else:
+                error_msg = str(last_exception) if last_exception else "unknown"
+                _append_index(req, "openai", model, {"error": "max_retries_exceeded", "detail": error_msg}, 0, 0, success=False, total_attempts=upstream_attempts, error_message=last_exception)
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": {"message": f"\u4e0a\u6e38\u591a\u6b21\u5931\u8d25({MAX_RETRIES}\u6b21): {error_msg}", "type": "max_retries_exceeded"}},
+                )
 
-        req.state.parsed_response = _resp_to_obj(r)
-        if success:
-            tok_in, tok_out = 0, 0
-            try:
-                resp_json = r.json()
-                usage = resp_json.get("usage", {})
-                tok_in = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
-                tok_out = usage.get("output_tokens") or usage.get("completion_tokens") or 0
-            except Exception:
-                pass
-            req.state.tokens = tok_in, tok_out
-        return _record_response(req, Response(
+        tok_in, tok_out = 0, 0
+        try:
+            resp_json = r.json()
+            usage = resp_json.get("usage", {})
+            tok_in = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+            tok_out = usage.get("output_tokens") or usage.get("completion_tokens") or 0
+        except Exception:
+            pass
+        _append_index(req, "openai", model, _resp_to_obj(r), tok_in, tok_out, success=r.status_code < 400, total_attempts=upstream_attempts)
+        return Response(
             content=r.content,
             status_code=r.status_code,
             media_type=r.headers.get("content-type", "application/json"),
-        ))
+        )
 
     # ---- stream SSE (OpenAI SSE pass-through) ----
-    response_headers = {**_SSE_HEADERS, "session-id": req.state.session_id}
     async def sse_passthrough() -> AsyncIterator[bytes]:
-        """沿用 Lite 的 SSE 透传和重试循环。"""
         up_chunks: List[Any] = []
         log_buf = bytearray()
+        is_responses = req.url.path.endswith("/responses")
         connection_established = False
+        upstream_status = None
+        log_error = None
         upstream_attempts = 0
         last_exception = None
         last_retry_status = None
@@ -649,20 +626,23 @@ async def openai_chat_completions(req: Request):
             ) as client:
                 for attempt in range(MAX_RETRIES):
                     upstream_attempts += 1
-                    log_buf.clear()
+                    upstream_status = None
+                    log_error = None
+                    log_buf = bytearray()
                     try:
                         async with client.stream("POST", upstream_url, headers=retry_headers, json=body) as r:
-                            req.state.upstream_status = r.status_code
+                            upstream_status = r.status_code
                             up_chunks.append({
                                 "type": "openai_passthrough_sse_meta",
                                 "status_code": r.status_code,
-                                "headers": _log_headers(r.headers),
+                                "headers": dict(r.headers),
                             })
 
                             if is_rate_limit_status(r.status_code):
                                 err = await r.aread()
                                 last_retry_err_text = err.decode("utf-8", errors="replace")
                                 last_retry_status = r.status_code
+                                log_error = last_retry_err_text
                                 up_chunks.append({"type": "error_body", "body": last_retry_err_text})
                                 logging.warning(f"Attempt {attempt} rate limit (openai stream): {r.status_code}")
                                 if attempt < MAX_RETRIES - 1:
@@ -674,33 +654,22 @@ async def openai_chat_completions(req: Request):
                             connection_established = True
 
                             if r.status_code >= 400:
-                                req.state.error = "upstream_http_error"
                                 err = await r.aread()
                                 err_text = err.decode("utf-8", errors="replace")
+                                log_error = err_text
                                 up_chunks.append({"type": "error_body", "body": err_text})
-                                payload = err_text.encode("utf-8")
-                                log_buf.extend(payload)
-                                yield payload
+                                yield err_text.encode("utf-8")
                                 return
 
                             async for raw in r.aiter_bytes():
                                 log_buf.extend(raw)
                                 yield raw
 
-                            # Parse log_buf for logging
-                            for line in log_buf.decode("utf-8", errors="replace").splitlines():
-                                if line.startswith("data:"):
-                                    data_part = line[5:].strip()
-                                    if data_part and data_part != "[DONE]":
-                                        try:
-                                            up_chunks.append(json.loads(data_part))
-                                        except json.JSONDecodeError:
-                                            pass
                             return
 
                     except Exception as e:
+                        log_error = e
                         if connection_established:
-                            req.state.error = "upstream_stream_error"
                             logging.warning(f"Stream interrupted (openai stream): {e}")
                             return
                         last_exception = e
@@ -711,293 +680,78 @@ async def openai_chat_completions(req: Request):
                             retry_headers = build_upstream_headers(retry_token, model, req)
 
                 # All retries exhausted
-                req.state.error = "max_retries_exceeded"
                 error_msg = str(last_exception) if last_exception else (f"HTTP {last_retry_status}" if last_retry_status else "unknown")
                 logging.error(f"All retries exhausted (openai stream): {error_msg}")
                 error_data = {"error": {"message": f"\u4e0a\u6e38\u591a\u6b21\u5931\u8d25({MAX_RETRIES}\u6b21): {error_msg}", "type": "max_retries_exceeded"}}
-                payload = f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode("utf-8")
-                log_buf.extend(payload)
-                yield payload
-                log_buf.extend(b"data: [DONE]\n\n")
+                yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode("utf-8")
                 yield b"data: [DONE]\n\n"
 
-        except (asyncio.CancelledError, GeneratorExit):
-            req.state.error = "client_disconnected"
-            raise
         except Exception as e:
-            req.state.error = "connection_error"
             logging.error(f"Failed to create httpx client (openai stream): {e}")
+            last_exception = e
+            log_error = e
             error_data = {"error": {"message": str(e), "type": "connection_error"}}
-            payload = f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode("utf-8")
-            log_buf.extend(payload)
-            yield payload
-            log_buf.extend(b"data: [DONE]\n\n")
+            yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode("utf-8")
             yield b"data: [DONE]\n\n"
         finally:
-            req.state.chunks = up_chunks
-            req.state.success = connection_established
-            req.state.total_attempts = upstream_attempts
+            log_error = sys.exc_info()[1] or log_error
+
+            # 按完整事件合并 data；Chat 用 [DONE]，Responses 用 response.completed。
+            sse_text = log_buf.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+            stream_done = False
+            for event in sse_text.split("\n\n")[:-1]:
+                data_part = "\n".join(line[5:].removeprefix(" ") for line in event.split("\n")
+                                      if line == "data" or line.startswith("data:"))
+                if data_part == "[DONE]":
+                    if not is_responses:
+                        stream_done = True
+                elif data_part:
+                    try:
+                        chunk = json.loads(data_part)
+                        up_chunks.append(chunk)
+                        if isinstance(chunk, dict):
+                            if is_responses and chunk.get("type") == "response.completed":
+                                stream_done = True
+                            if chunk.get("error") or chunk.get("type") in ("error", "response.failed", "response.incomplete"):
+                                log_error = data_part
+                    except json.JSONDecodeError:
+                        log_error = data_part
+
+            # 只读取上游已返回的 usage；客户端关闭时也保留已收到的 Token 用量。
             _tok_in, _tok_out = 0, 0
             for _c in up_chunks:
                 if isinstance(_c, dict):
-                    _u = _c.get("usage") or {}
-                    response = _c.get("response")
-                    if req.state.protocol == "responses" and isinstance(response, dict):
-                        _u = response.get("usage") or _u
+                    _u = _c.get("usage") or (_c.get("response") or {}).get("usage") or {}
                     if _u:
                         _tok_in = _tok_in or (_u.get("input_tokens") or _u.get("prompt_tokens") or 0)
                         _tok_out = _tok_out or (_u.get("output_tokens") or _u.get("completion_tokens") or 0)
-            req.state.tokens = _tok_in, _tok_out
-            _record_trajectory(req, 200, httpx.Headers(response_headers), log_buf)
+
+            # 统一分类，正常收尾取消也保留原始诊断信息。
+            _append_index(req, "openai", model, {
+                "type": "openai_passthrough_sse_capture", "chunks": up_chunks,
+                "headers": {"content-type": "text/event-stream"},
+                "status_code": upstream_status,
+            }, _tok_in, _tok_out, success=connection_established,
+                total_attempts=upstream_attempts, error_message=log_error, stream_done=stream_done)
 
     return StreamingResponse(
         sse_passthrough(),
         media_type="text/event-stream",
-        headers=response_headers,
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
+# ===============================================
+# 以下为新增的统计功能
+
 @app.get("/statistic")
-async def statistic_tokens_web(req: Request, model: str = '', date_start: str = '', date_end: str = '', status: str = '全部'):
-    """沿用 Lite 的 JSON 统计入口。"""
-    await _prepare_request(req)
-    res = await asyncio.to_thread(statistic_tokens, model=model, date_start=date_start, date_end=date_end, status=status)
-    return _record_response(req, JSONResponse(res))
-
-
-@app.exception_handler(StarletteHTTPException)
-async def record_http_error(req: Request, exc: StarletteHTTPException):
-    """为框架返回的 HTTP 错误补齐会话标识并落盘。"""
-    if not hasattr(req.state, "session_id"):
-        await _prepare_request(req)
-    response = await http_exception_handler(req, exc)
-    return _record_response(req, response)
-
-
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
-async def passthrough(req: Request):
-    """将其他 HTTP 请求直接发往当前监听地址对应的供应商。"""
-    await _prepare_request(req)
-    headers = dict(_forward_headers(req.headers, ("host", "content-length")))
-    headers["session-id"] = req.state.session_id
-    url = _upstream_url(req)
-
-    async def forward():
-        """保留原始响应字节和内容编码，并在结束时关闭上游连接。"""
-        try:
-            async with httpx.AsyncClient(
-                verify=_ssl_verify(), timeout=httpx.Timeout(500.0, connect=10.0), trust_env=TRUST_ENV,
-            ) as client:
-                async with client.stream(req.method, url, headers=headers, content=req.state.raw_body) as response:
-                    req.state.status = response.status_code
-                    req.state.upstream_status = response.status_code
-                    req.state.response_headers = dict(_forward_headers(response.headers))
-                    async for chunk in response.aiter_raw():
-                        yield chunk
-        except httpx.RequestError as exc:
-            req.state.status = _upstream_failure(req, exc)
-            if getattr(req.state, "response_started", False):
-                raise
-            req.state.response_headers = {"content-type": "application/json"}
-            yield json.dumps({"error": {"type": req.state.error}}).encode()
-
-    try:
-        return await _stream_response(req, forward())
-    except asyncio.CancelledError:
-        req.state.error = "client_disconnected"
-        _record_trajectory(req, 499, httpx.Headers())
-        raise
-
-
-_COOKIE_HEADERS = {"cookie", "set-cookie"}
-_KEY_PREFIXES = ("sk-ant-", "sk-proj-", "sk-")   # 长前缀优先匹配
-
-
-def _mask_secret(secret: str) -> str:
-    """把密钥掩码为「前缀 + 首位 + **** + 后四位」
-    - 保留 ``Bearer `` 等认证方案前缀；
-    - 识别 sk- / sk-ant- / sk-proj- 前缀，前缀本身原样保留；
-    - 去掉沙箱后缀，只取核心key的首位和后四位
-    """
-    if not secret:
-        return secret
-    scheme = ""
-    head, sep, tail = secret.partition(" ")
-    if sep and head.lower() in ("bearer", "basic", "token"):
-        scheme, secret = head + " ", tail.strip()
-    prefix = next((p for p in _KEY_PREFIXES if secret.startswith(p)), "")
-    body = secret[len(prefix):]
-    core = body.split("_", 1)[0]
-    return f"{scheme}{prefix}{core[0]}****{core[-4:]}"
-
-
-def _log_headers(headers) -> dict:
-    """日志中的鉴权头改为掩码（保留首位与后四位便于对账），Cookie 整体隐藏。"""
-    masked = {}
-    for name, value in headers.items():
-        lowered = name.lower()
-        if lowered in _COOKIE_HEADERS:
-            masked[name] = "[已隐藏]"
-        elif lowered in _SECRET_HEADERS:
-            masked[name] = _mask_secret(value)
-        else:
-            masked[name] = value
-    return masked
-
-
-def _parse_body(raw: bytes, headers: httpx.Headers) -> tuple[str, Any]:
-    """优先读取 JSON，其次保留文本或 Base64 编码的二进制内容。"""
-    if not raw:
-        return "json", None
-    try:
-        raw = httpx.Response(200, headers=headers, content=raw).content
-    except httpx.DecodingError:
-        return "base64", base64.b64encode(raw).decode("ascii")
-    try:
-        return "json", _parse_json(raw)
-    except (ValueError, RecursionError):
-        try:
-            return "text", raw.decode("utf-8")
-        except UnicodeDecodeError:
-            return "base64", base64.b64encode(raw).decode("ascii")
-
-
-def _session_id(headers, body) -> str:
-    """按请求头、请求体、元数据的顺序读取会话标识，缺失时生成 UUID。"""
-    candidates = [headers.get("session-id"), headers.get("x-session-id")]
-    fields = ("session-id", "session_id", "sessionId")
-    if isinstance(body, dict):
-        candidates.extend(body.get(key) for key in fields)
-        metadata = body.get("metadata")
-        if isinstance(metadata, dict):
-            candidates.extend(metadata.get(key) for key in fields)
-            user_id = metadata.get("user_id")
-            if isinstance(user_id, str):
-                try:
-                    user_id = json.loads(user_id)
-                except (ValueError, RecursionError):
-                    pass
-            if isinstance(user_id, dict):
-                candidates.extend(user_id.get(key) for key in fields)
-            if isinstance(user_id, str):
-                match = re.search(r"session_([A-Za-z0-9-]+)", user_id)
-                if match:
-                    candidates.append(match.group(1))
-    for value in candidates:
-        if isinstance(value, str):
-            value = value.strip()
-            if value and value.isascii() and value.isprintable():
-                return value
-    return uuid4().hex
-
-
-def _jsonl(value: dict) -> bytes:
-    """生成一条 UTF-8 JSONL 记录，供索引按字节定位。"""
-    try:
-        line = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-    except ValueError:
-        # 原版 JSON 解析可读入非有限数，将它们转换为字符串后再写入 JSONL。
-        line = json.dumps(_parse_json(json.dumps(value)), ensure_ascii=False, separators=(",", ":"))
-    return (line + "\n").encode("utf-8", errors="backslashreplace")
-
-
-def _append_trajectory(trace: dict, index: dict) -> None:
-    """串行追加小时数据与索引，日志目录清空后即写即建。"""
-    file = TRAJECTORY_DIR / index["file"]
-    line = _jsonl(trace)
-    with _LOG_LOCK:
-        file.parent.mkdir(parents=True, exist_ok=True)
-        with file.open("ab") as output:
-            index["offset"] = output.tell()
-            index["length"] = len(line)
-            output.write(line)
-        with (TRAJECTORY_DIR / "index.jsonl").open("ab") as output:
-            output.write(_jsonl(index))
-
-
-def _response_record(state, status: int, headers: httpx.Headers, raw: bytes | bytearray) -> dict:
-    """合并路由解析结果与实际下发的响应，补充失败状态。"""
-    result = getattr(state, "parsed_response", None) or {"headers": _log_headers(headers)}
-    result.update(status_code=status, **{"session-id": state.session_id})
-    upstream_status = getattr(state, "upstream_status", status)
-    if upstream_status != status:
-        result["upstream_status_code"] = upstream_status
-    if "json" not in result and "text" not in result:
-        kind, parsed = _parse_body(bytes(raw), headers)
-        result[kind] = parsed
-    chunks = getattr(state, "chunks", None)
-    if chunks is not None:
-        result["chunks"] = chunks
-        if any(isinstance(chunk, dict) and (
-            chunk.get("error") or chunk.get("type") in ("error", "response.failed", "response.incomplete")
-        ) for chunk in chunks):
-            state.error = getattr(state, "error", None) or "upstream_sse_error"
-    if getattr(state, "error", None):
-        result["error"] = state.error
-    return result
-
-
-async def _prepare_request(req: Request) -> None:
-    """为当前路由确定供应商、请求标识和会话标识。"""
-    state = req.state
-    host, port = req.scope["server"][:2]
-    wildcard = "::" if ":" in host else "0.0.0.0"
-    listeners = req.app.state.listeners
-    state.provider, state.target = listeners.get((host, port)) or listeners[(wildcard, port)]
-    state.protocol = _MODEL_PATHS.get(req.url.path, "http") if req.method == "POST" else "http"
-    state.request_id = uuid4().hex
-    state.started = datetime.now()
-    try:
-        state.raw_body = await req.body()
-    except (ClientDisconnect, asyncio.CancelledError):
-        state.body, state.body_kind = None, "json"
-        state.session_id = _session_id(req.headers, None)
-        state.error = "client_disconnected"
-        _record_trajectory(req, 499, httpx.Headers())
-        raise
-
-    state.body_kind, state.body = _parse_body(state.raw_body, httpx.Headers(req.headers.raw))
-    state.session_id = _session_id(req.headers, state.body)
-
-
-def _record_response(req: Request, response: Response) -> Response:
-    """为普通响应补上会话标识，并在返回前写入轨迹。"""
-    response.headers["session-id"] = req.state.session_id
-    _record_trajectory(req, response.status_code, httpx.Headers(response.headers.raw), response.body)
-    return response
-
-
-def _record_trajectory(req: Request, status: int, headers: httpx.Headers,
-                       raw: bytes | bytearray = b"") -> None:
-    """由各路由收尾直接写入小时数据和索引。"""
-    state = req.state
-    ts = state.started.strftime("%Y%m%d%H%M%S%f")[:-3]
-    trace = {
-        "ts": ts, "id": state.request_id, "session-id": state.session_id,
-        "provider": state.provider, "protocol": state.protocol,
-        "method": req.method, "path": _request_path(req),
-        "headers": _log_headers(req.headers),
-        "req": {"base64": state.body} if state.body_kind == "base64" else state.body,
-        "res": _response_record(state, status, headers, raw),
-    }
-    tok_in, tok_out = getattr(state, "tokens", (0, 0))
-    success = getattr(state, "success", 200 <= status < 400)
-    index = {
-        "ts": ts, "id": state.request_id, "session-id": state.session_id, "provider": state.provider,
-        "model": getattr(state, "model", ""), "tok_in": tok_in, "tok_out": tok_out,
-        "status_code": status, "success": success and "error" not in trace["res"],
-        "file": f"data/{ts[:10]}.jsonl",
-    }
-    if hasattr(state, "total_attempts"):
-        index["total_attempts"] = state.total_attempts
-    try:
-        _append_trajectory(trace, index)
-    except OSError:
-        logging.exception("写入轨迹失败（%s）", state.request_id)
+def statistic_tokens_web(model: str = '', date_start: str = '', date_end: str = '', status: str = '全部'):
+    res = statistic_tokens(model=model, date_start=date_start, date_end=date_end, status=status)
+    return JSONResponse(res)
 
 
 def load_config(path: Path) -> list[tuple[str, str, int, str]]:
-    """校验端口映射和上游基础地址，并保留配置中的原始 URL。"""
+    """读取端口映射并检查上游基础地址。"""
     config = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(config, dict) or not config:
         raise ValueError("配置须包含至少一个供应商")
@@ -1006,26 +760,17 @@ def load_config(path: Path) -> list[tuple[str, str, int, str]]:
     for name, entry in config.items():
         try:
             local_ip = entry["local_ip"]
-            if not re.fullmatch(r"(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\]):[0-9]+", local_ip):
-                raise ValueError
             local = urlsplit("//" + local_ip)
             host, port = local.hostname, local.port
             target = entry["target_ip"]
-            if not host or not port or local.username is not None or local.path or local.query or local.fragment:
+            if (not isinstance(target, str) or not host or not port or ":" in host
+                    or local.username is not None or local.path or local.query or local.fragment):
                 raise ValueError
-            if not re.fullmatch(r"https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]+)?(?:/[A-Za-z0-9._~-]+)*", target):
-                raise ValueError
+            target = target.rstrip("/")
             upstream = urlsplit(target)
-            if not upstream.hostname or upstream.port == 0 or {".", ".."}.intersection(upstream.path.split("/")):
+            if (upstream.scheme not in ("http", "https") or not upstream.hostname or upstream.port == 0
+                    or upstream.username is not None or upstream.query or upstream.fragment):
                 raise ValueError
-            if ":" not in upstream.hostname and not all(
-                re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
-                for label in upstream.hostname.removesuffix(".").split(".")
-            ):
-                raise ValueError
-            labels = upstream.hostname.removesuffix(".").split(".")
-            if len(labels) == 4 and all(label.isdecimal() for label in labels):
-                ipaddress.IPv4Address(".".join(labels))
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"供应商 {name!r} 的 local_ip 或 target_ip 格式无效") from exc
         if (host, port) in addresses:
@@ -1040,11 +785,13 @@ def main() -> None:
     import argparse
     import uvicorn
 
-    global BAN_EXPLORE
+    global BAN_EXPLORE, SANDBOX_ID
     parser = argparse.ArgumentParser(description="启动模型 API 转发网关")
     parser.add_argument("--config", type=Path, required=True, help="proxy_config.json 路径")
     parser.add_argument("--ban_explore", action="store_true", help="去掉 Task 工具描述中的 Explore 行")
+    parser.add_argument("--sandbox-id", default=SANDBOX_ID, help="沙箱 ID，未指定时自动生成，同一网关共用")
     args = parser.parse_args()
+    SANDBOX_ID = args.sandbox_id
     if args.ban_explore:
         BAN_EXPLORE = True
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -1055,14 +802,12 @@ def main() -> None:
             listeners = {}
             for name, host, port, target in providers:
                 try:
-                    family, _, _, _, address = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0]
+                    family, _, _, _, address = socket.getaddrinfo(host, port, family=socket.AF_INET, type=socket.SOCK_STREAM)[0]
                     listener = stack.enter_context(socket.socket(family, socket.SOCK_STREAM))
                     if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
                         listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
                     else:
                         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    if family == socket.AF_INET6:
-                        listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
                     listener.bind(address)
                 except OSError as exc:
                     raise OSError(f"供应商 {name!r} 无法监听 {host}:{port}：{exc}") from exc
