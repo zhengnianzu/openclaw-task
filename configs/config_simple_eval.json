@@ -22,8 +22,7 @@
       "name": "evaluator",
       "config": [],
       "skills": [],
-      "system_prompt": null,
-      "model": "api-proxy-deepseek/deepseek-v4-pro"
+      "system_prompt": null
     }
   ],
   "queries": [

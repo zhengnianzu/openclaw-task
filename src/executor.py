@@ -404,6 +404,7 @@ def _make_options(timeout: int, client: Any):
         "src.dsh_client":        ("src.dsh_client",          "ExecutionOptions"),
         "src.jiuwenswarm_client": ("src.jiuwenswarm_client", "ExecutionOptions"),
         "src.openclaw_local_client": ("src.openclaw_local_client", "ExecutionOptions"),
+        "src.taichu_client":      ("src.taichu_client",     "ExecutionOptions"),
     }
     entry = harness_options.get(client_module)
     if entry is None:

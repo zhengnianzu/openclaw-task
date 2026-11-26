@@ -21,6 +21,11 @@ harness 轨迹落盘位置 (沙箱内路径, 脚本在沙箱里被 harness_autom
   - jiuwenswarm-xiaoyi: ~/.jiuwenswarm/agent/sessions/<session_id>/history.jsonl
                  (metadata.json.project_dir 区分 main/evaluator/其他 agent；dev 使用
                  chat.usage_metadata，xiaoyi 使用消息事件和 chat.final 顶层 usage)
+  - taichu     : $TAICHU_HOME/user/agent_instances/<persona>/session_workspaces/
+                 <session_id>_workspace/.taichu/session-transcripts/<session_id>.jsonl
+                 (persona: main→sys_celia_main；按 session 累计全部 run；缺失时退回
+                 $TAICHU_HOME/evidence/<agent>/native/taichu-session-ledger.jsonl。
+                 工具调用 = model_output.payload.assistant.content 里的 toolCall 块)
   - codex： 暂未保存session
   (其余 harness 走「基类 HarnessAdapter」兜底: 不解析轨迹, 只靠 evaluator_use.log +
    run.log 给大致结果, 分级忽略 ge3 门槛, 结果带 "fallback": True)
@@ -1472,6 +1477,133 @@ class JiuwenSwarmXiaoyiAdapter(JiuwenSwarmAdapter):
             "total_tokens": total_tk,
         }
 
+class TaichuAdapter(HarnessAdapter):
+    """TaiChu CLI（taichu-cli-linux 沙箱）原生会话轨迹适配器。
+
+    落盘布局（``$TAICHU_HOME`` 默认 ``/home/ma-user/taichu``，与 src/taichu_client.py 一致）::
+
+        $TAICHU_HOME/
+        ├── evidence/<agent>/native/taichu-session-ledger.jsonl     # 每轮调用前清空，只剩最后一轮的证据
+        └── user/agent_instances/<persona>/session_workspaces/
+            └── <session_id>_workspace/.taichu/session-transcripts/<session_id>.jsonl
+
+    persona：``main`` → ``sys_celia_main``，其余 agent 以自身名称为 persona。
+
+    轨迹源优先级：
+      1. session transcript —— taichu 原生、按 session 累计全部 run，**不会被每轮清空**，
+         多轮 simulator 交互的完整轨迹只在这里；同一 persona 多个 session 时取最新的。
+      2. evidence ledger —— 同一份事件格式，单 session 时与 transcript 字节一致；
+         transcript 不在（未回收 user/）时兜底。
+
+    两者都是 NDJSON 事件流，``event`` 字段区分：
+      - ``model_output``：一次模型调用；``payload.assistant.content`` 的 ``toolCall`` 块计工具调用，
+        ``usage.{input,output}`` 计 token（``error_message`` 非空的失败调用不计入 assistant 轮）；
+      - ``tool_call`` / ``tool_result``：工具执行事实（与 toolCall 块一一对应，不重复计数）。
+    """
+
+    name = "taichu"
+    DEFAULT_PERSONA = "sys_celia_main"
+
+    @staticmethod
+    def _home() -> Path:
+        return Path(os.environ.get("TAICHU_HOME") or "/home/ma-user/taichu").expanduser()
+
+    @classmethod
+    def _persona(cls, agent_name: str) -> str:
+        return cls.DEFAULT_PERSONA if agent_name == "main" else agent_name
+
+    @staticmethod
+    def _read_events(path: Path) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(obj, dict):
+                        events.append(obj)
+        except OSError:
+            pass
+        return events
+
+    def _transcripts(self, agent_name: str) -> List[Path]:
+        root = (self._home() / "user" / "agent_instances" / self._persona(agent_name)
+                / "session_workspaces")
+        if not root.is_dir():
+            return []
+        return [
+            p for p in root.glob("*_workspace/.taichu/session-transcripts/*.jsonl")
+            if p.is_file()
+        ]
+
+    def find_trajectory(self, agent_name: str) -> Optional[Path]:
+        """优先取该 persona 最新的 session transcript，缺失时退回 evidence ledger。"""
+        transcripts = self._transcripts(agent_name)
+        if transcripts:
+            return max(transcripts, key=lambda p: (p.stat().st_mtime, p.stat().st_size))
+        ledger = self._home() / "evidence" / agent_name / "native" / "taichu-session-ledger.jsonl"
+        return ledger if ledger.is_file() else None
+
+    def analyze(self, path: Path, agent_name: str) -> Dict[str, int]:
+        """按 ``model_output`` 逐次模型调用统计。
+
+        tool_calls       : toolCall 块总数（同一轮可多个）
+        assistant_rounds : 成功的模型调用数（失败调用只有 error_message、无内容、usage 全 0）
+        plain_rounds     : 不含 toolCall 的成功模型调用数
+        *_tokens         : usage.input / usage.output 累加；taichu 不单独报告 reasoning token
+        """
+        tool_calls = plain_rounds = assistant_rounds = 0
+        input_tk = output_tk = reasoning_tk = 0
+        for event in self._read_events(path):
+            if event.get("event") != "model_output":
+                continue
+            assistant = (event.get("payload") or {}).get("assistant") or {}
+            if assistant.get("error_message"):
+                continue
+            blocks = [b for b in (assistant.get("content") or []) if isinstance(b, dict)]
+            assistant_rounds += 1
+            n_tc = sum(1 for b in blocks if b.get("type") == "toolCall")
+            tool_calls += n_tc
+            if n_tc == 0:
+                plain_rounds += 1
+            usage = assistant.get("usage") or {}
+            if isinstance(usage, dict):
+                input_tk += int(usage.get("input") or 0)
+                output_tk += int(usage.get("output") or 0)
+                reasoning_tk += int(usage.get("reasoning") or usage.get("reasoning_tokens") or 0)
+        return {
+            "tool_calls": tool_calls,
+            "plain_rounds": plain_rounds,
+            "assistant_rounds": assistant_rounds,
+            "input_tokens": input_tk,
+            "output_tokens": output_tk,
+            "reasoning_tokens": reasoning_tk,
+            "total_tokens": input_tk + output_tk + reasoning_tk,
+        }
+
+    def extract_eval_traj_verdict(self, path: Optional[Path]) -> Tuple[bool, Optional[float]]:
+        """从 evaluator 轨迹里各次 ``model_output`` 的 text 块兜底提取首轮裁决。"""
+        if not path or not Path(path).is_file():
+            return False, None
+        texts: List[str] = []
+        for event in self._read_events(Path(path)):
+            if event.get("event") != "model_output":
+                continue
+            assistant = (event.get("payload") or {}).get("assistant") or {}
+            text = "".join(
+                b.get("text", "") for b in (assistant.get("content") or [])
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+            if text.strip():
+                texts.append(text)
+        return _extract_completion_from_eval_text(texts) if texts else (False, None)
+
+
 HARNESS_ADAPTER_CLASSES: Dict[str, type] = {
     "openclaw": OpenclawAdapter,
     "openclaw-local": OpenclawAdapter,
@@ -1485,6 +1617,7 @@ HARNESS_ADAPTER_CLASSES: Dict[str, type] = {
     "jiuwenswarm-dev": JiuwenSwarmAdapter,
     "jiuwenswarm-dev-stable": JiuwenSwarmAdapter,
     "jiuwenswarm-xiaoyi": JiuwenSwarmXiaoyiAdapter,
+    "taichu": TaichuAdapter,
 }
 
 

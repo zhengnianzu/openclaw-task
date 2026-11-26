@@ -218,6 +218,9 @@ class HarnessAutomation:
         elif self.harness_type == "jiuwenswarm-xiaoyi":
             from src.jiuwenswarm_client import JiuwenSwarmWorkspaceManager
             self.workspace_manager = JiuwenSwarmWorkspaceManager("~/.jiuwenswarm/agent/workspace")
+        elif self.harness_type == "taichu":
+            from src.taichu_client import TaichuWorkspaceManager
+            self.workspace_manager = TaichuWorkspaceManager()
         else:
             from src.openclaw_client import OpenclawWorkspaceManager
             self.workspace_manager = OpenclawWorkspaceManager("~/.openclaw/workspace")
@@ -251,6 +254,8 @@ class HarnessAutomation:
             "jiuwenswarm-xiaoyi",
         ):
             return await self._run_jiuwenswarm()
+        elif self.harness_type == "taichu":
+            return await self._run_taichu()
         else:
             return await self._run_openclaw()
 
@@ -650,6 +655,43 @@ class HarnessAutomation:
                 client=client,
                 get_agent_fn=client.get_agent,
                 execute_with_retry_fn=make_jiuwenswarm_execute_with_retry(client),
+                simulator_factory=simulator_factory,
+                agent_system_prompts=agent_system_prompts,
+                max_turn=self.config.user_max_turn,
+                run_id=_RUN_ID,
+            )
+
+    async def _run_taichu(self) -> Dict[str, Any]:
+        from src.taichu_client import (
+            build_taichu_client,
+            TaichuAgentManager,
+            make_taichu_execute,
+        )
+        from src.executor import execute_queries
+
+        # 容器、镜像与 .taichu.json 由交付目录决定；provider 在 .taichu.json 预定义。
+        async with await build_taichu_client() as client:
+            self.client = client
+            await self._setup_workspaces()
+
+            agent_manager = TaichuAgentManager(
+                client, self.workspace_manager, agent_overrides=self.agent_overrides
+            )
+            for agent_config in self.config.agents:
+                await agent_manager.setup_agent(agent_config)
+
+            simulator_factory = lambda: create_simulator(
+                self.config, self.simulator_model_cfg
+            )
+            agent_system_prompts = {
+                a.name: a.system_prompt for a in self.config.agents if a.system_prompt
+            }
+            return await execute_queries(
+                queries=self.config.queries,
+                client=client,
+                get_agent_fn=client.get_agent,
+                # 单轮失败直接抛出；taichu 内部恢复轮由 --max-turns 控制。
+                execute_with_retry_fn=make_taichu_execute(client),
                 simulator_factory=simulator_factory,
                 agent_system_prompts=agent_system_prompts,
                 max_turn=self.config.user_max_turn,

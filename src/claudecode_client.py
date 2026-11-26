@@ -783,7 +783,11 @@ class ClaudecodeAgentManager:
                     _read_cc_small_fast_model() or override.model,
                 )
             if override.base_url:
-                env["ANTHROPIC_BASE_URL"] = override.base_url
+                # claude-code 的 ANTHROPIC_BASE_URL 要求裸地址(不带 /v1),
+                normalized_base = override.base_url.strip().rstrip("/")
+                if normalized_base.endswith("/v1"):
+                    normalized_base = normalized_base.removesuffix("/v1").rstrip("/")
+                env["ANTHROPIC_BASE_URL"] = normalized_base
             if override.api_key:
                 env["ANTHROPIC_AUTH_TOKEN"] = override.api_key
             # 只读 project 段(通常不存在) → user 段完全跳过 → env 注入生效
