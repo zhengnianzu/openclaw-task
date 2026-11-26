@@ -48,7 +48,7 @@ logger = logging.getLogger("harness_automation")
 DEFAULT_PERSONA = "sys_celia_main"          # 0.2.0 内置默认分身
 _EVIDENCE_PROTOCOL = "eval-json/v1"
 SANDBOX_HOME = Path("/home/ma-user")
-DEFAULT_TAICHU_HOME = SANDBOX_HOME / "taichu"
+DEFAULT_TAICHU_HOME = Path.home() / "taichu" if os.name == "nt" else SANDBOX_HOME / "taichu"
 
 # 本地兜底强杀留给 taichu 自己走完 deadline 并落证据的余量。
 _TIMEOUT_GRACE_SECONDS = int(os.environ.get("TAICHU_TIMEOUT_GRACE", "60"))
@@ -95,7 +95,9 @@ class TaichuPaths:
     # -- 宿主侧路径 ---------------------------------------------------------
     @property
     def config_file(self) -> Path:
-        return self.home / "configs" / ".taichu.json"
+        injected = self.home / "configs" / ".taichu.json"
+        local = self.home / ".taichu.json"
+        return local if local.is_file() and not injected.is_file() else injected
 
     @property
     def user_root(self) -> Path:

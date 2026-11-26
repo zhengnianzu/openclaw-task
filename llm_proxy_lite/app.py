@@ -5,6 +5,8 @@ import httpx
 import asyncio
 import logging
 import base64
+import copy
+import hashlib
 import ipaddress
 import math
 import socket
@@ -34,6 +36,7 @@ BAN_EXPLORE = os.getenv("BAN_EXPLORE", "false").lower() == "true"
 BAN_STREAM = os.getenv("BAN_STREAM", "false").lower() == "true"
 EXPOSE_THINKING = os.getenv("EXPOSE_THINKING", "true").lower() == "true"
 TRUST_ENV = os.getenv("TRUST_ENV", "true").lower() == "true"
+TAICHU_MAAS_COMPAT = os.getenv("TAICHU_MAAS_COMPAT", "").lower() in {"1", "true", "yes"}
 
 # 全局默认：重试次数（不从环境变量读取）
 MAX_RETRIES = 20
@@ -135,6 +138,31 @@ def _strip_task_explore_line(
         cleaned.append(t)
 
     return cleaned
+
+
+def _taichu_maas_body(body: dict) -> dict:
+    """兼容 MaaS 的工具 schema 和关联 ID 限制，原始请求仍用于轨迹记录。"""
+    body = copy.deepcopy(body)
+    for tool in body.get("tools", []):
+        function = tool.get("function", {})
+        parameters = function.get("parameters", {})
+        if (function.get("name") == "edit" and "anyOf" in parameters
+                and {"old_text", "new_text", "edits"}.issubset(parameters.get("properties", {}))):
+            parameters.pop("anyOf")
+            function["description"] = (function.get("description", "")
+                                       + "\nProvide either old_text with new_text, or edits; do not combine them.")
+
+    def short_id(value):
+        if isinstance(value, str) and len(value) > 32:
+            return "call_" + hashlib.sha256(value.encode()).hexdigest()[:24]
+        return value
+
+    for message in body.get("messages", []):
+        for call in message.get("tool_calls", []):
+            call["id"] = short_id(call.get("id"))
+        if "tool_call_id" in message:
+            message["tool_call_id"] = short_id(message["tool_call_id"])
+    return body
 
 
 def _forward_headers(headers, exclude=()) -> list:
@@ -550,6 +578,8 @@ async def openai_chat_completions(req: Request):
     elif "tools" in body:
         body.pop("tools", None)
 
+    if TAICHU_MAAS_COMPAT and req.url.path != "/v1/responses":
+        body = _taichu_maas_body(body)
 
     # ---- non-stream ----
     if not stream:
@@ -1186,13 +1216,16 @@ def main() -> None:
     import argparse
     import uvicorn
 
-    global BAN_EXPLORE
+    global BAN_EXPLORE, TAICHU_MAAS_COMPAT
     parser = argparse.ArgumentParser(description="启动模型 API 转发网关")
     parser.add_argument("--config", type=Path, required=True, help="proxy_config.json 路径")
     parser.add_argument("--ban_explore", action="store_true", help="去掉 Task 工具描述中的 Explore 行")
+    parser.add_argument("--taichu-maas-compat", action="store_true", default=TAICHU_MAAS_COMPAT,
+                        help="兼容 MaaS 的太初工具 schema 和关联 ID 限制")
     args = parser.parse_args()
     if args.ban_explore:
         BAN_EXPLORE = True
+    TAICHU_MAAS_COMPAT = args.taichu_maas_compat
     os.environ["SANDBOX_ID"] = get_sandbox_id()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)

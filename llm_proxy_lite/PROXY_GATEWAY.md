@@ -39,6 +39,10 @@ python llm_proxy_lite/app.py --config llm_proxy_lite/proxy_config.json
 
 两种模型路由的普通分支遇到非 `200` 响应或连接异常时重试。模型路由最多尝试 20 次，重试间隔为 0.5 秒。流式错误沿用 Lite 的响应格式。日志记录返回给客户端的 HTTP 状态和尝试次数，状态与上游不同时另记上游状态。
 
+太初对接 MaaS 时，可设置 `TAICHU_MAAS_COMPAT=1` 或启动参数 `--taichu-maas-compat`。
+仅在 OpenAI Chat Completions 转发时移除太初 `edit` 工具根 schema 的 `anyOf`，
+并将超过 32 字符的工具调用及结果关联 ID 同步缩短；轨迹保留原始请求，工具参数仍由太初校验。
+
 ## 日志文件与统计
 
 控制台输出请求状态、尝试次数、耗时和 Token 摘要；逐次尝试的细节写入 `logs_proxy/gateway.log`。能力探测与健康检查标记 `request_kind=probe/health`，只输出 DEBUG，不计入模型调用统计。
