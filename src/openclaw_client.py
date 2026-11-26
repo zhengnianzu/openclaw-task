@@ -58,6 +58,15 @@ EXECUTION_HISTORY_FALLBACK_DELAY_SECONDS = 3
 EXECUTION_HISTORY_FALLBACK_LIMIT = 50
 EXECUTION_HISTORY_FALLBACK_MAX_POLLS = 40
 EXECUTION_HISTORY_FALLBACK_POLL_INTERVAL_SECONDS = 30.0
+# 空回复之后的纯轮询预算。execute 返回空内容不等于这一轮失败 —— agent 可能还在
+# 跑长工具调用或长生成, 只是这次订阅先结束了。这里只等不催: 补发"继续"会让轨迹
+# 里多出一条无依据的 user 消息, 把"agent 自己继续"变成"用户催办"。
+EXECUTION_EMPTY_REPLY_POLL_MAX_POLLS = 60
+EXECUTION_EMPTY_REPLY_POLL_INTERVAL_SECONDS = 30.0
+
+AUTO_COMPACTION_UNRECOVERABLE_MARKER = (
+    "auto-compaction could not recover this turn"
+)
 
 
 # ============================================================================
@@ -596,6 +605,27 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                 isinstance(message, dict)
                 and str(message.get("role", "")).lower() == "assistant"
             )
+        """ openclaw.json配置项修改如下：
+            "contextWindow": 512000,
+            "compaction": {
+                "mode": "safeguard",
+                "reserveTokensFloor": 120000,
+                "midTurnPrecheck": {
+                    "enabled": true
+                },
+                "timeoutSeconds": 300
+            }
+        """
+        def raise_if_unrecoverable_compaction(text: Any) -> None:
+            """识别网关注入的终态错误，禁止向同一 session 继续发送消息。"""
+            if (
+                isinstance(text, str)
+                and AUTO_COMPACTION_UNRECOVERABLE_MARKER in text.lower()
+            ):
+                raise RuntimeError(
+                    "Auto-compaction could not recover this turn; "
+                    "terminating the current agent-loop instead of reusing the blocked session"
+                )
 
         async def fetch_history() -> List[dict[str, Any]]:
             try:
@@ -665,29 +695,82 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                 )
             return None
 
+        async def poll_after_empty(
+            before_history: List[dict[str, Any]],
+        ) -> Optional[dict[str, Any]]:
+            """空回复后的**纯轮询**: 只等 history 出现新回复, 不向 agent 补发任何消息。
+
+            execute 返回空内容不代表这一轮失败 —— 常见于 agent 还在跑长工具调用/
+            长生成, 而本次订阅先结束了。此时补发"继续"会在轨迹里插一条无依据的
+            user 消息, 把"agent 自己接着干"改写成"用户催办", 并且可能让服务端把
+            同一任务当成新的一轮重跑。所以只轮询: 每 30s 查一次 history, 最多等
+            30 分钟, 拿到新回复就当作本轮结果返回。
+
+            返回 dict(含 content/stop_reason) 或 None(等满预算仍无回复)。
+            """
+            logger.warning(
+                "agent 返回空内容,不补发'继续';转入纯轮询 history (最多 %d 次 × %.0fs ≈ %.0f 分钟)",
+                EXECUTION_EMPTY_REPLY_POLL_MAX_POLLS,
+                EXECUTION_EMPTY_REPLY_POLL_INTERVAL_SECONDS,
+                EXECUTION_EMPTY_REPLY_POLL_MAX_POLLS
+                * EXECUTION_EMPTY_REPLY_POLL_INTERVAL_SECONDS / 60,
+            )
+            text = await history_fallback(
+                before_history,
+                max_polls=EXECUTION_EMPTY_REPLY_POLL_MAX_POLLS,
+                poll_interval=EXECUTION_EMPTY_REPLY_POLL_INTERVAL_SECONDS,
+            )
+            if not text:
+                return None
+            return {"content": text, "stop_reason": "complete"}
+
+        # 空回复一律"只轮询、不催发": 等满 poll_after_empty 的预算仍无回复就上抛。
+        # 不向 agent 补发"继续"、也不重发原 query, 轨迹里因此不会多出无依据的输入。
+        attempt_query = query_text
+        continued_after_empty = False
+
         for attempt in range(1, max_attempts + 1):
             before_history = await fetch_history()
             try:
-                result = await agent.execute(query_text, options=options)
+                result = await agent.execute(attempt_query, options=options)
                 if result is None:
-                    raise RuntimeError("Agent returned None")
-                if query_text == "真棒" or query_text == "好吧":
+                    # 拿不到结果对象也是空回复的一种, 同样先纯轮询再判失败
+                    polled_null = await poll_after_empty(before_history)
+                    if polled_null:
+                        raise_if_unrecoverable_compaction(polled_null["content"])
+                        return ExecutionResult(
+                            success=True,
+                            content=polled_null["content"],
+                            stop_reason=polled_null["stop_reason"],
+                        ), True
+                    raise RuntimeError("Agent returned empty reply: result is None")
+                if attempt_query == "真棒" or attempt_query == "好吧":
                     print(f"openclaw res={result}")
-                if getattr(result, "content", None):
-                    return result, False
+                content = getattr(result, "content", None)
+                has_content = (
+                    bool(content.strip())
+                    if isinstance(content, str)
+                    else bool(content)
+                )
+                if has_content:
+                    raise_if_unrecoverable_compaction(content)
+                    return result, continued_after_empty
 
-                fallback_text = await history_fallback(before_history)
-                if fallback_text:
+                # 空回复: 只轮询 history, 不补发"继续"催 agent 重跑。
+                polled = await poll_after_empty(before_history)
+                if polled:
+                    raise_if_unrecoverable_compaction(polled["content"])
                     return result.model_copy(
                         update={
                             "success": True,
-                            "content": fallback_text,
-                            "stop_reason": result.stop_reason or "complete",
+                            "content": polled["content"],
+                            "stop_reason": result.stop_reason or polled["stop_reason"],
                             "error_message": None,
                         }
                     ), True
 
                 error_message = getattr(result, "error_message", None)
+                raise_if_unrecoverable_compaction(error_message)
                 if error_message and not str(error_message).startswith(
                     "Agent completed with no response"
                 ):
@@ -698,6 +781,11 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                 )
             except AgentExecutionError as e:
                 msg = str(e).lower()
+                if AUTO_COMPACTION_UNRECOVERABLE_MARKER in msg:
+                    logger.error(
+                        "检测到不可恢复的 auto-compaction 终态，立即终止当前 agent-loop"
+                    )
+                    raise RuntimeError(str(e)) from e
                 if "llm request failed" in msg:
                     reason = "llm request failed"
                 else:
@@ -711,6 +799,7 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                 await asyncio.sleep(60)
                 fallback_text = await history_fallback(before_history)
                 if fallback_text:
+                    raise_if_unrecoverable_compaction(fallback_text)
                     logger.info("%s但 agent 已完成,从 history 获取到回复", reason)
                     return ExecutionResult(
                         success=True,
@@ -727,11 +816,26 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                 )
                 try:
                     result = await agent.execute("继续", options=options)
-                    if result is not None and getattr(result, "content", None):
+                    retry_content = (
+                        getattr(result, "content", None)
+                        if result is not None
+                        else None
+                    )
+                    retry_has_content = (
+                        bool(retry_content.strip())
+                        if isinstance(retry_content, str)
+                        else bool(retry_content)
+                    )
+                    if retry_has_content:
+                        raise_if_unrecoverable_compaction(retry_content)
                         logger.info("'继续'重试成功,agent 恢复执行")
                         return result, True
                 except Exception as retry_e:
+                    if AUTO_COMPACTION_UNRECOVERABLE_MARKER in str(retry_e).lower():
+                        raise RuntimeError(str(retry_e)) from retry_e
                     logger.warning("'继续'重试也失败: %s", retry_e)
+                attempt_query = "继续"
+                continued_after_empty = True
                 logger.warning(
                     "history 也无结果,第 %d/%d 次重试前等待 %d 秒",
                     attempt, max_attempts, EXECUTION_RETRY_WAIT_SECONDS,
@@ -759,6 +863,7 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
 
                 fallback_text = await history_fallback(before_history)
                 if fallback_text:
+                    raise_if_unrecoverable_compaction(fallback_text)
                     logger.info("WS 断开但 agent 已完成,从 history 获取到回复")
                     return ExecutionResult(
                         success=True,
@@ -775,14 +880,30 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                 await asyncio.sleep(EXECUTION_RETRY_WAIT_SECONDS)
                 continue
             except RuntimeError as e:
-                if attempt >= max_attempts:
-                    logger.error("agent 连续返回空内容 %d 次: %s", attempt, e)
+                msg = str(e).lower()
+                if AUTO_COMPACTION_UNRECOVERABLE_MARKER in msg:
+                    logger.error(
+                        "检测到不可恢复的 auto-compaction 终态，立即终止当前 agent-loop；"
+                        "不向原 session 发送“继续”"
+                    )
                     raise
-                logger.warning(
-                    "agent 返回空内容且 history 无兜底,第 %d/%d 次重试前等待 %d 秒: %s",
-                    attempt, max_attempts, EXECUTION_RETRY_WAIT_SECONDS, e,
+                if "agent returned empty" not in msg:
+                    raise
+                # 空回复已经在上面的 poll_after_empty 里等满了轮询预算, 仍无回复才算
+                # 这一轮真的没产出。此时**不补发"继续"、也不重发原 query** ——
+                # 两者都会在轨迹里多出一条没有用户依据的输入, 并可能让服务端把同一
+                # 任务当成新的一轮重跑。直接上抛, 由 executor 决定后续。
+                logger.error(
+                    "agent 返回空内容,且 history 纯轮询 %.0f 秒后仍无新回复;不补发'继续': %s",
+                    EXECUTION_EMPTY_REPLY_POLL_MAX_POLLS
+                    * EXECUTION_EMPTY_REPLY_POLL_INTERVAL_SECONDS,
+                    e,
                 )
-                await asyncio.sleep(EXECUTION_RETRY_WAIT_SECONDS)
+                raise RuntimeError(
+                    f"Agent returned empty content and no new reply appeared in "
+                    f"chat.history after "
+                    f"{EXECUTION_EMPTY_REPLY_POLL_MAX_POLLS * EXECUTION_EMPTY_REPLY_POLL_INTERVAL_SECONDS:.0f}s "
+                    f"of polling"
+                ) from e
 
     return execute_with_retry
-

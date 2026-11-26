@@ -809,9 +809,40 @@ async def passthrough(req: Request):
         raise
 
 
+_COOKIE_HEADERS = {"cookie", "set-cookie"}
+_KEY_PREFIXES = ("sk-ant-", "sk-proj-", "sk-")   # 长前缀优先匹配
+
+
+def _mask_secret(secret: str) -> str:
+    """把密钥掩码为「前缀 + 首位 + **** + 后四位」
+    - 保留 ``Bearer `` 等认证方案前缀；
+    - 识别 sk- / sk-ant- / sk-proj- 前缀，前缀本身原样保留；
+    - 去掉沙箱后缀，只取核心key的首位和后四位
+    """
+    if not secret:
+        return secret
+    scheme = ""
+    head, sep, tail = secret.partition(" ")
+    if sep and head.lower() in ("bearer", "basic", "token"):
+        scheme, secret = head + " ", tail.strip()
+    prefix = next((p for p in _KEY_PREFIXES if secret.startswith(p)), "")
+    body = secret[len(prefix):]
+    core = body.split("_", 1)[0]
+    return f"{scheme}{prefix}{core[0]}****{core[-4:]}"
+
+
 def _log_headers(headers) -> dict:
-    """仅在日志中隐藏鉴权头和 Cookie 的值。"""
-    return {name: "[已隐藏]" if name.lower() in _SECRET_HEADERS else value for name, value in headers.items()}
+    """日志中的鉴权头改为掩码（保留首位与后四位便于对账），Cookie 整体隐藏。"""
+    masked = {}
+    for name, value in headers.items():
+        lowered = name.lower()
+        if lowered in _COOKIE_HEADERS:
+            masked[name] = "[已隐藏]"
+        elif lowered in _SECRET_HEADERS:
+            masked[name] = _mask_secret(value)
+        else:
+            masked[name] = value
+    return masked
 
 
 def _parse_body(raw: bytes, headers: httpx.Headers) -> tuple[str, Any]:

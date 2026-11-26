@@ -81,12 +81,16 @@ def _char_len(path) -> int:
 
 
 def has_task_done_marker(log_path) -> bool:
-    """检查任务记录 log 是否含「【Task_Done】」标记(assistant 回答末尾的任务完成信号)。"""
+    """检查任务记录 log 是否含「【Task_Done】」标记(assistant 回答末尾的任务完成信号)。
+
+    标记可能被日志行宽折断成「【Task」+「_Done】」两截, 所以两种写法都认。
+    """
     if not log_path or not os.path.isfile(log_path):
         return False
     try:
         with open(log_path, encoding="utf-8", errors="replace") as f:
-            return "【Task_Done】" in f.read()
+            text = f.read()
+        return "【Task_Done】" in text or "【Task\n_Done】" in text or "【Task_\nDone】" in text
     except OSError:
         return False
 

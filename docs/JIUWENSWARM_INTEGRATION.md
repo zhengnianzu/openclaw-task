@@ -22,12 +22,15 @@ WebSocket 协议，通过 `harness_type` 选择各自的镜像、配置模板、
 
 ```bash
 # dev-stable：固定到已校验提交
-python -m pip install \
-  "git+https://gitcode.com/openJiuwen/jiuwenswarm.git@9f21b447874e83f3aff1646b5f9ae70213d33125"
+python -m pip install "git+https://gitcode.com/openJiuwen/jiuwenswarm.git@9f21b447874e83f3aff1646b5f9ae70213d33125"
+
+# 20261123
+python -m pip install "git+https://gitcode.com/openJiuwen/jiuwenswarm.git@cca83c28a2fb3e34c106cb5681be080a726192e5"
+  
 
 # xiaoyi：按分支安装；生产使用前建议再替换为实际验证过的 commit SHA
-python -m pip install \
-  "git+https://gitcode.com/openJiuwen/jiuwenswarm.git@3e1e19bb1379fc65c2e2c231086d7b26be772c0a"
+python -m pip install "git+https://gitcode.com/openJiuwen/jiuwenswarm.git@3e1e19bb1379fc65c2e2c231086d7b26be772c0a"
+  
 ```
 
 ## 2. 总体架构
@@ -256,7 +259,134 @@ export JIUWENSWARM_MODE=code.normal
 `chat.tool_call`、`chat.tool_result`、`chat.final`、`chat.processing_status` 和错误事件。
 若某个镜像改变事件包裹方式，应在客户端做字段兼容，不应通过增加 variant 字段处理。
 
-## 9. 轨迹统计
+## 9. 核心执行交互命令
+
+本节把 `src/jiuwenswarm_client.py` 中与网关交互的每一条命令展开，作为联调
+和排障的协议速查。所有帧都是 JSON，`type: "req"` 为客户端请求（带唯一
+`id`），`type: "event"` 为服务端事件流，`type: "res"` 为对请求的同步应答。
+
+### 9.1 连接与握手
+
+```text
+ws://127.0.0.1:19001/tui     （环境变量 JIUWENSWARM_GATEWAY_URL）
+max_msg_size = 8 MiB         （轨迹/工具结果帧可能很大）
+每轮 query 使用独立连接       （服务端仍可能转发同会话上一轮的尾随事件）
+所有 execute 串行持有 client._lock（兼容仅允许单 TUI 客户端的服务版本）
+```
+
+连接建立后收到的**第一帧**必须是握手事件，否则直接报错：
+
+```json
+{"type": "event", "event": "connection.ack", "payload": {"status": "ready"}}
+```
+
+### 9.2 会话建立 —— 两分支差异
+
+xiaoyi 需要先 `session.create`，dev-stable 不需要：
+
+```jsonc
+// jiuwenswarm-xiaoyi: session.create（服务端必须保留客户端传入的 session_id）
+{
+  "type": "req", "id": "<uuid>", "method": "session.create",
+  "is_stream": false,
+  "params": {
+    "session_id": "harness-<uuid>",
+    "mode": "agent", "work_mode": "work",
+    "cwd": "<workspace>", "project_dir": "<workspace>",
+    "workspace_dir": "<workspace>", "trusted_dirs": ["<workspace>"],
+    "supports_user_interaction": false,
+    "agent_ref": {"mode": "agent", "id": "default"}
+  }
+}
+```
+
+- 应答按 `id` 匹配（`_receive_response`），服务端返回的 `session_id` 若与请求
+  不一致，xiaoyi 分支直接报错（要求保留传入 ID）。
+- **dev-stable 不发 session.create**：它的 `chat.send` 直接接受客户端
+  session_id（对齐 v1024 已验证行为），`_session_created` 直接置真。
+- `_session_created` 按 (agent, session) 缓存，同会话多轮不重复建。
+
+### 9.3 chat.send —— 核心执行命令
+
+```jsonc
+{
+  "type": "req",
+  "id": "<uuid>",
+  "method": "chat.send",
+  "is_stream": true,
+  "params": {
+    "session_id": "harness-<uuid>",
+    "mode": "agent",
+    "work_mode": "work",
+    "content":  "<首轮 = system_prompt + 运行约束 + query; 后续轮 = query>",
+    "query":    "<同 content>",
+    "cwd":          "<agent workspace>",
+    "project_dir":  "<agent workspace>",
+    "workspace_dir":"<agent workspace>",
+    "trusted_dirs": ["<agent workspace>"],
+    "supports_user_interaction": false,
+    "agent_ref":  {"mode": "agent", "id": "evaluator"},
+    "model_name": "evaluator"
+  }
+}
+```
+
+要点：
+
+| 参数 | 语义 |
+| --- | --- |
+| `agent_ref` | 只决定 agent 身份/会话归属；**不参与模型选择**（实测 2026-11-13） |
+| `model_name` | 模型选择**唯一入口**：网关 `_resolve_model_for_request` 只认它，命中 `models.defaults` 中 `alias=<agent_name>` 的条目。不传一律落 `is_default` 条目。main 沿用服务端默认，不传 |
+| `content` 首轮 | `system_prompt`（task config）+ `FIRST_TURN_SYSTEM_REMINDER`（运行约束）+ query，`\n\n` 拼接；由 `_initialized` 保证只拼一次 |
+| `is_stream` | `chat.send` 固定 true；`session.create` / `chat.interrupt` 为 false |
+
+### 9.4 事件流消费（`_receive`）
+
+按 `request_id` / `session_id` 双重过滤串扰后，按 `event`（外层）与
+`event_type`（内层嵌套）分派：
+
+| 事件 | 处理 |
+| --- | --- |
+| `chat.delta` | 累积增量文本 |
+| `chat.llm_usage` / `chat.usage_metadata` / `chat.usage_summary`（含嵌套在 `chat.final` 内层的形式） | 取 usage（三种包裹位置兼容：`usage` / `usage_metadata` / `metadata`） |
+| `chat.tool_call` | 组装 `assistant.tool_calls`（tool_call_id/name/arguments，参数字符串化） |
+| `chat.tool_result` | 组装 `role: tool` 消息（三种 id 字段名兼容） |
+| `chat.final` | 取最终文本；非 team 模式收到即结束 |
+| `chat.processing_status`（`is_processing=false` 或 status ∈ complete/completed/done/idle） | 结束信号（备用终态） |
+| `chat.error` / `team.error` | 抛 RuntimeError |
+| `chat.ask_user_question` / `plan.approval_required` | 抛错（非交互执行不允许人工介入） |
+
+终态判定：非 team 模式 `chat.final` 即 break；team 模式继续消费直到
+`processing_status` 完毕。空回复视为失败（`JiuwenSwarm 未返回回复内容`）。
+
+### 9.5 异常路径与中断
+
+任一异常（含取消）时，在 10s 内补发一条 `chat.interrupt`：
+
+```json
+{"type": "req", "id": "<uuid>", "method": "chat.interrupt", "is_stream": false,
+ "params": {"session_id": "harness-<uuid>", "mode": "agent", "work_mode": "work"}}
+```
+
+- 只断 WS 不够：服务端会继续跑完整个 turn，后续 `session.create` 排在其后
+  直至超时（实测 2s 超时太短）。
+- 超时 → `stop_reason=timeout`；协议/网络错误 → `stop_reason=error`，错误文案
+  由 `_with_real_cause` 从 llm.log 时间窗内补真实原因并附 `request_id`。
+- 执行层（`make_jiuwenswarm_execute_with_retry`）**不自动重放**：单次执行即
+  最终结果；`stop_reason != complete` 返回 incomplete 证据标记。
+
+### 9.6 请求构造模板（代码入口）
+
+```python
+def _request(self, method: str, **params) -> dict:
+    return {"type": "req", "id": uuid.uuid4().hex, "method": method,
+            "is_stream": method == "chat.send",
+            "params": {"session_id": self.session_key,
+                       "mode": self._client.mode,
+                       "work_mode": self._client.work_mode, **params}}
+```
+
+## 10. 轨迹统计
 
 `task_status.py` 的统计流程可以共用，版本差异应封装在
 `scripts/harness_adapter.py`：
@@ -297,7 +427,7 @@ jiuwenswarm-xiaoyi  -> xiaoyi 轨迹定位/解析
 是否保留 `jiuwenswarm-dev-stable` 旧别名由兼容策略决定；新任务和 Hive 配置统一使用
 `jiuwenswarm-dev`。通用 `jiuwenswarm` 不应再用于新任务。
 
-## 10. 启动与验收
+## 11. 启动与验收
 
 建议按以下顺序验收每个镜像：
 
@@ -322,7 +452,7 @@ jiuwenswarm-xiaoyi  -> xiaoyi 轨迹定位/解析
 | Xiaoyi 有回复但无统计 | 是否误按 dev 的 `history.json` 和 metadata 结构解析 |
 | MCP 未加载 | `enabled`、transport、stdio 依赖、远端网络和启动日志 |
 
-## 11. 兼容边界
+## 12. 兼容边界
 
 - 一份 `jiuwenswarm_client.py` 可以兼容两个分支，因为在线 `/tui` 协议主体一致；
 - 工作区、配置模板和轨迹格式不能共用硬编码路径，必须按 `harness_type` 分支；

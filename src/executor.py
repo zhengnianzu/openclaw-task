@@ -329,12 +329,13 @@ async def execute_queries(
                 trajectory.outcome = "failed"
                 break
 
-            if "【Task_Done】" in user_reply:
+            # 兼容被日志换行折断的写法：【Task\n_Done】
+            if "【Task_Done】" in user_reply or "【Task\n_Done】" in user_reply or "【Task_\nDone】" in user_reply:
                 logger.info("任务完成(Turn %d)", turn)
                 trajectory.outcome = "done"
                 success = True
                 break
-            elif "【Task_Failed】" in user_reply:
+            elif "【Task_Failed】" in user_reply or "【Task\n_Failed】" in user_reply or "【Task_\nFailed】" in user_reply:
                 logger.error("任务失败(Turn %d):%s", turn, user_reply)
                 trajectory.outcome = "failed"
                 break
@@ -403,6 +404,7 @@ def _make_options(timeout: int, client: Any):
         "src.dsh_client":        ("src.dsh_client",          "ExecutionOptions"),
         "src.jiuwenswarm_client": ("src.jiuwenswarm_client", "ExecutionOptions"),
         "src.openclaw_local_client": ("src.openclaw_local_client", "ExecutionOptions"),
+        "src.taichu_client":      ("src.taichu_client",     "ExecutionOptions"),
     }
     entry = harness_options.get(client_module)
     if entry is None:

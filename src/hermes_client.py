@@ -40,6 +40,13 @@ _HERMES_AGENT_ROOT_ENV = "HERMES_AGENT_ROOT"
 _HERMES_AGENT_ROOT_DEFAULT = Path("~/.hermes/hermes-agent").expanduser()
 _AIAgent_cls = None  # type: ignore[assignment]
 
+# simulator_config 的标准协议值 -> hermes 内部 transport 名
+_HERMES_API_MODE = {
+    "anthropic-messages": "anthropic_messages",
+    "openai-completions": "chat_completions",
+    "openai-responses": "codex_responses",
+}
+
 
 def _hermes_agent_root() -> str:
     return os.environ.get(_HERMES_AGENT_ROOT_ENV, _HERMES_AGENT_ROOT_DEFAULT)
@@ -165,6 +172,21 @@ def _load_aiagent_kwargs_from_config(
     base_url = model_section.get("base_url") or None
     api_key = model_section.get("api_key") or None
 
+    # 新版 provider 结构(平台 hermes_config.yaml 模板): model.provider 只存名字,
+    # base_url/api_key/transport/default_model 在顶层 providers.<name> 条目里。
+    # 旧读取只认 model 段内联或 custom_providers: 段, 新模板下全落空,
+    # AIAgent 查不到 provider 即报 "No LLM provider configured"。
+    transport = None
+    if isinstance(provider, str) and provider:
+        provs = data.get("providers") or {}
+        pv = provs.get(provider) if isinstance(provs, dict) else None
+        if isinstance(pv, dict):
+            base_url = base_url or pv.get("api") or pv.get("base_url")
+            api_key = api_key or pv.get("api_key")
+            if not model_name:
+                model_name = pv.get("default_model") or ""
+            transport = pv.get("transport") or None
+
     if isinstance(provider, str) and provider.startswith("custom:"):
         pname = provider.split(":", 1)[1].strip()
         cps = data.get("custom_providers") or {}
@@ -186,6 +208,11 @@ def _load_aiagent_kwargs_from_config(
         out["base_url"] = base_url
     if api_key:
         out["api_key"] = api_key
+    # transport 值(anthropic_messages/chat_completions/codex_responses)就是
+    # AIAgent api_mode 的合法值 —— 主 agent 的协议由此声明, 与 evaluator 的
+    # _HERMES_API_MODE 映射殊途同归。
+    if transport:
+        out["api_mode"] = transport
     return out
 
 
@@ -281,6 +308,35 @@ class HermesAgent:
         else:
             os.environ["HERMES_HOME"] = prev_env
 
+    def _enter_workspace_cwd(self) -> Optional[tuple]:
+        """把进程 cwd 切到 agent workspace(即 hermes_home/profile 目录),
+        并设 HERMES_WRITE_SAFE_ROOT 写入围栏。
+        """
+        if self.hermes_home is None:
+            return None
+        prev_cwd = os.getcwd()
+        os.chdir(self.hermes_home)
+        prev_fence = os.environ.get("HERMES_WRITE_SAFE_ROOT")
+        os.environ["HERMES_WRITE_SAFE_ROOT"] = str(self.hermes_home)
+        logger.debug(
+            "cwd -> workspace: %s (agent=%s prev=%s, write_fence=on)",
+            self.hermes_home, self.agent_name, prev_cwd,
+        )
+        return (prev_cwd, prev_fence)
+
+    def _restore_cwd(self, handle: Optional[tuple]) -> None:
+        if handle is None:
+            return
+        prev_cwd, prev_fence = handle
+        if prev_fence is None:
+            os.environ.pop("HERMES_WRITE_SAFE_ROOT", None)
+        else:
+            os.environ["HERMES_WRITE_SAFE_ROOT"] = prev_fence
+        try:
+            os.chdir(prev_cwd)
+        except Exception as e:
+            logger.warning("恢复 cwd 失败 (忽略): %s", e)
+
     def _ensure_agent(self):
         if self._agent is not None:
             return self._agent
@@ -305,11 +361,30 @@ class HermesAgent:
                 ctor_kwargs["base_url"] = ov.base_url
             if ov.api_key:
                 ctor_kwargs["api_key"] = ov.api_key
+            # 协议(transport): 与主 agent 同一套映射
+            # 否则 SDK 落默认协议, openai 端点会被当 anthropic 调用。
+            api_mode = _HERMES_API_MODE.get(str(ov.api or "").strip().lower())
+            if api_mode:
+                ctor_kwargs["api_mode"] = api_mode
             ctor_kwargs.pop("provider", None)
             logger.info(
-                "agent=%s 应用 simulator_config 覆盖: model=%r base_url=%r",
-                self.agent_name, ov.model, ov.base_url,
+                "agent=%s 应用 simulator_config 覆盖: model=%r base_url=%r api_mode=%r",
+                self.agent_name, ov.model, ov.base_url, api_mode,
             )
+
+        # Base URL 规范化(收口点): hermes 两种协议(anthropic_messages /
+        # chat_completions)的 providers.<name>.api 都要求带 /v1 后缀。
+        raw_base = ctor_kwargs.get("base_url")
+        if raw_base:
+            normalized = str(raw_base).strip().rstrip("/")
+            if not normalized.endswith("/v1"):
+                normalized += "/v1"
+            if normalized != raw_base:
+                logger.info(
+                    "agent=%s base_url 规范化: %r -> %r",
+                    self.agent_name, raw_base, normalized,
+                )
+                ctor_kwargs["base_url"] = normalized
 
         # 显式绑定 SessionDB 到 profile 目录
         if self.hermes_home is not None:
@@ -353,6 +428,9 @@ class HermesAgent:
         options: Optional[ExecutionOptions] = None,
     ) -> ExecutionResult:
         handle = self._enter_hermes_home()
+        # cwd 切到 workspace: 保证 run_conversation 期间以相对路径生成的
+        # 交付件都落在该 agent 的 workspace 下(与 HERMES_HOME 进出配对)。
+        prev_cwd = self._enter_workspace_cwd()
         try:
             agent = self._ensure_agent()
 
@@ -417,6 +495,7 @@ class HermesAgent:
                 messages=result_dict.get("messages") or [],
             )
         finally:
+            self._restore_cwd(prev_cwd)
             self._exit_hermes_home(handle)
 
 
