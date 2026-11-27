@@ -35,6 +35,8 @@ import logging
 import os
 import shutil
 import signal
+import stat
+import sys
 import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -46,13 +48,12 @@ logger = logging.getLogger("harness_automation")
 
 DEFAULT_PERSONA = "sys_celia_main"          # 0.2.0 内置默认分身
 _EVIDENCE_PROTOCOL = "eval-json/v1"
-SANDBOX_HOME = Path("/home/ma-user")
-DEFAULT_TAICHU_HOME = SANDBOX_HOME / "taichu"
+_IS_WINDOWS = os.name == "nt"
+DEFAULT_TAICHU_HOME = Path(r"C:\Users\win11admin\taichu")  if _IS_WINDOWS else Path("/home/ma-user/taichu")
 
 # 本地兜底强杀留给 taichu 自己走完 deadline 并落证据的余量。
 _TIMEOUT_GRACE_SECONDS = int(os.environ.get("TAICHU_TIMEOUT_GRACE", "60"))
-# 单轮内的 LLM/tool 轮次上限（含 taichu 自带的 completion-recovery 轮）。
-_DEFAULT_MAX_TURNS = int(os.environ.get("TAICHU_MAX_TURNS", "60"))
+_DEFAULT_MAX_TURNS = int(os.environ.get("TAICHU_MAX_TURNS", "999999"))
 
 
 class TaichuHarnessError(RuntimeError):
@@ -62,6 +63,54 @@ class TaichuHarnessError(RuntimeError):
 def persona_for(agent_name: str) -> str:
     """Agent → persona id。``main`` 用内置默认分身，其余以自身名称建独立分身。"""
     return DEFAULT_PERSONA if agent_name == "main" else agent_name
+
+
+# ---------------------------------------------------------------------------
+# 平台适配
+# ---------------------------------------------------------------------------
+
+async def kill_process_tree(process) -> None:
+    """结束 CLI 进程及它派生的工具子进程。
+
+    POSIX 靠 ``start_new_session`` + ``killpg`` 一次带走整组；Windows 没有进程组，
+    ``process.kill()`` 只会杀掉父进程，taichu 派生的工具 exe 会留在后台，
+    所以用 ``taskkill /T`` 按进程树清理。
+    """
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+    elif process.returncode is None:
+        try:
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill", "/F", "/T", "/PID", str(process.pid),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await killer.wait()
+        except (OSError, NotImplementedError):
+            process.kill()
+
+
+def remove_tree(path: Path) -> None:
+    """删除目录树。
+
+    POSIX 下直接删——root 不受文件权限限制，只要父目录可写即可。Windows 上
+    带只读属性的文件会让 ``DeleteFile`` 对管理员也失败，先清只读位再删。
+    """
+    if not _IS_WINDOWS:
+        shutil.rmtree(path)
+        return
+
+    def _clear_readonly(func, target, _exc_info):
+        try:
+            os.chmod(target, stat.S_IWRITE | stat.S_IREAD)
+        except OSError:
+            pass
+        func(target)
+
+    shutil.rmtree(path, onexc=lambda func, target, exc: _clear_readonly(func, target, exc))
 
 
 # ---------------------------------------------------------------------------
@@ -359,13 +408,7 @@ class TaichuAgent:
     async def close(self):
         process = self._process
         if process is not None:
-            try:
-                if os.name == "posix":
-                    os.killpg(process.pid, signal.SIGKILL)
-                elif process.returncode is None:
-                    process.kill()
-            except ProcessLookupError:
-                pass
+            await kill_process_tree(process)
             await process.wait()
         await self._cleanup_launch()
 
@@ -381,7 +424,7 @@ class TaichuAgent:
         """
         path = self.client.paths.evidence_root / self.agent_name
         if path.exists():
-            shutil.rmtree(path)
+            remove_tree(path)
         path.mkdir(parents=True)
         return path
 
@@ -391,8 +434,12 @@ class TaichuAgent:
 
     def _build_command(self, query_text: str, evidence_dir: Path, options: ExecutionOptions) -> list[str]:
         paths = self.client.paths
+        # 优先用 hive prepare_config 预生成的 per-agent 配置（.taichu.<persona>.json），
+        # 不存在则退回默认 .taichu.json。
+        cfg_override = self.client._agent_configs.get(self.agent_name)
+        config_arg = str(cfg_override) if cfg_override else paths.cli_config()
         command = self._launch_prefix() + [
-            "--config", paths.cli_config(),
+            "--config", config_arg,
             "--user-data-root", paths.cli_user_root(),
             "--no-color",
         ]
@@ -405,7 +452,7 @@ class TaichuAgent:
             "--workspace-root", paths.cli_workspace(self.agent_name),
             "--evidence-dir", paths.cli_path(evidence_dir),
             "--timeout-seconds", str(int(options.timeout_seconds or 3600)),
-            "--max-turns", str(int(options.max_turns or _DEFAULT_MAX_TURNS)),
+            "--max-turns", str(_DEFAULT_MAX_TURNS),
             "--message", query_text,
         ]
         return command
@@ -557,6 +604,7 @@ class TaichuClient:
         self.workspace_manager = self.workspace_class(self.paths)
         self._agents: dict[tuple[str, str], TaichuAgent] = {}
         self._registered: set[str] = set()
+        self._agent_configs: dict[str, Optional[Path]] = {}
         self._lock = asyncio.Lock()
         self.base_config: dict = {}
 
@@ -566,14 +614,27 @@ class TaichuClient:
         self.base_config = json.loads(self.paths.config_file.read_text(encoding="utf-8"))
         return self
 
+    def _resolve_agent_config(self, agent_name: str) -> Optional[Path]:
+        """返回该 agent 的专属配置文件；不存在则返回 None（用默认 .taichu.json）。
+
+        hive ``prepare_config._prepare_taichu`` 按 user_proxy_model.json 里的 agent 名
+        生成 ``.taichu.<agent>.json``，这里按同样的命名查找。
+        """
+        directory = self.paths.config_file.parent
+        for name in (agent_name, persona_for(agent_name)):
+            candidate = directory / f".taichu.{name}.json"
+            if candidate.is_file():
+                return candidate
+        return None
+
     async def __aexit__(self, *args):
         await self.close()
 
     async def check_runtime(self) -> None:
         """启动前尽早失败：确认 taichu-cli 可执行。"""
         cli = self.paths.cli or "taichu-cli"
-        resolved = shutil.which(cli) if "/" not in cli else cli
-        if not resolved or not os.access(resolved, os.X_OK):
+        resolved = shutil.which(cli) or (cli if os.path.isfile(cli) else None)
+        if not resolved:
             raise TaichuHarnessError(
                 f"找不到可执行的 taichu-cli: {cli}（用 TAICHU_CLI 指定绝对路径）"
             )
@@ -597,6 +658,13 @@ class TaichuClient:
 
 
 async def build_taichu_client(home=None, **kwargs) -> TaichuClient:
+    # Windows 上 asyncio 默认 SelectorEventLoop 不支持子进程（RuntimeError），
+    # 切到 ProactorEventLoop 才能 create_subprocess_exec。
+    if _IS_WINDOWS:
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        except (AttributeError, NotImplementedError):
+            pass
     return TaichuClient(home=home, **kwargs)
 
 
@@ -623,18 +691,22 @@ class TaichuAgentManager:
     async def setup_agent(self, agent_config):
         workspace = self.workspace_manager.get_agent_workspace(agent_config.name)
         self.client._registered.add(agent_config.name)
-        default_model = (self.client.base_config or {}).get("default_model")
+        cfg_path = self.client._resolve_agent_config(agent_config.name)
+        self.client._agent_configs[agent_config.name] = cfg_path
+        base_config = self.client.base_config or {}
+        model_id = base_config.get("default_model")
+        if cfg_path is not None:
+            try:
+                model_id = json.loads(cfg_path.read_text(encoding="utf-8")).get(
+                    "default_model") or model_id
+            except (OSError, ValueError):
+                pass
         logger.info(
-            "设置 TaiChu Agent: %s | persona=%s | model=%s（来自 .taichu.json） | workspace=%s",
-            agent_config.name, persona_for(agent_config.name), default_model, workspace,
+            "设置 TaiChu Agent: %s | persona=%s | model=%s | config=%s | workspace=%s",
+            agent_config.name, persona_for(agent_config.name),
+            model_id,
+            cfg_path or self.client.paths.cli_config(), workspace,
         )
-        requested = getattr(agent_config, "model", None)
-        if requested and default_model and requested.split("/")[-1] != default_model:
-            logger.warning(
-                "TaiChu: agent '%s' 请求的 model=%s 未生效，使用 .taichu.json 的 default_model=%s；"
-                "如需按 agent 选模型，请在 agent_config/persona_policy.json 里配置",
-                agent_config.name, requested, default_model,
-            )
 
 
 # ---------------------------------------------------------------------------
