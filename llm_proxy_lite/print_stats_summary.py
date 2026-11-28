@@ -4,7 +4,7 @@ import json
 import argparse
 from pathlib import Path
 from typing import Literal, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 INDEX_FILENAME = "index.jsonl"
@@ -52,6 +52,9 @@ class DataItem(BaseModel):
     count: int = 0
     input_token_num: int = 0
     output_token_num: int = 0
+    error_counts: dict[str, int] = Field(default_factory=dict)
+    error_examples: dict[str, str] = Field(default_factory=dict)
+    stream_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class SummaryItem(BaseModel):
@@ -125,6 +128,7 @@ def _aggregate_index_entries(entries, model_filter, date_start, date_end, status
 
         tok_in = entry.get("tok_in", 0) or 0
         tok_out = entry.get("tok_out", 0) or 0
+        stream_status = entry.get("stream_status")
 
         # 新索引用 HTTP 和流完成状态记录成败，旧索引沿用原有口径。
         is_success = bool(entry.get("success", False)) and ("status_code" in entry or tok_out > 0)
@@ -139,9 +143,31 @@ def _aggregate_index_entries(entries, model_filter, date_start, date_end, status
             model_count_data[_model]["success"].count += 1
             model_count_data[_model]["success"].input_token_num += tok_in
             model_count_data[_model]["success"].output_token_num += tok_out
+            if stream_status:
+                counts = model_count_data[_model]["success"].stream_counts
+                counts[stream_status] = counts.get(stream_status, 0) + 1
         elif status in ["全部", "失败"] and not is_success:
             model_count_data[_model]["error"].count += 1
             model_count_data[_model]["error"].input_token_num += tok_in
+            model_count_data[_model]["error"].output_token_num += tok_out
+            reason = entry.get("error_message")
+            error_type = entry.get("error_type")
+            if not error_type and isinstance(reason, dict):
+                exception = reason.get("exception")
+                if isinstance(exception, list) and exception:
+                    error_type = str(exception[-1]).strip().split("\n", 1)[0].split(":", 1)[0].rsplit(".", 1)[-1]
+            if stream_status:
+                reason = stream_status
+            elif (entry.get("status_code") or 0) >= 400:
+                reason = f"HTTP {entry['status_code']}"
+            elif error_type:
+                reason = f"请求取消（{error_type}）" if error_type == "CancelledError" else error_type
+            else:
+                reason = reason if isinstance(reason, str) and reason else "未记录失败原因"
+            errors = model_count_data[_model]["error"].error_counts
+            errors[reason] = errors.get(reason, 0) + 1
+            if entry.get("id"):
+                model_count_data[_model]["error"].error_examples.setdefault(reason, entry["id"])
 
 
 def statistic_tokens(model: str = '', date_start: str = '', date_end: str = '', status: str = '全部', **kwargs) -> dict:
@@ -215,12 +241,16 @@ def statistic_tokens(model: str = '', date_start: str = '', date_end: str = '', 
             elif status in ["全部", "失败"] and token_out == 0:
                 model_count_data[_model]["error"].count += 1
                 model_count_data[_model]["error"].input_token_num += token_in
+                reason = (find_first_key_value(data, 'message', str) or find_first_key_value(data, 'error', str)
+                          or find_first_key_value(data, 'detail', str) or "未记录失败原因")
+                errors = model_count_data[_model]["error"].error_counts
+                errors[reason] = errors.get(reason, 0) + 1
 
     for key, val in model_count_data.items():
         if val['success'].count > 0:
-            res_data.append(val['success'].model_dump())
+            res_data.append(val['success'].model_dump(exclude={"error_counts", "error_examples"}))
         if val['error'].count > 0:
-            res_data.append(val['error'].model_dump())
+            res_data.append(val['error'].model_dump(exclude={"stream_counts"}))
 
     summary_success = SummaryItem(status="success")
     summary_error = SummaryItem(status="error")
@@ -243,9 +273,11 @@ API 调用统计摘要
 
 成功调用次数: {summary_success.count}
 失败调用次数: {summary_error.count}
-总输入 Tokens: {summary_success.total_input}
-总输出 Tokens: {summary_success.total_output}
-总 Tokens: {summary_success.total_input + summary_success.total_output}
+失败输入 Tokens: {summary_error.total_input}
+失败输出 Tokens: {summary_error.total_output}
+总输入 Tokens: {summary_success.total_input + summary_error.total_input}
+总输出 Tokens: {summary_success.total_output + summary_error.total_output}
+总 Tokens: {summary_success.total_input + summary_success.total_output + summary_error.total_input + summary_error.total_output}
 
 按模型统计:
 --------------------------------------------------------------------------------
@@ -256,10 +288,18 @@ API 调用统计摘要
             _input_token = val['success'].input_token_num
             _output_token = val['success'].output_token_num
             _all_token = _input_token + _output_token
-            print_log += f"""{key}: 调用 {_count} 次, 输入 {_input_token} , 输出 {_output_token}, 总计 {_all_token} tokens"""
+            print_log += f"""{key}: 成功 {_count} 次, 输入 {_input_token} , 输出 {_output_token}, 总计 {_all_token} tokens"""
             print_log += '\n'
+            for stream_status, count in val['success'].stream_counts.items():
+                print_log += f"  {count} 次: {stream_status}\n"
         if val['error'].count > 0:
-            print_log += f"{key}: 失败 {val['error'].count} 次, 输入 {val['error'].input_token_num} tokens\n"
+            print_log += (f"{key}: 失败 {val['error'].count} 次, 输入 {val['error'].input_token_num}, "
+                          f"输出 {val['error'].output_token_num} tokens\n")
+            for reason, count in val['error'].error_counts.items():
+                print_log += f"  {count} 次: {reason}\n"
+                example = val['error'].error_examples.get(reason)
+                if example:
+                    print_log += f"    示例请求ID: {example}\n"
     print_log += "--------------------------------------------------------------------------------"
 
     print(print_log)
