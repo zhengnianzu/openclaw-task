@@ -73,10 +73,12 @@ async def process_turn(
     agent: Any = None,
     before_history: Optional[List[dict[str, Any]]] = None,
 ) -> Optional[str]:
-    """逐轮处理(仅多轮 simulator 路径):能力1 每轮捕获带证据轨迹 + 能力2 按 eval_step 节流评估。
-    
-    单轮对话不进入本函数(不采集轨迹)。每个 turn 都捕获轨迹(供评审窗口取数),
-    但仅在评审点(`turn % eval_step == 0`)触发 evaluator;被跳过的轮给 simulator 喂空。
+    """逐轮处理:能力1 每轮捕获带证据轨迹 + 能力2 按 eval_step 节流评估。
+
+    多轮(simulator)与单轮(use_simulator=false)都走这里:单轮就是 turn=1 的一轮,
+    eval_step=1 时 1 % 1 == 0,自然命中评审点。
+    每个 turn 都捕获轨迹(供评审窗口取数),但仅在评审点(`turn % eval_step == 0`)
+    触发 evaluator;被跳过的轮给 simulator 喂空。
 
     Returns:
         evaluator_feedback: 本轮喂回 simulator 的反馈;跳过轮/未回流/评估失败均为 None。
@@ -273,6 +275,13 @@ async def execute_queries(
             retry = 0
 
             if query_simulator is None:
+                # 单轮(use_simulator=false):就是 turn=1 的一轮,同样要过评审——
+                # 否则 Q1→A1 直接结束,evaluate 块形同虚设(eval_step=1 时 1%1==0 必评)。
+                # 返回值(是否回流)无消费者:没有 simulator 可喂,评估结果只落轨迹。
+                await process_turn(
+                    client, query, turn, current_query, result, evidence_incomplete,
+                    trajectory, evaluator, agent=agent, before_history=before_history,
+                )
                 success = True
                 break
             # 后台监测: 扫描本轮增量消息，从 sessions_spawn 里提取 childSessionKey
@@ -343,8 +352,13 @@ async def execute_queries(
             current_query = user_reply
         else:
             if query_simulator is not None:
-                trajectory.outcome = "max_turn"
-                logger.warning("达到最大轮次 %d,任务未完成", max_turn)
+                if max_turn > 1:
+                    trajectory.outcome = "max_turn"
+                    logger.warning("达到最大轮次 %d,任务未完成", max_turn)
+                elif max_turn == 1 and (getattr(last_result, "content", "") or "").strip():
+                    logger.info("单轮配置(user_max_turn=%d),本轮交付即最终结果", max_turn)
+                    trajectory.outcome = "done"
+                    success = True
 
         # 文件隔离收尾:任务结束后把 oracle/rubrics 原始字节写回(best-effort,纯调试便利)。
         if evaluator is not None:
